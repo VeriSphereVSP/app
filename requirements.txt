@@ -6,3 +6,5 @@ openai
 sqlalchemy
 psycopg2-binary
 numpy
+pytest
+httpx

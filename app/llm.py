@@ -1,40 +1,106 @@
-import json
-from openai import OpenAI
-from .config import OPENAI_API_KEY, OPENAI_MODEL
+from __future__ import annotations
 
-SYSTEM = """You are VeriSphere Chat Orchestrator (MVP).
-Return ONLY JSON:
+from dataclasses import dataclass
+from typing import Any, Dict, Optional
+import os
+
+try:
+    from openai import OpenAI
+except Exception:  # pragma: no cover
+    OpenAI = None  # type: ignore
+
+
+SYSTEM_PROMPT = """You are VeriSphere.
+Classify input as:
+1) non_actionable
+2) explicit_claims
+3) topic_search
+
+Respond ONLY in JSON.
+
+Schemas:
+
+non_actionable:
+{ "kind": "non_actionable", "message": string }
+
+explicit_claims:
 {
-  "assistant_message": string,
-  "claims": [{"local_id": string, "text": string, "confidence": number, "type": string, "actions": [{"type": string, "label": string, "payload": {}}]}],
-  "ambiguities": [],
-  "rejected": [],
-  "message": {"summary": string}
+  "kind": "claims",
+  "claims": [
+    { "text": string, "confidence": number, "actions": [] }
+  ]
 }
-Bound claims <= 10. confidence 0..1.
+
+topic_search:
+{
+  "kind": "article",
+  "title": string,
+  "sections": [
+    {
+      "id": string,
+      "text": string,
+      "claims": [
+        { "text": string, "confidence": number, "actions": [] }
+      ]
+    }
+  ]
+}
 """
 
-def interpret(message: str):
-    message = (message or "").strip()
-    if not message:
-        return {"assistant_message":"Say something and I’ll extract claims to stake on.","claims":[],"ambiguities":[],"rejected":[],"message":{"summary":""}}
-    if not OPENAI_API_KEY:
+
+@dataclass
+class LLMResult:
+    json: Dict[str, Any]
+
+
+def _heuristic_interpret(text: str) -> Dict[str, Any]:
+    t = (text or "").strip()
+    if not t:
+        return {"kind": "non_actionable", "message": "Empty input."}
+
+    # naive heuristics: treat trailing '?' as topic search
+    if t.endswith("?") or len(t.split()) > 16:
         return {
-            "assistant_message":"I extracted a claim candidate (LLM disabled).",
-            "claims":[{"local_id":"c1","text":message,"confidence":0.55,"type":"claim","actions":[
-                {"type":"create_claim","label":"Create claim","payload":{"local_id":"c1"}},
-                {"type":"stake_support","label":"Stake support","payload":{"local_id":"c1"}},
-                {"type":"stake_challenge","label":"Stake challenge","payload":{"local_id":"c1"}}
-            ]}],
-            "ambiguities":[],
-            "rejected":[],
-            "message":{"summary":message[:140]}
+            "kind": "article",
+            "title": "Topic summary (stub)",
+            "sections": [
+                {
+                    "id": "s1",
+                    "text": t,
+                    "claims": [],
+                }
+            ],
         }
-    client = OpenAI(api_key=OPENAI_API_KEY, timeout=25.0)
-    resp = client.chat.completions.create(
-        model=OPENAI_MODEL,
-        messages=[{"role":"system","content":SYSTEM},{"role":"user","content":message}],
-        temperature=0.2
+
+    # otherwise treat as explicit claim
+    return {
+        "kind": "claims",
+        "claims": [
+            {
+                "text": t,
+                "confidence": 0.7,
+                "actions": [],
+            }
+        ],
+    }
+
+
+def interpret_with_openai(text: str, model: str = "gpt-4o-mini") -> Dict[str, Any]:
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key or OpenAI is None:
+        return _heuristic_interpret(text)
+
+    client = OpenAI(api_key=api_key)
+    completion = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": text},
+        ],
+        temperature=0.2,
     )
-    raw = resp.choices[0].message.content or "{}"
-    return json.loads(raw)
+
+    content = completion.choices[0].message.content or ""
+    # OpenAI should return JSON. Let exceptions bubble to caller for 500.
+    import json as _json
+    return _json.loads(content)
