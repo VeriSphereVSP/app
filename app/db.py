@@ -1,6 +1,6 @@
 import json
 from typing import Generator, Optional, List
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker, Session
 from .config import DATABASE_URL
 
@@ -39,3 +39,19 @@ def decode_embedding(db: Session, value) -> Optional[List[float]]:
         return list(value)
     except TypeError:
         return None
+
+def get_mm_state_for_update(db: Session) -> int:
+    row = db.execute(
+        text("SELECT net_vsp FROM mm_state WHERE id = TRUE FOR UPDATE")
+    ).one()
+    return int(row[0])
+
+def set_mm_state(db: Session, new_value: int):
+    db.execute(
+        text("""
+        UPDATE mm_state
+        SET net_vsp = :v, updated_at = now()
+        WHERE id = TRUE
+        """),
+        {"v": max(0, new_value)}
+    )

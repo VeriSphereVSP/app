@@ -24,13 +24,16 @@ BROADCAST_PATH = Path("/app/broadcast/Deploy.s.sol/43113/run-latest.json")
 
 @app.on_event("startup")
 async def check_deployment():
+    """Log warning if deployment artifact is missing (no crash)."""
     if not BROADCAST_PATH.exists():
         print(f"Warning: Deployment artifact not found at {BROADCAST_PATH}")
+        print("  → Run 'forge script ... --broadcast' in core/ first, then restart containers.")
     else:
         print(f"Deployment artifact found: {BROADCAST_PATH}")
 
 @app.get("/api/contracts")
 def get_contracts():
+    """Return latest deployed contract addresses from Foundry broadcast JSON."""
     if not BROADCAST_PATH.exists():
         raise HTTPException(500, f"Deployment artifact not found at {BROADCAST_PATH}")
 
@@ -45,6 +48,7 @@ def get_contracts():
             if name and addr:
                 contracts[name] = addr
 
+        # Fallbacks from config.py
         contracts.setdefault("USDC", USDC_ADDRESS)
         contracts.setdefault("VSPToken", VSP_ADDRESS)
 
@@ -58,7 +62,7 @@ def get_contracts():
         raise HTTPException(500, f"Failed to load contracts: {str(e)}")
 
 # ============================================================
-# Existing endpoints
+# Existing endpoints (unchanged)
 # ============================================================
 
 class InterpretRequest(BaseModel):
@@ -79,13 +83,13 @@ def interpret(req: InterpretRequest) -> Dict[str, Any]:
         raise HTTPException(status_code=500, detail=f"Interpret failed: {str(e)}")
 
 # ============================================================
-# Market Maker API – prefixed with /api/mm/
+# Market Maker API (unchanged)
 # ============================================================
 
 def oracle_timestamp() -> str:
     return datetime.utcnow().isoformat() + "Z"
 
-@app.get("/api/mm/quote")
+@app.get("/mm/quote")
 def mm_quote(db: Session = Depends(get_db)):
     net_vsp, unit_au, spread_rate = db.execute(
         text("""
@@ -99,7 +103,6 @@ def mm_quote(db: Session = Depends(get_db)):
         unit_au=unit_au,
         spread_rate=spread_rate,
     )
-    print("Quote requested – returning prices")
     return {
         "market_price_usdc": prices["market_usd"],
         "buy_usdc": prices["buy_usd"],
@@ -112,7 +115,7 @@ class MMTradeRequest(BaseModel):
     vsp_amount: int
     expected_price_usdc: float
 
-@app.post("/api/mm/buy")
+@app.post("/mm/buy")
 def mm_buy(req: MMTradeRequest, db: Session = Depends(get_db)):
     usdc_needed = int(req.vsp_amount * req.expected_price_usdc * 1_000_000)
     if allowance(USDC_ADDRESS, req.user_address, MM_ADDRESS) < usdc_needed:
@@ -130,7 +133,7 @@ def mm_buy(req: MMTradeRequest, db: Session = Depends(get_db)):
         )
     return {"ok": True}
 
-@app.post("/api/mm/sell")
+@app.post("/mm/sell")
 def mm_sell(req: MMTradeRequest, db: Session = Depends(get_db)):
     usdc_out = int(req.vsp_amount * req.expected_price_usdc * 1_000_000)
     if allowance(VSP_ADDRESS, req.user_address, MM_ADDRESS) < req.vsp_amount * 10**18:
