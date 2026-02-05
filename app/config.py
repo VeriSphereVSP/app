@@ -1,5 +1,7 @@
 # app/app/config.py
+from dotenv import load_dotenv
 import os
+load_dotenv()
 from pathlib import Path
 import json
 
@@ -66,6 +68,7 @@ RPC_URL = (
 # ============================================================
 # LLM / Embeddings
 # ============================================================
+
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 

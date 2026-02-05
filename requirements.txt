@@ -8,3 +8,6 @@ psycopg2-binary
 numpy
 pytest
 httpx
+requests>=2.31.0
+web3>=6.0.0
+beautifulsoup4

@@ -6,14 +6,14 @@ from typing import Any, Dict, Optional
 from datetime import datetime
 from sqlalchemy.orm import Session
 from sqlalchemy import text
-from pathlib import Path
-import json
-
 from .llm import interpret_with_openai
 from .db import get_db
 from app.mm_pricing import compute_mm_prices
 from .erc20 import allowance, transfer, transfer_from
 from .config import USDC_ADDRESS, VSP_ADDRESS, MM_ADDRESS
+from .semantic import compute_one
+from pathlib import Path
+import json
 
 app = FastAPI(title="VeriSphere App API", version="0.1.0")
 
@@ -33,29 +33,36 @@ async def check_deployment():
 def get_contracts():
     if not BROADCAST_PATH.exists():
         raise HTTPException(500, f"Deployment artifact not found at {BROADCAST_PATH}")
-
     try:
         with BROADCAST_PATH.open() as f:
             data = json.load(f)
-
         contracts = {}
         for tx in data.get("transactions", []):
             name = tx.get("contractName")
             addr = tx.get("contractAddress")
             if name and addr:
                 contracts[name] = addr
-
         contracts.setdefault("USDC", USDC_ADDRESS)
         contracts.setdefault("VSPToken", VSP_ADDRESS)
-
         print(f"Returning {len(contracts)} contracts from /api/contracts")
         return contracts
-
     except Exception as e:
         import traceback
         print("ERROR in /api/contracts:", str(e))
         print(traceback.format_exc())
         raise HTTPException(500, f"Failed to load contracts: {str(e)}")
+
+@app.get("/api/claim-status/{claim_text}")
+def claim_status(claim_text: str, db: Session = Depends(get_db)):
+    on_chain = compute_one(db, claim_text)
+    stake_support = 0  # Query StakeEngine
+    stake_challenge = 0
+    return {
+        "on_chain": on_chain,
+        "stake_support": stake_support,
+        "stake_challenge": stake_challenge,
+        "author": "Unknown"
+    }
 
 # ============================================================
 # Existing endpoints
@@ -69,13 +76,43 @@ class InterpretRequest(BaseModel):
 def healthz() -> Dict[str, str]:
     return {"ok": "true"}
 
-@app.post("/interpret")
+@app.post("/api/interpret")
 def interpret(req: InterpretRequest) -> Dict[str, Any]:
     if not req.input or not isinstance(req.input, str):
         raise HTTPException(status_code=400, detail="Invalid input")
     try:
-        return interpret_with_openai(req.input, model=req.model or "gpt-4o-mini")
+        r = interpret_with_openai(req.input, model=req.model or "gpt-4o-mini")
+
+        # Enhance with on-chain data (safe block)
+        try:
+            db = get_db()  # assuming you have a way to get db session
+            if r["kind"] == "claims":
+                for claim in r["claims"]:
+                    claim_text = claim["text"]
+                    on_chain = compute_one(db, claim_text, top_k=5)
+                    claim["on_chain"] = on_chain
+                    claim["stake_support"] = 0  # TODO: query StakeEngine
+                    claim["stake_challenge"] = 0
+                    claim["author"] = "User"
+            elif r["kind"] == "article":
+                for section in r["sections"]:
+                    for claim in section["claims"]:
+                        claim_text = claim["text"]
+                        on_chain = compute_one(db, claim_text, top_k=5)
+                        claim["on_chain"] = on_chain
+                        claim["stake_support"] = 0
+                        claim["stake_challenge"] = 0
+                        claim["author"] = "AI Search"
+        except Exception as enhance_err:
+            print(f"Enhancement failed: {str(enhance_err)}")
+            # Continue with raw result if enhancement fails
+            r["enhancement_error"] = str(enhance_err)
+
+        return r
     except Exception as e:
+        import traceback
+        print("Interpret error:", str(e))
+        print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Interpret failed: {str(e)}")
 
 # ============================================================
