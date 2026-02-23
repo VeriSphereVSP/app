@@ -11,6 +11,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
+# Copy core artifacts (for ABI loading — includes VeriSphereForwarder)
+COPY core/out /core/out
+
 # Create and activate virtual environment
 RUN python -m venv /venv
 ENV PATH="/venv/bin:$PATH"
@@ -32,4 +35,4 @@ COPY app/ops ./ops
 EXPOSE 8070
 
 # Use /bin/sh instead of bash (slim image doesn't have bash)
-CMD ["/bin/sh", "-c", "/venv/bin/python -m app.migrate && /venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8070"]
+CMD ["/bin/sh", "-c", "python migrate.py && /venv/bin/uvicorn main:app --host 0.0.0.0 --port 8070"]

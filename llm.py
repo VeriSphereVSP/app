@@ -20,7 +20,9 @@ Classify input as:
 1) non_actionable
 2) explicit_claims
 3) topic_search
-Respond **ONLY** with valid JSON — no extra text, no explanations, no markdown fences.
+Respond **ONLY** with valid JSON — no extra text, no explanations, no markdown.
+
+If the input is a single topic name or short phrase (1–5 words) without claim language, treat it as topic_search and generate a concise article on that topic, broken into claims.
 
 Schemas:
 non_actionable:

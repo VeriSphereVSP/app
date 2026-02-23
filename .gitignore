@@ -14,3 +14,7 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+
+# Allow deployment addresses
+!deployments/
+!deployments/*.json

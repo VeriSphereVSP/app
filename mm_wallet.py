@@ -4,6 +4,15 @@ from eth_account import Account
 from config import RPC_URL, MM_PRIVATE_KEY, MM_ADDRESS
 
 w3 = Web3(Web3.HTTPProvider(RPC_URL))
+
+# Inject POA middleware for Avalanche (web3.py v7+ renamed it)
+try:
+    from web3.middleware import ExtraDataToPOAMiddleware
+    w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+except ImportError:
+    from web3.middleware import geth_poa_middleware
+    w3.middleware_onion.inject(geth_poa_middleware, layer=0)
+
 if not w3.is_connected():
     raise RuntimeError("Web3 RPC not connected")
 
@@ -17,7 +26,6 @@ if account.address.lower() != MM_ADDRESS.lower():
 
 def sign_and_send(tx: dict) -> str:
     tx = dict(tx)
-
     tx.pop("gasPrice", None)
 
     try:
@@ -40,4 +48,3 @@ def sign_and_send(tx: dict) -> str:
 
     signed = account.sign_transaction(tx)
     return w3.eth.send_raw_transaction(signed.raw_transaction).hex()
-
