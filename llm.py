@@ -1,4 +1,4 @@
-# app/app/llm.py
+# app/llm.py
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
@@ -10,10 +10,7 @@ import re
 from dotenv import load_dotenv
 load_dotenv()
 
-try:
-    from openai import OpenAI
-except ImportError:
-    OpenAI = None  # type: ignore
+from llm_provider import complete
 
 SYSTEM_PROMPT = """You are VeriSphere.
 Classify input as:
@@ -83,31 +80,24 @@ def _heuristic_interpret(text: str) -> Dict[str, Any]:
         "claims": [{"text": t, "confidence": 0.7, "actions": []}],
     }
 
-def interpret_with_openai(input_text: str, model: str = "gpt-4o-mini") -> Dict[str, Any]:
-    if not OpenAI:
-        raise RuntimeError("OpenAI library not installed. Run 'pip install openai'")
-
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        raise RuntimeError("OPENAI_API_KEY not set in .env file")
-
-    client = OpenAI(api_key=api_key)
-
+def interpret_with_openai(input_text: str, model: str = None) -> Dict[str, Any]:
+    """Interpret user input using the configured LLM provider.
+    
+    Despite the name (kept for backward compatibility), this now uses
+    whichever provider is configured via LLM_PROVIDER env var.
+    """
     try:
-        print(f"Sending to OpenAI: {input_text[:100]}...")
-        response = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": input_text},
-            ],
-            temperature=0.7,
+        print(f"Sending to LLM: {input_text[:100]}...")
+
+        raw_content = complete(
+            prompt=input_text,
+            system=SYSTEM_PROMPT,
             max_tokens=2000,
-            stream=False
+            temperature=0.7,
+            model=model,
         )
 
-        raw_content = response.choices[0].message.content.strip()
-        print(f"Raw OpenAI response: {raw_content}")
+        print(f"Raw LLM response: {raw_content}")
 
         # Clean up markdown/code fences and trailing junk
         content = re.sub(r'^```json\s*|\s*```$', '', raw_content).strip()
@@ -129,5 +119,5 @@ def interpret_with_openai(input_text: str, model: str = "gpt-4o-mini") -> Dict[s
             return _heuristic_interpret(input_text)
 
     except Exception as e:
-        print(f"OpenAI error: {str(e)}")
-        raise RuntimeError(f"OpenAI call failed: {str(e)}")
+        print(f"LLM error: {str(e)}")
+        raise RuntimeError(f"LLM call failed: {str(e)}")

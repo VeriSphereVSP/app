@@ -14,13 +14,12 @@ from sqlalchemy import text
 from db import get_db
 from llm import interpret_with_openai
 from merge import merge_article_with_chain
-from mm_pricing import compute_mm_prices
-from erc20 import allowance, transfer, transfer_from
-from config import USDC_ADDRESS, VSP_ADDRESS, MM_ADDRESS
+from config import USDC_ADDRESS, VSP_ADDRESS
 from semantic import compute_one
 from chain.claim_registry import create_claim
 from chain.stake import stake_claim
 from relay import router as relay_router
+from mm_routes import router as mm_router
 
 
 @asynccontextmanager
@@ -39,6 +38,7 @@ async def lifespan(app):
 
 app = FastAPI(title="VeriSphere App API", version="0.1.0", lifespan=lifespan)
 app.include_router(relay_router)
+app.include_router(mm_router)
 
 ADDRESSES_PATH = Path("/app/broadcast/Deploy.s.sol/43113/addresses.json")
 
@@ -67,64 +67,13 @@ def get_contracts():
         raise HTTPException(500, f"Failed to load contracts: {str(e)}")
 
 
-def _find_on_chain_match(db, on_chain_result, claim_text=None):
-    """If this claim isn't on-chain but a similar on-chain claim exists, return that post_id."""
-    if on_chain_result.get("post_id") is not None:
-        return on_chain_result["post_id"]
-
-    # First: check the similar results from compute_one
-    for sim in on_chain_result.get("similar", []):
-        sim_cid = sim.get("claim_id")
-        if sim_cid is None:
-            continue
-        row = db.execute(
-            text("SELECT post_id FROM claim WHERE claim_id = :id AND post_id IS NOT NULL"),
-            {"id": sim_cid},
-        ).fetchone()
-        if row and sim.get("similarity", 0) >= 0.75:
-            return int(row[0])
-
-    # Second: directly query for on-chain claims similar to this text
-    # This catches cases where the match isn't in the top-K general results
-    if claim_text:
-        try:
-            from embedding import embed
-            from config import EMBEDDINGS_MODEL
-            vec = embed(claim_text)
-            rows = db.execute(
-                text("""
-                    SELECT c.post_id,
-                           1 - (ce.embedding <=> CAST(:vec AS vector)) AS similarity
-                    FROM claim c
-                    JOIN claim_embedding ce ON ce.claim_id = c.claim_id
-                    WHERE c.post_id IS NOT NULL
-                    ORDER BY ce.embedding <=> CAST(:vec AS vector)
-                    LIMIT 1
-                """),
-                {"vec": vec},
-            ).fetchone()
-            if rows and rows[1] >= 0.75:
-                return int(rows[0])
-        except Exception as e:
-            import traceback
-            print(f"On-chain similarity search failed: {e}")
-            print(traceback.format_exc())
-
-    return None
-
 
 @app.get("/api/claim-status/{claim_text}")
 def claim_status(claim_text: str, user: str = None, db: Session = Depends(get_db)):
-    """Return full claim state including on-chain stakes and verity score."""
-    on_chain = compute_one(db, claim_text, top_k=10)
-
-    # Check if this claim or a near-duplicate is on-chain
-    post_id = _find_on_chain_match(db, on_chain, claim_text)
-
-    # If we found a match via similarity, update on_chain to reflect it
-    if post_id is not None and on_chain.get("post_id") is None:
-        on_chain["post_id"] = post_id
-        on_chain["matched_via"] = "similarity"
+    """Return full claim state including on-chain stakes and verity score.
+    Uses strict hash matching only — no fuzzy/similarity resolution."""
+    on_chain = compute_one(db, claim_text, top_k=5)
+    post_id = on_chain.get("post_id")
 
     result = {
         "on_chain": on_chain,
@@ -165,34 +114,75 @@ def interpret(req: InterpretRequest, db: Session = Depends(get_db)):
     if not req.input or not isinstance(req.input, str):
         raise HTTPException(status_code=400, detail="Invalid input")
     try:
-        r = interpret_with_openai(req.input, model=req.model or "gpt-4o-mini")
+        r = interpret_with_openai(req.input)
 
+        if r["kind"] == "non_actionable":
+            return r
+
+        # For single/multiple claims: generate an article about the implied topic
+        # and include the user's claims in the set
+        user_claims = []
         if r["kind"] == "claims":
-            for claim in r["claims"]:
-                claim_text = claim["text"]
-                on_chain = compute_one(db, claim_text, top_k=10)
-                post_id = _find_on_chain_match(db, on_chain, claim_text)
-                if post_id is not None and on_chain.get("post_id") is None:
-                    on_chain["post_id"] = post_id
-                    on_chain["matched_via"] = "similarity"
-                claim["on_chain"] = on_chain
-                claim["stake_support"] = 0
-                claim["stake_challenge"] = 0
-                claim["author"] = "User"
+            user_claims = r.get("claims", [])
+            for uc in user_claims:
+                uc["author"] = "User"
 
+            # Extract the topic from the user's claims and generate an article
+            topic_hint = "; ".join(c["text"] for c in user_claims)
+            try:
+                article_prompt = f"Write a factual overview about the topic implied by: {topic_hint}"
+                article_r = interpret_with_openai(article_prompt, model=req.model or "gpt-4o-mini")
+                if article_r["kind"] == "article":
+                    r = article_r  # Replace with the article response
+                elif article_r["kind"] == "claims":
+                    # LLM returned claims again — use them as article claims
+                    r["kind"] = "article"
+                    r["title"] = r.get("title", "Results")
+                    r["sections"] = [{"text": "", "claims": article_r.get("claims", [])}]
+            except Exception as e:
+                print(f"Topic article generation failed (non-fatal): {e}")
+                # Fall through with just the user claims
+
+        # Collect all AI claims
+        ai_claims = []
+        if r["kind"] == "claims":
+            ai_claims = r.get("claims", [])
         elif r["kind"] == "article":
-            for section in r["sections"]:
-                for claim in section["claims"]:
-                    claim_text = claim["text"]
-                    on_chain = compute_one(db, claim_text, top_k=10)
-                    post_id = _find_on_chain_match(db, on_chain, claim_text)
-                    if post_id is not None and on_chain.get("post_id") is None:
-                        on_chain["post_id"] = post_id
-                        on_chain["matched_via"] = "similarity"
-                    claim["on_chain"] = on_chain
-                    claim["stake_support"] = 0
-                    claim["stake_challenge"] = 0
-                    claim["author"] = "AI Search"
+            for section in r.get("sections", []):
+                ai_claims.extend(section.get("claims", []))
+
+        # Merge user claims into the set (avoid duplicates by text)
+        ai_texts = {c["text"].lower().strip() for c in ai_claims}
+        for uc in user_claims:
+            if uc["text"].lower().strip() not in ai_texts:
+                ai_claims.append(uc)
+
+        # Enrich each claim with on-chain state
+        for claim in ai_claims:
+            claim_text = claim["text"]
+            on_chain = compute_one(db, claim_text, top_k=5)
+            claim["on_chain"] = on_chain
+            claim.setdefault("stake_support", 0)
+            claim.setdefault("stake_challenge", 0)
+            claim.setdefault("verity_score", 0.0)
+            claim.setdefault("author", "AI Search")
+
+            post_id = on_chain.get("post_id")
+            if post_id is not None:
+                try:
+                    from chain.chain_reader import get_stake_totals, get_verity_score
+                    s, c = get_stake_totals(post_id)
+                    claim["stake_support"] = s
+                    claim["stake_challenge"] = c
+                    claim["verity_score"] = get_verity_score(post_id)
+                except Exception:
+                    pass
+
+        # Build View 1: topic rows with incumbent/challenger pairing
+        from views.topic_view import build_topic_view
+        rows = build_topic_view(db, ai_claims, req.input)
+
+        r["topic_rows"] = rows
 
         return r
     except Exception as e:
@@ -200,93 +190,6 @@ def interpret(req: InterpretRequest, db: Session = Depends(get_db)):
         print("Interpret error:", str(e))
         print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Interpret failed: {str(e)}")
-
-
-@app.get("/api/mm/quote")
-def mm_quote(db: Session = Depends(get_db)):
-    try:
-        row = db.execute(
-            text("SELECT net_vsp, unit_au, spread_rate FROM mm_state WHERE id = TRUE")
-        ).fetchone()
-
-        if not row:
-            return {
-                "market_price_usdc": 1.0,
-                "buy_usdc": 1.0025,
-                "sell_usdc": 0.9975,
-                "ts": datetime.utcnow().isoformat() + "Z",
-            }
-
-        net_vsp, unit_au, spread_rate = row
-        prices = compute_mm_prices(net_vsp=net_vsp, unit_au=unit_au, spread_rate=spread_rate)
-        return {
-            "market_price_usdc": float(prices["market_usd"]),
-            "buy_usdc": float(prices["buy_usd"]),
-            "sell_usdc": float(prices["sell_usd"]),
-            "ts": datetime.utcnow().isoformat() + "Z",
-        }
-    except Exception as e:
-        print(f"MM quote error: {str(e)}")
-        raise HTTPException(500, f"Failed to get quote: {str(e)}")
-
-
-class MMTradeRequest(BaseModel):
-    user_address: str
-    vsp_amount: int
-    expected_price_usdc: float
-
-
-@app.post("/api/mm/buy")
-def mm_buy(req: MMTradeRequest, db: Session = Depends(get_db)):
-    usdc_needed = int(req.vsp_amount * req.expected_price_usdc * 1_000_000)
-    if allowance(USDC_ADDRESS, req.user_address, MM_ADDRESS) < usdc_needed:
-        raise HTTPException(400, "USDC allowance too low")
-    try:
-        with db.begin():
-            net_vsp, unit_au, spread_rate = db.execute(
-                text("SELECT net_vsp, unit_au, spread_rate FROM mm_state WHERE id = TRUE FOR UPDATE")
-            ).one()
-            prices = compute_mm_prices(net_vsp, unit_au, spread_rate)
-            transfer_from(USDC_ADDRESS, req.user_address, MM_ADDRESS, usdc_needed)
-            transfer(VSP_ADDRESS, req.user_address, req.vsp_amount * 10**18)
-            db.execute(
-                text("UPDATE mm_state SET net_vsp = :n WHERE id = TRUE"),
-                {"n": net_vsp + req.vsp_amount},
-            )
-        return {"ok": True}
-    except HTTPException:
-        raise
-    except Exception as e:
-        import traceback
-        print(f"MM buy error: {str(e)}")
-        print(traceback.format_exc())
-        raise HTTPException(500, f"Failed to buy VSP: {str(e)}")
-
-
-@app.post("/api/mm/sell")
-def mm_sell(req: MMTradeRequest, db: Session = Depends(get_db)):
-    usdc_out = int(req.vsp_amount * req.expected_price_usdc * 1_000_000)
-    if allowance(VSP_ADDRESS, req.user_address, MM_ADDRESS) < req.vsp_amount * 10**18:
-        raise HTTPException(400, "VSP allowance too low")
-    try:
-        with db.begin():
-            net_vsp, unit_au, spread_rate = db.execute(
-                text("SELECT net_vsp, unit_au, spread_rate FROM mm_state WHERE id = TRUE FOR UPDATE")
-            ).one()
-            transfer_from(VSP_ADDRESS, req.user_address, MM_ADDRESS, req.vsp_amount * 10**18)
-            transfer(USDC_ADDRESS, req.user_address, usdc_out)
-            db.execute(
-                text("UPDATE mm_state SET net_vsp = :n WHERE id = TRUE"),
-                {"n": net_vsp - req.vsp_amount},
-            )
-        return {"ok": True}
-    except HTTPException:
-        raise
-    except Exception as e:
-        import traceback
-        print(f"MM sell error: {str(e)}")
-        print(traceback.format_exc())
-        raise HTTPException(500, f"Failed to sell VSP: {str(e)}")
 
 
 class CreateClaimRequest(BaseModel):

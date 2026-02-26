@@ -117,12 +117,25 @@ def get_user_stake(user_address, post_id, side):
 
 def get_verity_score(post_id):
     """Returns verity score as a float in -100 to +100 range.
-    effectiveVSRay returns a Ray-scaled int256 where 1e18 = 1.0 (i.e. 100%)."""
+    effectiveVSRay returns a Ray-scaled int256 where 1e18 = 1.0 (i.e. 100%).
+    Falls back to raw stake ratio if on-chain score is 0 but stakes exist."""
     try:
         se = _get_score_engine()
         vs_ray = se.functions.effectiveVSRay(post_id).call()
-        # Convert from Ray (1e18 = 1.0) to percentage (-100 to +100)
-        return (vs_ray / 1e18) * 100
+        vs = (vs_ray / 1e18) * 100
+        if vs != 0:
+            return vs
     except Exception as e:
         logger.warning("Failed to read verity score for post %d: %s", post_id, e)
-        return 0.0
+
+    # Fallback: compute from raw stake totals
+    # This covers the case where updatePost() hasn't been called yet
+    try:
+        support, challenge = get_stake_totals(post_id)
+        total = support + challenge
+        if total > 0.001:
+            return ((support - challenge) / total) * 100
+    except Exception:
+        pass
+
+    return 0.0
