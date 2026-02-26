@@ -20,6 +20,7 @@ from chain.claim_registry import create_claim
 from chain.stake import stake_claim
 from relay import router as relay_router
 from mm_routes import router as mm_router
+from claim_views import router as claim_views_router
 
 
 @asynccontextmanager
@@ -39,6 +40,7 @@ async def lifespan(app):
 app = FastAPI(title="VeriSphere App API", version="0.1.0", lifespan=lifespan)
 app.include_router(relay_router)
 app.include_router(mm_router)
+app.include_router(claim_views_router)
 
 ADDRESSES_PATH = Path("/app/broadcast/Deploy.s.sol/43113/addresses.json")
 
