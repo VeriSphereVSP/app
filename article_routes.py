@@ -112,7 +112,7 @@ def _link_unlinked_sentences(db: Session, article: dict):
 
 # ── Endpoints ───────────────────────────────────────────
 
-@router.get("/article/{topic}")
+@router.get("/article/{topic:path}")
 def get_article(topic: str, db: Session = Depends(get_db)):
     """Get a full article. If it doesn't exist, generate it."""
     from article_store import ensure_tables, get_article as load_article

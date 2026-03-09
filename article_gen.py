@@ -4,6 +4,8 @@ AI article generation: creates a Wikipedia-style article decomposed into
 sections of atomic sentences, each sentence a stakeable claim.
 """
 import json
+import requests
+from urllib.parse import urlparse
 import re
 import logging
 from typing import Dict, Any, List
@@ -59,10 +61,60 @@ Input: It orbits the Sun every 365.25 days.
 Output: Earth orbits the Sun every 365.25 days."""
 
 
+
+
+def _fetch_url_text(url: str, max_chars: int = 12000) -> str:
+    """Fetch a URL and extract plain text content."""
+    import re as _re
+    resp = requests.get(url, timeout=15, headers={"User-Agent": "Verisphere/1.0"})
+    resp.raise_for_status()
+    html = resp.text
+    # Remove scripts, styles, comments
+    html = _re.sub(r"<(script|style|noscript)[^>]*>.*?</\1>", "", html, flags=_re.DOTALL | _re.IGNORECASE)
+    html = _re.sub(r"<!--.*?-->", "", html, flags=_re.DOTALL)
+    # Extract title
+    title_m = _re.search(r"<title[^>]*>(.*?)</title>", html, _re.DOTALL | _re.IGNORECASE)
+    title = _re.sub(r"<[^>]+>", "", title_m.group(1)).strip() if title_m else ""
+    # Strip tags
+    text = _re.sub(r"<[^>]+>", " ", html)
+    text = _re.sub(r"\s+", " ", text).strip()
+    # Truncate
+    if len(text) > max_chars:
+        text = text[:max_chars]
+    return title, text
+
+
+def _is_url(topic: str) -> bool:
+    """Check if a topic string is a URL."""
+    try:
+        p = urlparse(topic.strip())
+        return p.scheme in ("http", "https") and bool(p.netloc)
+    except Exception:
+        return False
+
+
+def _build_prompt(topic: str) -> str:
+    """Build the appropriate prompt based on whether input is a URL or topic."""
+    if _is_url(topic):
+        try:
+            title, text = _fetch_url_text(topic)
+            from lang_detect import detect_language, lang_instruction
+            lang_extra = lang_instruction(detect_language(text[:500]))
+            return (
+                f"Structure the following web page content into an encyclopedia-style article. "
+                f"The page title is: {title}\n\n"
+                f"Page content:\n{text}"
+                f"{lang_extra}"
+            )
+        except Exception as e:
+            logger.warning(f"URL fetch failed, treating as topic: {e}")
+    from lang_detect import detect_language, lang_instruction
+    return f"Write an encyclopedia article about: {topic}" + lang_instruction(detect_language(topic))
+
 def generate_article(topic: str) -> Dict[str, Any]:
     """Generate a full article for a topic. Returns {title, sections}."""
     raw = complete(
-        prompt=f"Write an encyclopedia article about: {topic}" + lang_instruction(detect_language(topic)),
+        prompt=_build_prompt(topic) + lang_instruction(detect_language(topic)),
         system=ARTICLE_SYSTEM,
         max_tokens=6144,
         temperature=0.4,

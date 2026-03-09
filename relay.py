@@ -7,7 +7,7 @@ Pattern: submit tx -> wait for receipt -> update DB -> return authoritative stat
 import json
 import logging
 from pathlib import Path
-from moderation import check_content
+
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
@@ -17,6 +17,7 @@ from web3.logs import DISCARD
 from config import FORWARDER_ADDRESS, POST_REGISTRY_ADDRESS
 from db import get_db
 from mm_wallet import w3, sign_and_send
+from moderation import check_content
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -156,35 +157,27 @@ def _check_duplicate_claim(calldata_hex, req_from, db):
     """
     Do a static call to createClaim. If it reverts with DuplicateClaim(postId),
     recover the existing post_id and return a success response.
-    Returns a response dict on duplicate, None otherwise.
     """
     try:
         claim_text = _decode_claim_text(calldata_hex)
-
-        # Static call to trigger the revert
         reg_address = Web3.to_checksum_address(POST_REGISTRY_ADDRESS)
-        data = bytes.fromhex(calldata_hex)
         try:
             w3.eth.call({
                 "to": reg_address,
                 "from": Web3.to_checksum_address(req_from),
                 "data": "0x" + calldata_hex,
             })
-            # If call succeeds, it's not a duplicate
             return None
         except Exception as call_err:
             err_data = ""
-            # web3.py puts revert data in different places depending on version
             if hasattr(call_err, 'data') and isinstance(call_err.data, str):
                 err_data = call_err.data.removeprefix("0x")
             elif hasattr(call_err, 'args') and call_err.args:
-                # Parse from error message string
                 for arg in call_err.args:
                     s = str(arg)
                     if DUPLICATE_CLAIM_SELECTOR in s:
                         idx = s.find(DUPLICATE_CLAIM_SELECTOR)
                         err_data = s[idx:]
-                        # Clean up: take only hex chars
                         cleaned = ""
                         for c in err_data:
                             if c in "0123456789abcdefABCDEF":
@@ -195,7 +188,6 @@ def _check_duplicate_claim(calldata_hex, req_from, db):
                         break
 
             if not err_data or DUPLICATE_CLAIM_SELECTOR not in err_data:
-                # Check string representation as fallback
                 err_str = str(call_err)
                 if DUPLICATE_CLAIM_SELECTOR in err_str:
                     idx = err_str.find(DUPLICATE_CLAIM_SELECTOR)
@@ -228,6 +220,22 @@ def _check_duplicate_claim(calldata_hex, req_from, db):
     return None
 
 
+def _moderate_claim(calldata_hex: str) -> None:
+    """Check if createClaim calldata contains blocked content. Raises HTTPException if blocked."""
+    try:
+        selector = calldata_hex[:8]
+        if selector.lower() != CREATE_CLAIM_SELECTOR:
+            return  # Not a createClaim call, skip moderation
+        claim_text = _decode_claim_text(calldata_hex)
+        result = check_content(claim_text)
+        if not result.allowed:
+            raise HTTPException(400, f"Content blocked: {result.reason}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.warning(f"Moderation decode failed (allowing): {e}")
+
+
 @router.get("/api/relay/nonce/{address}")
 async def get_nonce(address: str):
     try:
@@ -240,30 +248,6 @@ async def get_nonce(address: str):
 
 
 @router.post("/api/relay")
-
-def _moderate_claim(calldata_hex: str) -> None:
-    """Check if createClaim calldata contains blocked content."""
-    try:
-        # createClaim selector = first 4 bytes
-        selector = calldata_hex[:8]
-        # keccak256("createClaim(string)")[:4]
-        CREATE_CLAIM_SEL = "8b7afe2e"
-        if selector.lower() != CREATE_CLAIM_SEL:
-            return  # Not a createClaim call, skip moderation
-
-        # Decode the string argument (ABI-encoded)
-        from eth_abi import decode
-        text_bytes = bytes.fromhex(calldata_hex[8:])
-        (text,) = decode(["string"], text_bytes)
-        
-        result = check_content(text)
-        if not result.allowed:
-            raise HTTPException(400, f"Content blocked: {result.reason}")
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.warning(f"Moderation decode failed (allowing): {e}")
-
 async def relay(body: RelayRequest, db: Session = Depends(get_db)):
     try:
         fwd = _get_forwarder()
@@ -282,18 +266,18 @@ async def relay(body: RelayRequest, db: Session = Depends(get_db)):
         )
 
         # Content moderation gate
-        _moderate_claim(req.data.removeprefix('0x') if hasattr(req, 'data') else '')
+        _moderate_claim(calldata_hex)
 
         # Verify signature
         try:
             is_valid = fwd.functions.verify(request_data).call()
             if not is_valid:
-                print(f"VERIFY FAILED: is_valid={is_valid}"); raise HTTPException(400, "Invalid signature")
+                raise HTTPException(400, "Invalid signature")
         except HTTPException:
             raise
         except Exception as e:
             if "invalid" in str(e).lower() or "revert" in str(e).lower():
-                print(f"VERIFY EXCEPTION: {e}"); raise HTTPException(400, f"Signature verification failed: {e}")
+                raise HTTPException(400, f"Signature verification failed: {e}")
             logger.warning("verify() call failed (proceeding anyway): %s", e)
 
         # Check if this is a createClaim call
