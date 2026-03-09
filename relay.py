@@ -7,6 +7,7 @@ Pattern: submit tx -> wait for receipt -> update DB -> return authoritative stat
 import json
 import logging
 from pathlib import Path
+from moderation import check_content
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
@@ -21,6 +22,9 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 RECEIPT_TIMEOUT = 30
+
+# Error selectors
+DUPLICATE_CLAIM_SELECTOR = "c314bc02"
 
 
 def _load_abi(name):
@@ -139,13 +143,93 @@ def _get_claim_state(post_id, user_address=None):
         "user_challenge": 0,
     }
     if user_address:
-        result["user_support"] = get_user_stake(user_address, post_id, 0)
-        result["user_challenge"] = get_user_stake(user_address, post_id, 1)
+        try:
+            us, uc = get_user_stake(post_id, user_address)
+            result["user_support"] = us
+            result["user_challenge"] = uc
+        except Exception:
+            pass
     return result
 
 
+def _check_duplicate_claim(calldata_hex, req_from, db):
+    """
+    Do a static call to createClaim. If it reverts with DuplicateClaim(postId),
+    recover the existing post_id and return a success response.
+    Returns a response dict on duplicate, None otherwise.
+    """
+    try:
+        claim_text = _decode_claim_text(calldata_hex)
+
+        # Static call to trigger the revert
+        reg_address = Web3.to_checksum_address(POST_REGISTRY_ADDRESS)
+        data = bytes.fromhex(calldata_hex)
+        try:
+            w3.eth.call({
+                "to": reg_address,
+                "from": Web3.to_checksum_address(req_from),
+                "data": "0x" + calldata_hex,
+            })
+            # If call succeeds, it's not a duplicate
+            return None
+        except Exception as call_err:
+            err_data = ""
+            # web3.py puts revert data in different places depending on version
+            if hasattr(call_err, 'data') and isinstance(call_err.data, str):
+                err_data = call_err.data.removeprefix("0x")
+            elif hasattr(call_err, 'args') and call_err.args:
+                # Parse from error message string
+                for arg in call_err.args:
+                    s = str(arg)
+                    if DUPLICATE_CLAIM_SELECTOR in s:
+                        idx = s.find(DUPLICATE_CLAIM_SELECTOR)
+                        err_data = s[idx:]
+                        # Clean up: take only hex chars
+                        cleaned = ""
+                        for c in err_data:
+                            if c in "0123456789abcdefABCDEF":
+                                cleaned += c
+                            else:
+                                break
+                        err_data = cleaned
+                        break
+
+            if not err_data or DUPLICATE_CLAIM_SELECTOR not in err_data:
+                # Check string representation as fallback
+                err_str = str(call_err)
+                if DUPLICATE_CLAIM_SELECTOR in err_str:
+                    idx = err_str.find(DUPLICATE_CLAIM_SELECTOR)
+                    err_data = err_str[idx:]
+                    cleaned = ""
+                    for c in err_data:
+                        if c in "0123456789abcdefABCDEF":
+                            cleaned += c
+                        else:
+                            break
+                    err_data = cleaned
+
+            if err_data.startswith(DUPLICATE_CLAIM_SELECTOR) and len(err_data) >= 72:
+                post_id = int(err_data[8:72], 16)
+                logger.info(
+                    "DuplicateClaim detected: text='%s' existing post_id=%d",
+                    claim_text[:50], post_id)
+                _mark_claim_on_chain(db, claim_text, post_id)
+                claim_state = _get_claim_state(post_id, req_from)
+                claim_state["text"] = claim_text
+                claim_state["creator"] = req_from
+                return {
+                    "ok": True,
+                    "tx_hash": None,
+                    "duplicate": True,
+                    "claim": claim_state,
+                }
+    except Exception as e:
+        logger.warning("DuplicateClaim check failed: %s", e)
+    return None
+
+
 @router.get("/api/relay/nonce/{address}")
-async def get_nonce(address: str) -> NonceResponse:
+async def get_nonce(address: str):
     try:
         fwd = _get_forwarder()
         nonce = fwd.functions.nonces(Web3.to_checksum_address(address)).call()
@@ -156,6 +240,30 @@ async def get_nonce(address: str) -> NonceResponse:
 
 
 @router.post("/api/relay")
+
+def _moderate_claim(calldata_hex: str) -> None:
+    """Check if createClaim calldata contains blocked content."""
+    try:
+        # createClaim selector = first 4 bytes
+        selector = calldata_hex[:8]
+        # keccak256("createClaim(string)")[:4]
+        CREATE_CLAIM_SEL = "8b7afe2e"
+        if selector.lower() != CREATE_CLAIM_SEL:
+            return  # Not a createClaim call, skip moderation
+
+        # Decode the string argument (ABI-encoded)
+        from eth_abi import decode
+        text_bytes = bytes.fromhex(calldata_hex[8:])
+        (text,) = decode(["string"], text_bytes)
+        
+        result = check_content(text)
+        if not result.allowed:
+            raise HTTPException(400, f"Content blocked: {result.reason}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.warning(f"Moderation decode failed (allowing): {e}")
+
 async def relay(body: RelayRequest, db: Session = Depends(get_db)):
     try:
         fwd = _get_forwarder()
@@ -173,17 +281,33 @@ async def relay(body: RelayRequest, db: Session = Depends(get_db)):
             sig_bytes,
         )
 
+        # Content moderation gate
+        _moderate_claim(req.data.removeprefix('0x') if hasattr(req, 'data') else '')
+
         # Verify signature
         try:
             is_valid = fwd.functions.verify(request_data).call()
             if not is_valid:
-                raise HTTPException(400, "Invalid signature")
+                print(f"VERIFY FAILED: is_valid={is_valid}"); raise HTTPException(400, "Invalid signature")
         except HTTPException:
             raise
         except Exception as e:
             if "invalid" in str(e).lower() or "revert" in str(e).lower():
-                raise HTTPException(400, f"Signature verification failed: {e}")
+                print(f"VERIFY EXCEPTION: {e}"); raise HTTPException(400, f"Signature verification failed: {e}")
             logger.warning("verify() call failed (proceeding anyway): %s", e)
+
+        # Check if this is a createClaim call
+        is_create = (
+            req.to.lower() == POST_REGISTRY_ADDRESS.lower()
+            and calldata_hex[:8] == CREATE_CLAIM_SELECTOR
+        )
+
+        # Pre-flight: for createClaim, check for duplicate BEFORE wasting gas
+        if is_create:
+            dup = _check_duplicate_claim(calldata_hex, req.from_, db)
+            if dup:
+                logger.info("Pre-flight: claim already exists on-chain, returning existing")
+                return dup
 
         # Submit transaction
         tx = fwd.functions.execute(request_data).build_transaction({
@@ -206,6 +330,14 @@ async def relay(body: RelayRequest, db: Session = Depends(get_db)):
 
         if receipt.status == 0:
             logger.warning("Meta-tx REVERTED: tx=%s gasUsed=%d", tx_hash, receipt.gasUsed)
+
+            # For createClaim reverts, try DuplicateClaim recovery
+            if is_create:
+                dup = _check_duplicate_claim(calldata_hex, req.from_, db)
+                if dup:
+                    dup["tx_hash"] = tx_hash
+                    return dup
+
             raise HTTPException(400,
                 "Transaction reverted on-chain. "
                 "Common causes: insufficient VSP balance, duplicate claim, or contract error.")
@@ -214,12 +346,7 @@ async def relay(body: RelayRequest, db: Session = Depends(get_db)):
 
         response = {"ok": True, "tx_hash": tx_hash}
 
-        # Detect createClaim
-        is_create = (
-            req.to.lower() == POST_REGISTRY_ADDRESS.lower()
-            and calldata_hex[:8] == CREATE_CLAIM_SELECTOR
-        )
-
+        # Detect createClaim success
         if is_create:
             try:
                 reg = _get_post_registry()

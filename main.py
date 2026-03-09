@@ -2,6 +2,7 @@
 import asyncio
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Depends
+from lang_detect import detect_language, lang_instruction, is_rtl
 from pydantic import BaseModel, Field
 from typing import Dict, Any, Optional
 from datetime import datetime
@@ -12,8 +13,6 @@ from sqlalchemy.orm import Session
 from sqlalchemy import text
 
 from db import get_db
-from llm import interpret_with_openai
-from merge import merge_article_with_chain
 from config import USDC_ADDRESS, VSP_ADDRESS
 from semantic import compute_one
 from chain.claim_registry import create_claim
@@ -21,6 +20,8 @@ from chain.stake import stake_claim
 from relay import router as relay_router
 from mm_routes import router as mm_router
 from claim_views import router as claim_views_router
+from portfolio_views import router as portfolio_router
+from article_routes import router as article_router
 
 
 @asynccontextmanager
@@ -41,6 +42,8 @@ app = FastAPI(title="VeriSphere App API", version="0.1.0", lifespan=lifespan)
 app.include_router(relay_router)
 app.include_router(mm_router)
 app.include_router(claim_views_router)
+app.include_router(portfolio_router)
+app.include_router(article_router)
 
 ADDRESSES_PATH = Path("/app/broadcast/Deploy.s.sol/43113/addresses.json")
 
@@ -106,92 +109,50 @@ def claim_status(claim_text: str, user: str = None, db: Session = Depends(get_db
     return result
 
 
-class InterpretRequest(BaseModel):
-    input: str
-    model: Optional[str] = None
-
-
-@app.post("/api/interpret")
-def interpret(req: InterpretRequest, db: Session = Depends(get_db)):
-    if not req.input or not isinstance(req.input, str):
-        raise HTTPException(status_code=400, detail="Invalid input")
+@app.get("/api/claims/{post_id}/user-stake")
+def get_user_stake_endpoint(post_id: int, user: str = None):
+    """Get user's stake on a specific post by post_id."""
+    result = {"user_support": 0, "user_challenge": 0}
+    if not user:
+        return result
     try:
-        r = interpret_with_openai(req.input)
-
-        if r["kind"] == "non_actionable":
-            return r
-
-        # For single/multiple claims: generate an article about the implied topic
-        # and include the user's claims in the set
-        user_claims = []
-        if r["kind"] == "claims":
-            user_claims = r.get("claims", [])
-            for uc in user_claims:
-                uc["author"] = "User"
-
-            # Extract the topic from the user's claims and generate an article
-            topic_hint = "; ".join(c["text"] for c in user_claims)
-            try:
-                article_prompt = f"Write a factual overview about the topic implied by: {topic_hint}"
-                article_r = interpret_with_openai(article_prompt, model=req.model or "gpt-4o-mini")
-                if article_r["kind"] == "article":
-                    r = article_r  # Replace with the article response
-                elif article_r["kind"] == "claims":
-                    # LLM returned claims again — use them as article claims
-                    r["kind"] = "article"
-                    r["title"] = r.get("title", "Results")
-                    r["sections"] = [{"text": "", "claims": article_r.get("claims", [])}]
-            except Exception as e:
-                print(f"Topic article generation failed (non-fatal): {e}")
-                # Fall through with just the user claims
-
-        # Collect all AI claims
-        ai_claims = []
-        if r["kind"] == "claims":
-            ai_claims = r.get("claims", [])
-        elif r["kind"] == "article":
-            for section in r.get("sections", []):
-                ai_claims.extend(section.get("claims", []))
-
-        # Merge user claims into the set (avoid duplicates by text)
-        ai_texts = {c["text"].lower().strip() for c in ai_claims}
-        for uc in user_claims:
-            if uc["text"].lower().strip() not in ai_texts:
-                ai_claims.append(uc)
-
-        # Enrich each claim with on-chain state
-        for claim in ai_claims:
-            claim_text = claim["text"]
-            on_chain = compute_one(db, claim_text, top_k=5)
-            claim["on_chain"] = on_chain
-            claim.setdefault("stake_support", 0)
-            claim.setdefault("stake_challenge", 0)
-            claim.setdefault("verity_score", 0.0)
-            claim.setdefault("author", "AI Search")
-
-            post_id = on_chain.get("post_id")
-            if post_id is not None:
-                try:
-                    from chain.chain_reader import get_stake_totals, get_verity_score
-                    s, c = get_stake_totals(post_id)
-                    claim["stake_support"] = s
-                    claim["stake_challenge"] = c
-                    claim["verity_score"] = get_verity_score(post_id)
-                except Exception:
-                    pass
-
-        # Build View 1: topic rows with incumbent/challenger pairing
-        from views.topic_view import build_topic_view
-        rows = build_topic_view(db, ai_claims, req.input)
-
-        r["topic_rows"] = rows
-
-        return r
+        from chain.chain_reader import get_user_stake
+        result["user_support"] = get_user_stake(user, post_id, 0)
+        result["user_challenge"] = get_user_stake(user, post_id, 1)
     except Exception as e:
-        import traceback
-        print("Interpret error:", str(e))
-        print(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=f"Interpret failed: {str(e)}")
+        print(f"Failed to read user stake for post_id={post_id}, user={user}: {e}")
+    return result
+
+
+@app.get("/api/claims/{post_id}/debug")
+def debug_claim(post_id: int):
+    """Debug: show raw on-chain data for a claim to verify VS calculation."""
+    from chain.chain_reader import get_stake_totals, get_verity_score, _get_score_engine
+    result = {}
+    try:
+        support, challenge = get_stake_totals(post_id)
+        result["stake_support"] = support
+        result["stake_challenge"] = challenge
+        result["stake_total"] = support + challenge
+        if support + challenge > 0:
+            result["simple_vs"] = ((support - challenge) / (support + challenge)) * 100
+        else:
+            result["simple_vs"] = 0
+    except Exception as e:
+        result["stake_error"] = str(e)
+    try:
+        se = _get_score_engine()
+        vs_ray = se.functions.effectiveVSRay(post_id).call()
+        result["effectiveVSRay_raw"] = str(vs_ray)
+        result["effectiveVS_pct"] = (vs_ray / 1e18) * 100
+    except Exception as e:
+        result["vs_ray_error"] = str(e)
+    result["get_verity_score_result"] = get_verity_score(post_id)
+    return result
+
+
+# Old /api/interpret endpoint removed — replaced by /api/article/{topic}
+# Old /api/disambiguate endpoint removed — now in article_routes.py
 
 
 class CreateClaimRequest(BaseModel):
@@ -207,10 +168,106 @@ def create_claim_endpoint(req: CreateClaimRequest):
         raise HTTPException(500, f"Failed to create claim: {str(e)}")
 
 
+class RecordClaimRequest(BaseModel):
+    text: str = Field(..., min_length=1)
+    post_id: int = Field(..., ge=0)
+
+
+@app.post("/api/claims/record")
+def record_claim_endpoint(req: RecordClaimRequest, db: Session = Depends(get_db)):
+    """Record a claim's on-chain post_id in the local DB.
+    Called by the frontend after a successful on-chain creation."""
+    try:
+        db.execute(sql_text(
+            "UPDATE claim SET post_id = :pid "
+            "WHERE LOWER(TRIM(claim_text)) = LOWER(TRIM(:t)) AND post_id IS NULL"
+        ), {"pid": req.post_id, "t": req.text})
+        db.commit()
+        return {"ok": True, "post_id": req.post_id}
+    except Exception as e:
+        print(f"record_claim failed: {e}")
+        return {"ok": False, "error": str(e)}
+
+
+@app.get("/api/claims/check-onchain")
+def check_claim_onchain(text: str, db: Session = Depends(get_db)):
+    """Check if a claim already exists on-chain. Returns post_id if it does.
+    Also syncs the local DB if a match is found."""
+    from chain.check_duplicate import check_claim_exists_onchain
+    result = check_claim_exists_onchain(text)
+    if result and result.get("post_id") is not None:
+        post_id = result["post_id"]
+        # Sync local DB
+        try:
+            db.execute(sql_text(
+                "UPDATE claim SET post_id = :pid "
+                "WHERE LOWER(TRIM(claim_text)) = LOWER(TRIM(:t)) AND post_id IS NULL"
+            ), {"pid": post_id, "t": text})
+            db.execute(sql_text(
+                "UPDATE article_sentence SET post_id = :pid "
+                "WHERE LOWER(TRIM(text)) = LOWER(TRIM(:t)) AND post_id IS NULL"
+            ), {"pid": post_id, "t": text})
+            db.commit()
+        except Exception as e:
+            print(f"check-onchain DB sync failed: {e}")
+        return {"exists": True, "post_id": post_id}
+    return {"exists": False, "post_id": None}
+
+
+
 class StakeRequest(BaseModel):
     claim_id: int = Field(..., ge=0)
     side: str = Field(..., pattern="^(support|challenge)$")
     amount: int = Field(..., gt=0)
+
+
+
+
+# ── Token read endpoints (replaces direct chain reads from frontend) ──────────
+
+@app.get("/api/token/allowance")
+def token_allowance(owner: str, spender: str):
+    """Read VSP token allowance. Frontend calls this instead of readContract."""
+    from web3 import Web3
+    from config import RPC_URL
+    from chain.abi import VSP_TOKEN_ABI
+    from config import VSP_TOKEN_ADDRESS
+    try:
+        w3 = Web3(Web3.HTTPProvider(RPC_URL))
+        token = w3.eth.contract(
+            address=Web3.to_checksum_address(VSP_TOKEN_ADDRESS),
+            abi=VSP_TOKEN_ABI,
+        )
+        val = token.functions.allowance(
+            Web3.to_checksum_address(owner),
+            Web3.to_checksum_address(spender),
+        ).call()
+        return {"allowance": str(val)}
+    except Exception as e:
+        print(f"token/allowance failed: {e}")
+        return {"allowance": "0"}
+
+
+@app.get("/api/token/balance")
+def token_balance(address: str):
+    """Read VSP token balance. Frontend calls this instead of readContract."""
+    from web3 import Web3
+    from config import RPC_URL
+    from chain.abi import VSP_TOKEN_ABI
+    from config import VSP_TOKEN_ADDRESS
+    try:
+        w3 = Web3(Web3.HTTPProvider(RPC_URL))
+        token = w3.eth.contract(
+            address=Web3.to_checksum_address(VSP_TOKEN_ADDRESS),
+            abi=VSP_TOKEN_ABI,
+        )
+        val = token.functions.balanceOf(
+            Web3.to_checksum_address(address),
+        ).call()
+        return {"balance": str(val)}
+    except Exception as e:
+        print(f"token/balance failed: {e}")
+        return {"balance": "0"}
 
 
 @app.post("/api/claims/stake")

@@ -6,14 +6,18 @@ Used by the TopicExplorer frontend component.
 from __future__ import annotations
 
 import logging
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
+from sqlalchemy import text as sql_text
+from sqlalchemy.orm import Session
 from web3 import Web3
 
 from mm_wallet import w3
 from config import PROTOCOL_VIEWS_ADDRESS, STAKE_ENGINE_ADDRESS
 from chain.abi import PROTOCOL_VIEWS_ABI, STAKE_ENGINE_ABI
+from db import get_db
+from moderation import check_content_fast
 
 logger = logging.getLogger(__name__)
 
@@ -48,22 +52,88 @@ def _wei_to_vsp(wei: int) -> float:
     return wei / 1e18
 
 
+def _moderate_text(text: str) -> str:
+    """Return text if clean, or a placeholder if blocked."""
+    mod = check_content_fast(text)
+    if mod.allowed:
+        return text
+    return "[Content hidden — policy violation]"
+
+
+# ── /all must be defined BEFORE /{post_id} routes ──
+
+@router.get("/all")
+def all_claims(limit: int = 100, offset: int = 0, db: Session = Depends(get_db)):
+    """List all on-chain claims with metrics."""
+    rows = db.execute(sql_text("""
+        SELECT c.claim_id, c.claim_text, c.post_id, c.created_tms,
+               COALESCE(ta.topic_key, '') as topic
+        FROM claim c
+        LEFT JOIN article_sentence s ON s.post_id = c.post_id
+        LEFT JOIN article_section sec ON s.section_id = sec.section_id
+        LEFT JOIN topic_article ta ON sec.article_id = ta.article_id
+        WHERE c.post_id IS NOT NULL
+        GROUP BY c.claim_id, c.claim_text, c.post_id, c.created_tms, ta.topic_key
+        ORDER BY c.post_id
+        LIMIT :limit OFFSET :offset
+    """), {"limit": limit, "offset": offset}).fetchall()
+
+    if not rows:
+        return {"claims": [], "total": 0}
+
+    views = _views()
+    results = []
+
+    for row in rows:
+        post_id = row[2]
+        if post_id is None:
+            continue
+        try:
+            s = views.functions.getClaimSummary(post_id).call()
+            support = _wei_to_vsp(int(s[1]))
+            challenge = _wei_to_vsp(int(s[2]))
+            total = _wei_to_vsp(int(s[3]))
+            vs = _ray_to_pct(int(s[7]))
+            base_vs = _ray_to_pct(int(s[6]))
+            incoming = int(s[8])
+            outgoing = int(s[9])
+            controversy = total * (100 - abs(vs)) / 100 if total > 0 else 0
+
+            results.append({
+                "post_id": post_id,
+                "text": _moderate_text(str(s[0])),
+                "verity_score": vs,
+                "base_vs": base_vs,
+                "stake_support": round(support, 4),
+                "stake_challenge": round(challenge, 4),
+                "total_stake": round(total, 4),
+                "controversy": round(controversy, 4),
+                "incoming_links": incoming,
+                "outgoing_links": outgoing,
+                "topic": row[4] or "",
+                "created_at": row[3].isoformat() if row[3] else None,
+            })
+        except Exception as e:
+            logger.warning(f"Failed to fetch summary for post {post_id}: {e}")
+            continue
+
+    results.sort(key=lambda x: -x["total_stake"])
+    total_count = db.execute(sql_text(
+        "SELECT COUNT(*) FROM claim WHERE post_id IS NOT NULL"
+    )).scalar() or 0
+
+    return {"claims": results, "total": total_count}
+
+
 @router.get("/{post_id}/summary")
 def claim_summary(post_id: int):
-    """
-    Full claim summary from ProtocolViews.getClaimSummary().
-    Returns text, VS, stakes, link counts.
-    """
+    """Full claim summary from ProtocolViews.getClaimSummary()."""
     try:
         views = _views()
         s = views.functions.getClaimSummary(post_id).call()
-        # ClaimSummary struct fields (by index):
-        #   0: text, 1: supportStake, 2: challengeStake, 3: totalStake,
-        #   4: postingFee, 5: isActive, 6: baseVSRay, 7: effectiveVSRay,
-        #   8: incomingCount, 9: outgoingCount
         return {
             "post_id": post_id,
-            "text": str(s[0]),
+            "text": _moderate_text(str(s[0])),
             "stake_support": _wei_to_vsp(int(s[1])),
             "stake_challenge": _wei_to_vsp(int(s[2])),
             "total_stake": _wei_to_vsp(int(s[3])),
@@ -83,26 +153,12 @@ def claim_summary(post_id: int):
 
 @router.get("/{post_id}/edges")
 def claim_edges(post_id: int):
-    """
-    Fetch incoming and outgoing evidence edges for a claim.
-
-    Returns:
-        {
-            "incoming": [ { claim_post_id, link_post_id, is_challenge, claim_text, claim_vs, ... } ],
-            "outgoing": [ ... ]
-        }
-
-    Each edge includes the linked claim's text, VS, and stake info for both
-    the claim itself and the link post.
-    """
+    """Fetch incoming and outgoing evidence edges for a claim."""
     try:
         views = _views()
         stake_engine = _stake()
 
-        # Fetch raw edges from ProtocolViews
-        # IncomingEdge: (fromClaimPostId, linkPostId, isChallenge)
         raw_incoming = views.functions.getIncomingEdges(post_id).call()
-        # Edge: (toClaimPostId, linkPostId, isChallenge)
         raw_outgoing = views.functions.getOutgoingEdges(post_id).call()
 
         def enrich_edge(
@@ -110,17 +166,14 @@ def claim_edges(post_id: int):
             link_post_id: int,
             is_challenge: bool,
         ) -> Dict[str, Any]:
-            """Enrich an edge with claim text, VS, and link stakes."""
             result: Dict[str, Any] = {
                 "claim_post_id": claim_post_id,
                 "link_post_id": link_post_id,
                 "is_challenge": is_challenge,
             }
-
-            # Fetch linked claim summary (text + VS)
             try:
                 cs = views.functions.getClaimSummary(claim_post_id).call()
-                result["claim_text"] = str(cs[0])
+                result["claim_text"] = _moderate_text(str(cs[0]))
                 result["claim_vs"] = _ray_to_pct(int(cs[7]))
                 result["claim_support"] = _wei_to_vsp(int(cs[1]))
                 result["claim_challenge"] = _wei_to_vsp(int(cs[2]))
@@ -129,8 +182,6 @@ def claim_edges(post_id: int):
                 result["claim_vs"] = 0
                 result["claim_support"] = 0
                 result["claim_challenge"] = 0
-
-            # Fetch link post stakes
             try:
                 ls, lc = stake_engine.functions.getPostTotals(link_post_id).call()
                 result["link_support"] = _wei_to_vsp(int(ls))
@@ -138,7 +189,6 @@ def claim_edges(post_id: int):
             except Exception:
                 result["link_support"] = 0
                 result["link_challenge"] = 0
-
             return result
 
         incoming: List[Dict[str, Any]] = []

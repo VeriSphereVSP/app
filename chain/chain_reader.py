@@ -1,7 +1,10 @@
 # app/chain/chain_reader.py
 """
-Read-only chain queries for stake totals, user stakes, and verity scores.
-Used by claim-status endpoint and relay post-confirmation.
+On-chain read helpers.
+
+StakeEngine v2 view functions (getUserStake, getPostTotals) already
+project epoch gains/losses lazily — they always return the current
+virtual balance, not stale snapshots. No separate projection needed.
 """
 
 import json
@@ -44,7 +47,14 @@ STAKE_ENGINE_ABI = _load_abi("StakeEngine") or [
             {"name": "postId", "type": "uint256"},
             {"name": "side", "type": "uint8"},
         ],
-        "outputs": [{"name": "total", "type": "uint256"}],
+        "outputs": [{"name": "", "type": "uint256"}],
+        "stateMutability": "view",
+    },
+    {
+        "type": "function",
+        "name": "sMax",
+        "inputs": [],
+        "outputs": [{"name": "", "type": "uint256"}],
         "stateMutability": "view",
     },
 ]
@@ -90,7 +100,7 @@ def _get_score_engine():
 
 
 def get_stake_totals(post_id):
-    """Returns (support_float, challenge_float) in VSP units."""
+    """Returns (support, challenge) in VSP units. Already projected."""
     try:
         se = _get_stake_engine()
         support_wei, challenge_wei = se.functions.getPostTotals(post_id).call()
@@ -101,7 +111,7 @@ def get_stake_totals(post_id):
 
 
 def get_user_stake(user_address, post_id, side):
-    """Returns user's stake in VSP units. side: 0=support, 1=challenge."""
+    """Returns user's projected stake in VSP units. side: 0=support, 1=challenge."""
     try:
         se = _get_stake_engine()
         addr = Web3.to_checksum_address(user_address)
@@ -118,7 +128,12 @@ def get_user_stake(user_address, post_id, side):
 def get_verity_score(post_id):
     """Returns verity score as a float in -100 to +100 range.
     effectiveVSRay returns a Ray-scaled int256 where 1e18 = 1.0 (i.e. 100%).
-    Falls back to raw stake ratio if on-chain score is 0 but stakes exist."""
+    Falls back to stake-share formula if on-chain score is 0 but stakes exist.
+    
+    Formula: if support > challenge → +(support/total)*100
+             if challenge > support → -(challenge/total)*100
+             if equal or zero → 0
+    """
     try:
         se = _get_score_engine()
         vs_ray = se.functions.effectiveVSRay(post_id).call()
@@ -128,14 +143,74 @@ def get_verity_score(post_id):
     except Exception as e:
         logger.warning("Failed to read verity score for post %d: %s", post_id, e)
 
-    # Fallback: compute from raw stake totals
-    # This covers the case where updatePost() hasn't been called yet
+    # Fallback: compute using same formula as ScoreEngine.baseVSRay
     try:
         support, challenge = get_stake_totals(post_id)
         total = support + challenge
         if total > 0.001:
-            return ((support - challenge) / total) * 100
+            if support > challenge:
+                return (support / total) * 100
+            elif challenge > support:
+                return -(challenge / total) * 100
+            else:
+                return 0.0
     except Exception:
         pass
 
     return 0.0
+
+
+def get_estimated_apr(post_id, side="support"):
+    """Estimate annualized rate for a position on this post.
+    
+    Formula from whitepaper:
+      rEff = rMin + (rMax - rMin) * v * participation
+    where:
+      v = abs(VS) / 100  (truth pressure, 0-1)
+      participation = T / sMax  (post size factor, 0-1)
+      rMin = 1% APR, rMax = 100% APR (from StakeRatePolicy)
+    
+    Winners (side matches VS sign): earn at +rEff APR (newly minted VSP)
+    Losers (side opposes VS sign): lose at -rEff APR (stake burned)
+    """
+    R_MIN = 0.01  # 1% APR minimum
+    R_MAX = 1.00  # 100% APR maximum
+    
+    try:
+        support, challenge = get_stake_totals(post_id)
+        total = support + challenge
+        if total < 0.001:
+            return 0.0
+        
+        vs = get_verity_score(post_id)
+        abs_vs = abs(vs)
+        v = abs_vs / 100.0  # normalized truth pressure (0-1)
+        
+        # Get sMax from contract
+        try:
+            se = _get_stake_engine()
+            s_max_wei = se.functions.sMax().call()
+            s_max = s_max_wei / 1e18
+        except Exception:
+            s_max = total  # fallback: assume this post IS the max
+        
+        if s_max < 0.001:
+            s_max = total
+        
+        participation = min(total / s_max, 1.0)  # post size factor (0-1)
+        
+        # Effective annual rate
+        r_eff = R_MIN + (R_MAX - R_MIN) * v * participation
+        
+        # Determine if this side wins or loses
+        support_wins = vs > 0
+        is_winner = (side == "support" and support_wins) or (side == "challenge" and not support_wins)
+        
+        if vs == 0:
+            return 0.0  # no pressure at VS=0
+        
+        return r_eff * 100 if is_winner else -r_eff * 100  # return as percentage
+        
+    except Exception as e:
+        logger.warning("Failed to estimate APR for post %d: %s", post_id, e)
+        return 0.0

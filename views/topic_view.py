@@ -14,7 +14,13 @@ from semantic import compute_one
 
 logger = logging.getLogger(__name__)
 
-TOPIC_RELEVANCE_THRESHOLD = 0.65
+# Lowered from 0.65 → 0.45 so on-chain claims surface more readily.
+# The LLM classifier handles true relevance filtering (via "irrelevant" action).
+TOPIC_RELEVANCE_THRESHOLD = 0.45
+
+# Per-AI-claim search threshold — claims semantically close to any AI
+# incumbent should be surfaced even if they're distant from the raw topic text.
+PER_CLAIM_SIMILARITY_THRESHOLD = 0.55
 
 
 def _fetch_on_chain_claims(db: Session, topic_embedding: str, limit: int = 20):
@@ -48,6 +54,43 @@ def _fetch_on_chain_claims(db: Session, topic_embedding: str, limit: int = 20):
         return result
     except Exception as e:
         logger.warning("Failed to fetch on-chain claims: %s", e)
+        return []
+
+
+def _fetch_on_chain_claims_for_text(db: Session, claim_text: str, limit: int = 5):
+    """
+    Fetch on-chain claims semantically similar to a specific claim text.
+    Used per-AI-claim to find challengers/duplicates that the topic-level
+    search might miss (e.g. "earth" topic wouldn't find "The Earth is flat"
+    but the AI claim "Earth is an oblate spheroid" would).
+    """
+    try:
+        vec = _embed_text(claim_text)
+        rows = db.execute(
+            sql_text("""
+                SELECT c.claim_id, c.claim_text, c.post_id,
+                       1 - (ce.embedding <=> CAST(:vec AS vector)) AS similarity
+                FROM claim c
+                JOIN claim_embedding ce ON ce.claim_id = c.claim_id
+                WHERE c.post_id IS NOT NULL
+                ORDER BY ce.embedding <=> CAST(:vec AS vector)
+                LIMIT :lim
+            """),
+            {"vec": vec, "lim": limit},
+        ).fetchall()
+        result = [
+            {
+                "claim_id": r[0],
+                "text": r[1],
+                "post_id": r[2],
+                "similarity": float(r[3]),
+            }
+            for r in rows
+            if float(r[3]) >= PER_CLAIM_SIMILARITY_THRESHOLD
+        ]
+        return result
+    except Exception as e:
+        logger.warning("Failed to fetch per-claim on-chain claims for '%s': %s", claim_text[:50], e)
         return []
 
 
@@ -160,6 +203,27 @@ def build_topic_view(db, ai_claims, topic_text, user_address=None):
 
     topic_vec = _embed_text(topic_text)
     on_chain_claims = _fetch_on_chain_claims(db, topic_vec, limit=30)
+
+    # ── NEW: Per-AI-claim on-chain search ─────────────────────────
+    # For each AI claim, also search for on-chain claims semantically
+    # close to that specific claim. This catches challengers that the
+    # broad topic search misses (e.g., "Earth is flat" won't match
+    # topic "earth" at 0.65 but will match "Earth is the third planet").
+    seen_claim_ids = {c["claim_id"] for c in on_chain_claims}
+    for ai_claim in ai_claims:
+        ai_text = ai_claim.get("text", "")
+        if not ai_text:
+            continue
+        per_claim_hits = _fetch_on_chain_claims_for_text(db, ai_text, limit=5)
+        for hit in per_claim_hits:
+            if hit["claim_id"] not in seen_claim_ids:
+                on_chain_claims.append(hit)
+                seen_claim_ids.add(hit["claim_id"])
+                logger.info(
+                    "  per-claim match: AI='%s' -> on-chain='%s' sim=%.3f post_id=%s",
+                    ai_text[:40], hit["text"][:40], hit["similarity"], hit["post_id"],
+                )
+    # ──────────────────────────────────────────────────────────────
 
     # Phase 1: Exact hash matches for AI claims
     hash_matched_ids = set()

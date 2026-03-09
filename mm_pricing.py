@@ -54,7 +54,7 @@ def _base_price(n: float, gold_usd: float, unit_au: float) -> float:
     Returns price in USD per 1 VSP.
     """
     if n >= 0:
-        return (math.log10(n + 10) ** 2) * unit_au * gold_usd
+        return (1 + math.log10(max(1, n))) * unit_au * gold_usd
     # Negative territory handled by caller via _reserve_price
     # This shouldn't be reached, but defensive:
     return unit_au * gold_usd * 0.01

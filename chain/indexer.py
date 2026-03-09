@@ -123,6 +123,8 @@ def _upsert_claim(db, claim_text, post_id):
                 ), {"pid": post_id, "cid": row[0]})
                 logger.info("Updated claim (id=%d) with post_id=%d", row[0], post_id)
             db.commit()
+            # Also try to link any unlinked article sentences
+            _try_link_sentences(db, claim_text, post_id)
             return
 
     result = db.execute(sql_text(
@@ -141,7 +143,26 @@ def _upsert_claim(db, claim_text, post_id):
         logger.warning("Failed to embed claim %d: %s", cid, e)
 
     db.commit()
+    _try_link_sentences(db, claim_text, post_id)
     logger.info("Indexed new on-chain claim: id=%d post_id=%d text=%s", cid, post_id, claim_text[:60])
+
+
+def _try_link_sentences(db, claim_text, post_id):
+    """Link any article_sentence rows that match this claim text but have no post_id."""
+    try:
+        result = db.execute(sql_text(
+            "UPDATE article_sentence SET post_id = :pid "
+            "WHERE LOWER(TRIM(text)) = LOWER(TRIM(:t)) AND post_id IS NULL"
+        ), {"pid": post_id, "t": claim_text})
+        if result.rowcount > 0:
+            db.commit()
+            logger.info("Auto-linked %d sentence(s) to post_id=%d", result.rowcount, post_id)
+    except Exception as e:
+        logger.warning("Failed to auto-link sentences for post_id=%d: %s", post_id, e)
+        try:
+            db.rollback()
+        except Exception:
+            pass
 
 
 def _sync_posts(w3, contract, db):
@@ -155,6 +176,7 @@ def _sync_posts(w3, contract, db):
     if next_post_id <= last_synced:
         return
 
+    logger.info("Syncing posts %d..%d (nextPostId=%d)", last_synced, next_post_id - 1, next_post_id)
     new_count = 0
     for pid in range(last_synced, next_post_id):
         try:
@@ -189,19 +211,27 @@ async def run_indexer():
     )
 
     SessionLocal = get_session_factory()
-    db = SessionLocal()
 
+    # Initial setup with a fresh session
+    db = SessionLocal()
     try:
         _ensure_indexer_state_table(db)
         _ensure_post_id_column(db)
-        logger.info("Indexer running (polling nextPostId every %ds)", POLL_INTERVAL)
-        _sync_posts(w3, contract, db)
-
-        while True:
-            try:
-                _sync_posts(w3, contract, db)
-            except Exception as e:
-                logger.exception("Indexer error: %s", e)
-            await asyncio.sleep(POLL_INTERVAL)
     finally:
         db.close()
+
+    logger.info("Indexer running (polling nextPostId every %ds)", POLL_INTERVAL)
+
+    while True:
+        # Use a fresh DB session each cycle to avoid stale connections
+        db = SessionLocal()
+        try:
+            _sync_posts(w3, contract, db)
+        except Exception as e:
+            logger.exception("Indexer error: %s", e)
+        finally:
+            try:
+                db.close()
+            except Exception:
+                pass
+        await asyncio.sleep(POLL_INTERVAL)

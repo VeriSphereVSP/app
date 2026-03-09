@@ -1,0 +1,347 @@
+# app/article_routes.py
+"""
+Article API endpoints.
+
+GET  /api/article/{topic}                    → full article with VS-enriched sentences
+POST /api/article/{topic}/generate           → AI-generate + store (idempotent)
+POST /api/article/sentence/insert            → add sentence to a section
+POST /api/article/sentence/{id}/edit         → replace sentence (create new + challenge old)
+POST /api/article/sentence/{id}/register     → register sentence on-chain (lazy)
+POST /api/article/sentence/cleanup           → AI grammar cleanup
+GET  /api/disambiguate                       → typeahead search
+"""
+import logging
+from typing import Optional, List
+
+from fastapi import APIRouter, HTTPException, Depends
+from pydantic import BaseModel
+from sqlalchemy.orm import Session
+
+from db import get_db
+
+logger = logging.getLogger(__name__)
+router = APIRouter(prefix="/api", tags=["article"])
+
+
+# ── Request models ──────────────────────────────────────
+
+class GenerateRequest(BaseModel):
+    refresh: bool = False
+
+class InsertRequest(BaseModel):
+    section_id: int
+    after_sentence_id: Optional[int] = None
+    text: str
+
+class EditRequest(BaseModel):
+    new_text: str
+
+class CleanupRequest(BaseModel):
+    text: str
+    topic: str = ""
+
+class RegisterRequest(BaseModel):
+    """Empty — just triggers on-chain registration."""
+    pass
+
+
+# ── Helpers ─────────────────────────────────────────────
+
+def _enrich_sentences(article: dict) -> dict:
+    """Add VS, stake totals to each sentence that has a post_id."""
+    try:
+        from chain.chain_reader import get_stake_totals, get_verity_score
+    except ImportError:
+        return article
+
+    for section in article.get("sections", []):
+        for sent in section.get("sentences", []):
+            pid = sent.get("post_id")
+            if pid is not None:
+                try:
+                    s, c = get_stake_totals(pid)
+                    sent["stake_support"] = s
+                    sent["stake_challenge"] = c
+                    sent["verity_score"] = get_verity_score(pid)
+                except Exception:
+                    sent["stake_support"] = 0
+                    sent["stake_challenge"] = 0
+                    sent["verity_score"] = 0
+            else:
+                sent["stake_support"] = 0
+                sent["stake_challenge"] = 0
+                sent["verity_score"] = 0
+    return article
+
+
+def _ensure_sentence_in_claim_db(db: Session, text: str) -> int:
+    """Ensure a sentence exists in the claim table, return claim_id."""
+    from semantic import ensure_claim
+    return ensure_claim(db, text)
+
+
+def _link_unlinked_sentences(db: Session, article: dict):
+    """For any article sentence with post_id=NULL, check if an on-chain claim
+    with matching text exists and link them. This handles the case where a claim
+    was created on-chain but the link_post callback didn't fire."""
+    from article_store import update_sentence_post_id
+    patched = 0
+    for section in article.get("sections", []):
+        for sent in section.get("sentences", []):
+            if sent.get("post_id") is not None:
+                continue
+            sid = sent.get("sentence_id")
+            text = sent.get("text", "").strip()
+            if not sid or not text:
+                continue
+            try:
+                row = db.execute(sql_text(
+                    "SELECT post_id FROM claim "
+                    "WHERE LOWER(TRIM(claim_text)) = LOWER(TRIM(:t)) "
+                    "AND post_id IS NOT NULL LIMIT 1"
+                ), {"t": text}).fetchone()
+                if row:
+                    update_sentence_post_id(db, sid, row[0])
+                    sent["post_id"] = row[0]
+                    patched += 1
+            except Exception as e:
+                logger.warning("Failed to link sentence %d: %s", sid, e)
+    if patched:
+        logger.info("Patched %d unlinked sentences with on-chain post_ids", patched)
+
+
+# ── Endpoints ───────────────────────────────────────────
+
+@router.get("/article/{topic}")
+def get_article(topic: str, db: Session = Depends(get_db)):
+    """Get a full article. If it doesn't exist, generate it."""
+    from article_store import ensure_tables, get_article as load_article
+    ensure_tables(db)
+
+    article = load_article(db, topic)
+    if not article:
+        # Auto-generate
+        return _generate_and_store(topic, db, refresh=False)
+
+    # Patch any sentences that match on-chain claims but aren't linked yet
+    _link_unlinked_sentences(db, article)
+
+    return _enrich_sentences(article)
+
+
+@router.post("/article/{topic}/generate")
+def generate_article_endpoint(topic: str, req: GenerateRequest,
+                              db: Session = Depends(get_db)):
+    """Generate (or regenerate) an article for a topic."""
+    return _generate_and_store(topic, db, refresh=req.refresh)
+
+
+def _generate_and_store(topic: str, db: Session, refresh: bool) -> dict:
+    from article_store import ensure_tables, get_article as load_article, store_article
+    from article_gen import generate_article
+    ensure_tables(db)
+
+    if not refresh:
+        existing = load_article(db, topic)
+        if existing:
+            return _enrich_sentences(existing)
+
+    logger.info("Generating article for '%s'", topic)
+    result = generate_article(topic)
+
+    store_article(db, topic, result["title"], result["sections"])
+    article = load_article(db, topic)
+    if not article:
+        raise HTTPException(500, "Failed to load article after storing")
+
+    # Also ensure each sentence is in the claim table for embedding search
+    for section in article["sections"]:
+        for sent in section["sentences"]:
+            try:
+                _ensure_sentence_in_claim_db(db, sent["text"])
+            except Exception as e:
+                logger.warning("Failed to ensure claim for '%s': %s", sent["text"][:50], e)
+
+    # Index existing on-chain claims into this new article
+    try:
+        from claim_indexer import index_existing_claims_into_article
+        index_existing_claims_into_article(db, article["article_id"])
+        # Re-load to include any indexed claims
+        article = load_article(db, topic)
+    except Exception as e:
+        logger.warning("Claim indexing failed (non-fatal): %s", e)
+
+    return _enrich_sentences(article)
+
+
+@router.post("/article/sentence/insert")
+def insert_sentence_endpoint(req: InsertRequest, db: Session = Depends(get_db)):
+    """Insert a new sentence into a section."""
+    from article_store import ensure_tables, insert_sentence
+    from article_gen import split_into_sentences
+    ensure_tables(db)
+
+    sentences = split_into_sentences(req.text)
+    inserted = []
+
+    after_id = req.after_sentence_id
+    for sent_text in sentences:
+        sid = insert_sentence(db, req.section_id, after_id, sent_text)
+
+        # Ensure in claim DB
+        try:
+            _ensure_sentence_in_claim_db(db, sent_text)
+        except Exception:
+            pass
+
+        # Check if already on chain
+        from sqlalchemy import text as sql_text
+        existing_post = db.execute(sql_text(
+            "SELECT post_id FROM claim WHERE LOWER(TRIM(claim_text)) = LOWER(TRIM(:t)) "
+            "AND post_id IS NOT NULL LIMIT 1"
+        ), {"t": sent_text}).fetchone()
+        existing_pid = existing_post[0] if existing_post else None
+        if existing_pid:
+            from article_store import update_sentence_post_id
+            update_sentence_post_id(db, sid, existing_pid)
+
+        inserted.append({"sentence_id": sid, "text": sent_text, "post_id": existing_pid})
+        after_id = sid  # Chain insertions
+
+    return {"inserted": inserted}
+
+
+@router.post("/article/sentence/{sentence_id}/edit")
+def edit_sentence_endpoint(sentence_id: int, req: EditRequest,
+                           db: Session = Depends(get_db)):
+    """Replace a sentence: creates new sentence(s) + marks old as replaced.
+
+    The frontend is responsible for creating the on-chain challenge link
+    (new_post_id challenges old_post_id) since that requires the user's wallet.
+    """
+    from article_store import (
+        ensure_tables, insert_sentence, mark_replaced,
+    )
+    from article_gen import split_into_sentences
+    from sqlalchemy import text as sql_text
+    ensure_tables(db)
+
+    # Get the old sentence's section_id
+    old = db.execute(sql_text(
+        "SELECT section_id, sort_order, text, post_id FROM article_sentence "
+        "WHERE sentence_id = :id"
+    ), {"id": sentence_id}).fetchone()
+    if not old:
+        raise HTTPException(404, "Sentence not found")
+
+    section_id, old_order, old_text, old_post_id = old
+
+    # Split new text into sentences
+    new_sentences = split_into_sentences(req.new_text)
+    created = []
+
+    after_id = sentence_id
+    for sent_text in new_sentences:
+        new_sid = insert_sentence(db, section_id, after_id, sent_text)
+        try:
+            _ensure_sentence_in_claim_db(db, sent_text)
+        except Exception:
+            pass
+
+        # Check if this claim already exists on-chain
+        existing_post = db.execute(sql_text(
+            "SELECT post_id FROM claim WHERE LOWER(TRIM(claim_text)) = LOWER(TRIM(:t)) "
+            "AND post_id IS NOT NULL LIMIT 1"
+        ), {"t": sent_text}).fetchone()
+        existing_pid = existing_post[0] if existing_post else None
+        if existing_pid:
+            from article_store import update_sentence_post_id
+            update_sentence_post_id(db, new_sid, existing_pid)
+
+        created.append({
+            "sentence_id": new_sid,
+            "text": sent_text,
+            "post_id": existing_pid,  # Frontend can skip createClaim if already on chain
+        })
+        after_id = new_sid
+
+    # Mark old as replaced by the first new sentence
+    if created:
+        mark_replaced(db, sentence_id, created[0]["sentence_id"])
+
+    return {
+        "old_sentence_id": sentence_id,
+        "old_post_id": old_post_id,
+        "created": created,
+    }
+
+
+@router.post("/article/sentence/{sentence_id}/register")
+def register_sentence_endpoint(sentence_id: int,
+                               db: Session = Depends(get_db)):
+    """Register a sentence on-chain. Called when a user first interacts with it.
+
+    Note: actual on-chain tx is done client-side via wallet. This endpoint
+    just links the sentence to its post_id after the client reports it.
+    """
+    # This is actually handled by a separate call — the client creates the
+    # claim on-chain and then calls this to update the DB.
+    # See: POST /api/article/sentence/{id}/link_post
+    raise HTTPException(501,
+        "Use /api/article/sentence/{id}/link_post with {post_id} instead")
+
+
+class LinkPostRequest(BaseModel):
+    post_id: int
+
+@router.post("/article/sentence/{sentence_id}/link_post")
+def link_post_endpoint(sentence_id: int, req: LinkPostRequest,
+                       db: Session = Depends(get_db)):
+    """Link a sentence to its on-chain post_id after client-side registration."""
+    from article_store import ensure_tables, update_sentence_post_id
+    ensure_tables(db)
+    update_sentence_post_id(db, sentence_id, req.post_id)
+    return {"sentence_id": sentence_id, "post_id": req.post_id}
+
+
+@router.post("/article/sentence/cleanup")
+def cleanup_sentence_endpoint(req: CleanupRequest):
+    """AI grammar/spelling cleanup. Returns original + suggested."""
+    from article_gen import cleanup_sentence
+    original = req.text.strip()
+    suggested = cleanup_sentence(original, topic=req.topic)
+    return {"original": original, "suggested": suggested}
+
+
+@router.get("/disambiguate")
+def disambiguate_endpoint(q: str, db: Session = Depends(get_db)):
+    """Typeahead disambiguation for search bar."""
+    if not q or len(q.strip()) < 1:
+        return {"results": []}
+    from article_store import ensure_tables, disambiguate
+    ensure_tables(db)
+    return {"results": disambiguate(db, q.strip())}
+
+
+@router.get("/claims/{post_id}/stakes")
+def get_user_stakes(post_id: int, user: str = None):
+    """Get stake totals and user-specific stakes for a post_id."""
+    try:
+        from chain.chain_reader import get_stake_totals, get_user_stake, get_verity_score
+        support, challenge = get_stake_totals(post_id)
+        result = {
+            "post_id": post_id,
+            "stake_support": support,
+            "stake_challenge": challenge,
+            "verity_score": get_verity_score(post_id),
+            "user_support": 0,
+            "user_challenge": 0,
+        }
+        if user:
+            result["user_support"] = get_user_stake(user, post_id, 0)
+            result["user_challenge"] = get_user_stake(user, post_id, 1)
+        return result
+    except Exception as e:
+        logger.warning("Failed to read stakes for post %d: %s", post_id, e)
+        return {"post_id": post_id, "stake_support": 0, "stake_challenge": 0,
+                "verity_score": 0, "user_support": 0, "user_challenge": 0}

@@ -7,18 +7,17 @@ from config import POST_REGISTRY_ADDRESS
 def create_claim(text: str) -> str:
     if not POST_REGISTRY_ADDRESS:
         raise ValueError("POST_REGISTRY_ADDRESS not set")
-    
+
     contract = w3.eth.contract(
         address=Web3.to_checksum_address(POST_REGISTRY_ADDRESS),
         abi=POST_REGISTRY_ABI
     )
 
     try:
-        # Build transaction - this will estimate gas and might fail
         tx = contract.functions.createClaim(text).build_transaction({
             "from": account.address,
             "nonce": w3.eth.get_transaction_count(account.address, "pending"),
-            "gas": 300000,  # Set explicit gas to skip estimation
+            "gas": 500000,  # Needs ~300k through UUPS proxy delegatecall
         })
     except Exception as e:
         print(f"Error building transaction: {e}")
@@ -30,12 +29,12 @@ def create_claim(text: str) -> str:
 def create_link(independent_post_id: int, dependent_post_id: int, is_challenge: bool) -> str:
     if not POST_REGISTRY_ADDRESS:
         raise ValueError("POST_REGISTRY_ADDRESS not set")
-    
+
     contract = w3.eth.contract(
         address=Web3.to_checksum_address(POST_REGISTRY_ADDRESS),
         abi=POST_REGISTRY_ABI
     )
-    
+
     try:
         tx = contract.functions.createLink(
             independent_post_id,
@@ -44,11 +43,11 @@ def create_link(independent_post_id: int, dependent_post_id: int, is_challenge: 
         ).build_transaction({
             "from": account.address,
             "nonce": w3.eth.get_transaction_count(account.address, "pending"),
-            "gas": 400000,  # Set explicit gas
+            "gas": 700000,  # Higher than createClaim: crosses into LinkGraph proxy
         })
     except Exception as e:
         print(f"Error building link transaction: {e}")
         raise
-    
+
     tx_hash = sign_and_send(tx)
     return tx_hash
