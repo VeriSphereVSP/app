@@ -12,9 +12,12 @@ from __future__ import annotations
 import logging
 from typing import List, Dict, Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
+from sqlalchemy import text as sql_text
 from web3 import Web3
 
+from db import get_db
+from sqlalchemy.orm import Session
 from mm_wallet import w3
 from config import PROTOCOL_VIEWS_ADDRESS, POST_REGISTRY_ADDRESS
 from chain.abi import PROTOCOL_VIEWS_ABI, POST_REGISTRY_ABI
@@ -50,7 +53,7 @@ def _ray_to_pct(ray_value: int) -> float:
 
 
 @router.get("/{address}")
-def user_portfolio(address: str):
+def user_portfolio(address: str, db: Session = Depends(get_db)):
     try:
         addr = Web3.to_checksum_address(address)
     except Exception:
@@ -108,6 +111,18 @@ def user_portfolio(address: str):
             pos["creator"] = None
 
         # VS and text
+        # Look up topic for this claim
+        try:
+            topic_row = db.execute(sql_text(
+                "SELECT ta.topic_key FROM article_sentence s "
+                "JOIN article_section sec ON s.section_id = sec.section_id "
+                "JOIN topic_article ta ON sec.article_id = ta.article_id "
+                "WHERE s.post_id = :pid LIMIT 1"
+            ), {"pid": post_id}).fetchone()
+            pos["topic"] = topic_row[0] if topic_row else None
+        except Exception:
+            pos["topic"] = None
+
         if pos["post_type"] == "claim":
             try:
                 cs = views.functions.getClaimSummary(post_id).call()
@@ -170,14 +185,62 @@ def user_portfolio(address: str):
         # Estimated APR from on-chain rate formula
         if pos["post_type"] == "claim":
             try:
-                from chain.chain_reader import get_estimated_apr
-                pos["estimated_apr"] = round(get_estimated_apr(post_id, pos["user_net_side"]), 1)
+                from chain.chain_reader import get_estimated_apr, get_apr_breakdown
+                breakdown = get_apr_breakdown(post_id, pos["user_net_side"])
+                # Enrich with user's queue position
+                try:
+                    from chain.chain_reader import get_user_lot_info
+                    side_int = 0 if pos["user_net_side"] == "support" else 1
+                    lot_info = get_user_lot_info(address, post_id, side_int)
+                    if lot_info:
+                        breakdown["tranche"] = lot_info["tranche"]
+                        breakdown["position_weight"] = round(lot_info["position_weight"], 3)
+                        breakdown["num_tranches"] = 10
+                        # Adjust r_eff by position weight
+                        breakdown["r_base"] = breakdown["r_eff"]
+                        breakdown["r_eff"] = round(breakdown["r_eff"] * lot_info["position_weight"], 2)
+                        # Recalculate APR with position weight
+                        if breakdown.get("vs", 0) == 0:
+                            r_actual = 0
+                            breakdown["r_eff"] = 0
+                            breakdown["r_base"] = 0
+                        else:
+                            r_actual = breakdown["r_eff"]
+                        breakdown["apr"] = round(r_actual if breakdown["is_winner"] else -r_actual, 1)
+                except Exception as e:
+                    import logging; logging.getLogger(__name__).debug("Lot info failed: %s", e)
+                pos["estimated_apr"] = breakdown["apr"]
+                pos["apr_breakdown"] = breakdown
             except Exception:
                 pos["estimated_apr"] = 0
         else:
             try:
-                from chain.chain_reader import get_estimated_apr
-                pos["estimated_apr"] = round(get_estimated_apr(post_id, pos["user_net_side"]), 1)
+                from chain.chain_reader import get_estimated_apr, get_apr_breakdown
+                breakdown = get_apr_breakdown(post_id, pos["user_net_side"])
+                # Enrich with user's queue position
+                try:
+                    from chain.chain_reader import get_user_lot_info
+                    side_int = 0 if pos["user_net_side"] == "support" else 1
+                    lot_info = get_user_lot_info(address, post_id, side_int)
+                    if lot_info:
+                        breakdown["tranche"] = lot_info["tranche"]
+                        breakdown["position_weight"] = round(lot_info["position_weight"], 3)
+                        breakdown["num_tranches"] = 10
+                        # Adjust r_eff by position weight
+                        breakdown["r_base"] = breakdown["r_eff"]
+                        breakdown["r_eff"] = round(breakdown["r_eff"] * lot_info["position_weight"], 2)
+                        # Recalculate APR with position weight
+                        if breakdown.get("vs", 0) == 0:
+                            r_actual = 0
+                            breakdown["r_eff"] = 0
+                            breakdown["r_base"] = 0
+                        else:
+                            r_actual = breakdown["r_eff"]
+                        breakdown["apr"] = round(r_actual if breakdown["is_winner"] else -r_actual, 1)
+                except Exception as e:
+                    import logging; logging.getLogger(__name__).debug("Lot info failed: %s", e)
+                pos["estimated_apr"] = breakdown["apr"]
+                pos["apr_breakdown"] = breakdown
             except Exception:
                 pos["estimated_apr"] = 0
 
@@ -199,6 +262,17 @@ def user_portfolio(address: str):
 
     for k in ["total_staked", "total_support", "total_challenge"]:
         summary[k] = round(summary[k], 6)
+
+    # Compute weighted average APR
+    weighted_apr = 0.0
+    total_for_apr = 0.0
+    for p in positions:
+        apr = p.get("estimated_apr", 0)
+        stake = p.get("user_total", 0)
+        if stake > 0:
+            weighted_apr += apr * stake
+            total_for_apr += stake
+    summary["weighted_apr"] = round(weighted_apr / total_for_apr, 1) if total_for_apr > 0 else 0.0
 
     return {
         "address": address,

@@ -81,11 +81,20 @@ def _ensure_sentence_in_claim_db(db: Session, text: str) -> int:
 
 
 def _link_unlinked_sentences(db: Session, article: dict):
-    """For any article sentence with post_id=NULL, check if an on-chain claim
-    with matching text exists and link them. This handles the case where a claim
-    was created on-chain but the link_post callback didn't fire."""
+    """For any article sentence with post_id=NULL, find matching on-chain claims
+    using semantic embedding similarity — not just exact text match."""
     from article_store import update_sentence_post_id
+    from semantic import find_best_onchain_match
     patched = 0
+    already_used = set()
+
+    # Collect existing post_ids
+    for section in article.get("sections", []):
+        for sent in section.get("sentences", []):
+            pid = sent.get("post_id")
+            if pid is not None:
+                already_used.add(pid)
+
     for section in article.get("sections", []):
         for sent in section.get("sentences", []):
             if sent.get("post_id") is not None:
@@ -95,17 +104,19 @@ def _link_unlinked_sentences(db: Session, article: dict):
             if not sid or not text:
                 continue
             try:
-                row = db.execute(sql_text(
-                    "SELECT post_id FROM claim "
-                    "WHERE LOWER(TRIM(claim_text)) = LOWER(TRIM(:t)) "
-                    "AND post_id IS NOT NULL LIMIT 1"
-                ), {"t": text}).fetchone()
-                if row:
-                    update_sentence_post_id(db, sid, row[0])
-                    sent["post_id"] = row[0]
+                match = find_best_onchain_match(db, text, exclude_post_ids=already_used)
+                if match:
+                    update_sentence_post_id(db, sid, match["post_id"])
+                    sent["post_id"] = match["post_id"]
+                    already_used.add(match["post_id"])
                     patched += 1
+                    logger.info(
+                        "Semantic link: sentence %d -> post %d (sim=%.3f) '%s' <-> '%s'",
+                        sid, match["post_id"], match["similarity"],
+                        text[:30], match["claim_text"][:30],
+                    )
             except Exception as e:
-                logger.warning("Failed to link sentence %d: %s", sid, e)
+                logger.warning("Failed to semantic-link sentence %d: %s", sid, e)
     if patched:
         logger.info("Patched %d unlinked sentences with on-chain post_ids", patched)
 
@@ -125,6 +136,15 @@ def get_article(topic: str, db: Session = Depends(get_db)):
 
     # Patch any sentences that match on-chain claims but aren't linked yet
     _link_unlinked_sentences(db, article)
+
+    # Index any on-chain claims that are relevant but not yet in this article
+    try:
+        from claim_indexer import index_existing_claims_into_article
+        index_existing_claims_into_article(db, article["article_id"])
+        # Re-load to include any newly indexed claims
+        article = load_article(db, topic)
+    except Exception as e:
+        logger.warning("Claim re-indexing failed (non-fatal): %s", e)
 
     return _enrich_sentences(article)
 

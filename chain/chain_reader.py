@@ -57,6 +57,31 @@ STAKE_ENGINE_ABI = _load_abi("StakeEngine") or [
         "outputs": [{"name": "", "type": "uint256"}],
         "stateMutability": "view",
     },
+    {
+        "type": "function",
+        "name": "numTranches",
+        "inputs": [],
+        "outputs": [{"name": "", "type": "uint256"}],
+        "stateMutability": "view",
+    },
+    {
+        "type": "function",
+        "name": "getUserLotInfo",
+        "inputs": [
+            {"name": "user", "type": "address"},
+            {"name": "postId", "type": "uint256"},
+            {"name": "side", "type": "uint8"},
+        ],
+        "outputs": [
+            {"name": "amount", "type": "uint256"},
+            {"name": "weightedPosition", "type": "uint256"},
+            {"name": "entryEpoch", "type": "uint256"},
+            {"name": "sideTotal", "type": "uint256"},
+            {"name": "tranche", "type": "uint256"},
+            {"name": "positionWeight", "type": "uint256"},
+        ],
+        "stateMutability": "view",
+    },
 ]
 
 SCORE_ENGINE_ABI = _load_abi("ScoreEngine") or [
@@ -138,8 +163,7 @@ def get_verity_score(post_id):
         se = _get_score_engine()
         vs_ray = se.functions.effectiveVSRay(post_id).call()
         vs = (vs_ray / 1e18) * 100
-        if vs != 0:
-            return vs
+        return vs  # 0 is a valid score (contested/neutral)
     except Exception as e:
         logger.warning("Failed to read verity score for post %d: %s", post_id, e)
 
@@ -214,3 +238,96 @@ def get_estimated_apr(post_id, side="support"):
     except Exception as e:
         logger.warning("Failed to estimate APR for post %d: %s", post_id, e)
         return 0.0
+
+
+def get_apr_breakdown(post_id, side="support"):
+    """Return APR and its component factors for display.
+    
+    Returns dict with:
+      apr: final APR percentage
+      r_min, r_max: rate bounds
+      vs: verity score
+      abs_vs: absolute VS
+      v: truth pressure (0-1)
+      total_stake: post total stake
+      s_max: system-wide max stake
+      participation: post size factor (0-1)
+      r_eff: effective rate before sign
+      is_winner: whether this side is winning
+    """
+    R_MIN = 0.01
+    R_MAX = 1.00
+    
+    result = {
+        "apr": 0.0, "r_min": R_MIN * 100, "r_max": R_MAX * 100,
+        "vs": 0.0, "abs_vs": 0.0, "v": 0.0,
+        "total_stake": 0.0, "s_max": 0.0, "participation": 0.0,
+        "r_eff": 0.0, "is_winner": False,
+    }
+    
+    try:
+        support, challenge = get_stake_totals(post_id)
+        total = support + challenge
+        result["total_stake"] = round(total, 4)
+        
+        if total < 0.001:
+            return result
+        
+        vs = get_verity_score(post_id)
+        abs_vs = abs(vs)
+        v = abs_vs / 100.0
+        result["vs"] = round(vs, 2)
+        result["abs_vs"] = round(abs_vs, 2)
+        result["v"] = round(v, 4)
+        
+        try:
+            se = _get_stake_engine()
+            s_max_wei = se.functions.sMax().call()
+            s_max = s_max_wei / 1e18
+        except Exception:
+            s_max = total
+        
+        if s_max < 0.001:
+            s_max = total
+        result["s_max"] = round(s_max, 4)
+        
+        participation = min(total / s_max, 1.0)
+        result["participation"] = round(participation, 4)
+        
+        r_eff = R_MIN + (R_MAX - R_MIN) * v * participation
+        result["r_eff"] = round(r_eff * 100, 2)
+        
+        support_wins = vs > 0
+        is_winner = (side == "support" and support_wins) or (side == "challenge" and not support_wins)
+        result["is_winner"] = is_winner
+        
+        if vs == 0:
+            return result
+        
+        result["apr"] = round(r_eff * 100 if is_winner else -r_eff * 100, 1)
+        return result
+        
+    except Exception as e:
+        logger.warning("Failed to get APR breakdown for post %d: %s", post_id, e)
+        return result
+
+
+def get_user_lot_info(user_address, post_id, side):
+    """Returns lot info: (amount, weightedPosition, entryEpoch, sideTotal, tranche, positionWeight).
+    positionWeight is RAY-scaled (1e18 = 1.0 = best position)."""
+    try:
+        se = _get_stake_engine()
+        addr = Web3.to_checksum_address(user_address)
+        result = se.functions.getUserLotInfo(addr, post_id, side).call()
+        return {
+            "amount": result[0] / 1e18,
+            "weighted_position": result[1] / 1e18,
+            "entry_epoch": result[2],
+            "side_total": result[3] / 1e18,
+            "tranche": result[4],
+            "position_weight": result[5] / 1e18,  # 1.0 = best, 0.1 = worst
+        }
+    except Exception as e:
+        logger.warning("Failed to get lot info for %s post %d side %d: %s",
+                       user_address, post_id, side, e)
+        return None

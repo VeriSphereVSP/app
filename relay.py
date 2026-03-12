@@ -78,9 +78,21 @@ class ForwardRequestPayload(BaseModel):
     data: str
 
 
+class PermitPayload(BaseModel):
+    token: str
+    owner: str
+    spender: str
+    value: str  # String to handle large numbers
+    deadline: int
+    v: int
+    r: str
+    s: str
+
+
 class RelayRequest(BaseModel):
     request: ForwardRequestPayload
     signature: str
+    permit: PermitPayload | None = None
 
 
 class NonceResponse(BaseModel):
@@ -220,6 +232,47 @@ def _check_duplicate_claim(calldata_hex, req_from, db):
     return None
 
 
+
+def _execute_permit(permit):
+    """Execute an EIP-2612 permit on behalf of the user. Relay pays gas."""
+    token_addr = Web3.to_checksum_address(permit.token)
+    owner_addr = Web3.to_checksum_address(permit.owner)
+    spender_addr = Web3.to_checksum_address(permit.spender)
+    value = int(permit.value)
+    r_bytes = bytes.fromhex(permit.r.removeprefix("0x"))
+    s_bytes = bytes.fromhex(permit.s.removeprefix("0x"))
+
+    permit_abi = [{
+        "inputs": [
+            {"name": "owner", "type": "address"},
+            {"name": "spender", "type": "address"},
+            {"name": "value", "type": "uint256"},
+            {"name": "deadline", "type": "uint256"},
+            {"name": "v", "type": "uint8"},
+            {"name": "r", "type": "bytes32"},
+            {"name": "s", "type": "bytes32"},
+        ],
+        "name": "permit",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function",
+    }]
+
+    contract = w3.eth.contract(address=token_addr, abi=permit_abi)
+    mm_addr = Web3.to_checksum_address(__import__("config").MM_ADDRESS)
+
+    tx = contract.functions.permit(
+        owner_addr, spender_addr, value, permit.deadline, permit.v, r_bytes, s_bytes,
+    ).build_transaction({"from": mm_addr, "gas": 120_000})
+
+    tx_hash = sign_and_send(tx)
+    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=30)
+    if receipt.status == 0:
+        raise HTTPException(400, "Permit transaction reverted")
+    logger.info("Permit executed: token=%s owner=%s spender=%s tx=%s",
+                permit.token[:10], permit.owner[:10], permit.spender[:10], tx_hash)
+
+
 def _moderate_claim(calldata_hex: str) -> None:
     """Check if createClaim calldata contains blocked content. Raises HTTPException if blocked."""
     try:
@@ -265,6 +318,10 @@ async def relay(body: RelayRequest, db: Session = Depends(get_db)):
             sig_bytes,
         )
 
+        # Execute permit if provided (relay pays gas)
+        if body.permit:
+            _execute_permit(body.permit)
+
         # Content moderation gate
         _moderate_claim(calldata_hex)
 
@@ -298,7 +355,7 @@ async def relay(body: RelayRequest, db: Session = Depends(get_db)):
             "from": w3.eth.default_account or Web3.to_checksum_address(
                 __import__("config").MM_ADDRESS),
             "value": req.value,
-            "gas": req.gas + 80_000,
+            "gas": req.gas + 150_000,
         })
         tx_hash = sign_and_send(tx)
         logger.info("Submitted meta-tx: from=%s to=%s tx=%s", req.from_, req.to, tx_hash)

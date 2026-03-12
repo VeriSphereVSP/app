@@ -16,6 +16,8 @@ from sqlalchemy import text as sql_text
 
 logger = logging.getLogger(__name__)
 
+from semantic import find_best_onchain_match, find_all_onchain_matches, OVERLAY_THRESHOLD
+
 # Simple stop words
 _STOP = {"a","an","the","is","are","was","were","be","been","being","have","has",
          "had","do","does","did","will","would","shall","should","may","might",
@@ -107,10 +109,16 @@ def is_claim_relevant_to_article(db: Session, article_id: int, claim_text: str) 
 
 
 def index_existing_claims_into_article(db: Session, article_id: int):
-    """Find on-chain claims that belong in a newly generated article and insert them."""
+    """Find on-chain claims that belong in an article and overlay them.
+
+    Two modes:
+    1. OVERLAY: If an article sentence semantically matches an on-chain claim,
+       link the sentence to the claim's post_id.
+    2. INSERT: If no matching sentence exists but the claim is topically relevant,
+       insert it into the best section.
+    """
     from article_store import insert_sentence, update_sentence_post_id
 
-    # Get all on-chain claims
     claims = db.execute(sql_text(
         "SELECT claim_id, claim_text, post_id FROM claim "
         "WHERE post_id IS NOT NULL ORDER BY post_id"
@@ -120,21 +128,53 @@ def index_existing_claims_into_article(db: Session, article_id: int):
         logger.info("No on-chain claims to index")
         return
 
-    # Get existing article sentence texts (for dedup)
-    existing = db.execute(sql_text(
-        "SELECT LOWER(TRIM(s.text)) FROM article_sentence s "
+    sentences = db.execute(sql_text(
+        "SELECT s.sentence_id, s.text, s.post_id, sec.section_id "
+        "FROM article_sentence s "
         "JOIN article_section sec ON s.section_id = sec.section_id "
-        "WHERE sec.article_id = :a"
+        "WHERE sec.article_id = :a "
+        "ORDER BY sec.sort_order, s.sort_order"
     ), {"a": article_id}).fetchall()
-    existing_texts = {r[0] for r in existing}
+
+    existing_texts = {r[1].lower().strip() for r in sentences}
+    existing_pids = {r[2] for r in sentences if r[2] is not None}
 
     indexed_count = 0
+
     for cid, ctext, pid in claims:
         ctext_key = ctext.lower().strip()
 
+        if pid in existing_pids:
+            continue
+
+        # Strategy 1: OVERLAY — find a sentence that semantically matches this claim
+        overlaid = False
+        for sent_id, sent_text, sent_pid, sec_id in sentences:
+            if sent_pid is not None:
+                continue
+            try:
+                matches = find_all_onchain_matches(db, sent_text, top_k=3)
+                for m in matches:
+                    if m["post_id"] == pid and m["similarity"] >= OVERLAY_THRESHOLD:
+                        update_sentence_post_id(db, sent_id, pid)
+                        existing_pids.add(pid)
+                        indexed_count += 1
+                        overlaid = True
+                        logger.info(
+                            "Overlaid claim post_id=%d onto sentence %d (sim=%.3f): '%s' <-> '%s'",
+                            pid, sent_id, m["similarity"], ctext[:40], sent_text[:40],
+                        )
+                        break
+            except Exception as e:
+                logger.debug("Semantic overlay check failed for sent %d: %s", sent_id, e)
+            if overlaid:
+                break
+
+        if overlaid:
+            continue
+
+        # Strategy 2: Exact text match already in article but not linked
         if ctext_key in existing_texts:
-            # Text already exists in article — but does it have a post_id?
-            # If not, link the existing sentence to this on-chain claim.
             try:
                 unlinked = db.execute(sql_text(
                     "SELECT s.sentence_id FROM article_sentence s "
@@ -144,23 +184,22 @@ def index_existing_claims_into_article(db: Session, article_id: int):
                 ), {"a": article_id, "t": ctext_key}).fetchone()
                 if unlinked:
                     update_sentence_post_id(db, unlinked[0], pid)
+                    existing_pids.add(pid)
                     indexed_count += 1
-                    logger.info("Linked existing sentence %d to on-chain claim post_id=%d '%s'",
+                    logger.info("Linked existing sentence %d to claim post_id=%d '%s'",
                                 unlinked[0], pid, ctext[:40])
             except Exception as e:
                 logger.warning("Failed to link existing sentence to post_id=%d: %s", pid, e)
             continue
 
-        # Check relevance to this article
+        # Strategy 3: INSERT — claim is relevant but no matching sentence exists
         if not is_claim_relevant_to_article(db, article_id, ctext):
             continue
 
-        # Find best section
         sec_id = find_best_section(db, article_id, ctext)
         if sec_id is None:
             continue
 
-        # Insert at end of section
         last_sent = db.execute(sql_text(
             "SELECT sentence_id FROM article_sentence "
             "WHERE section_id = :s ORDER BY sort_order DESC LIMIT 1"
@@ -170,9 +209,10 @@ def index_existing_claims_into_article(db: Session, article_id: int):
         try:
             new_sid = insert_sentence(db, sec_id, after_id, ctext)
             update_sentence_post_id(db, new_sid, pid)
-            existing_texts.add(ctext.lower().strip())
+            existing_texts.add(ctext_key)
+            existing_pids.add(pid)
             indexed_count += 1
-            logger.info("Indexed on-chain claim post_id=%d '%s' into article %d section %d",
+            logger.info("Inserted on-chain claim post_id=%d '%s' into article %d section %d",
                         pid, ctext[:40], article_id, sec_id)
         except Exception as e:
             logger.warning("Failed to index claim post_id=%d: %s", pid, e)

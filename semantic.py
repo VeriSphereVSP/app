@@ -138,3 +138,67 @@ def compute_one(db, claim_text, top_k=5):
         "max_similarity": max_sim,
         "similar": similar,
     }
+
+OVERLAY_THRESHOLD = 0.82
+
+def find_best_onchain_match(db, sentence_text, exclude_post_ids=None):
+    """Find the best on-chain claim matching a sentence by embedding similarity."""
+    if not sentence_text or not sentence_text.strip():
+        return None
+    exclude_post_ids = exclude_post_ids or set()
+
+    # Strategy 1: exact text match
+    row = db.execute(
+        text("SELECT claim_id, claim_text, post_id FROM claim "
+             "WHERE post_id IS NOT NULL AND LOWER(TRIM(claim_text)) = LOWER(TRIM(:t)) LIMIT 1"),
+        {"t": sentence_text},
+    ).fetchone()
+    if row and int(row[2]) not in exclude_post_ids:
+        return {"claim_id": int(row[0]), "claim_text": str(row[1]),
+                "post_id": int(row[2]), "similarity": 1.0}
+
+    # Strategy 2: embedding similarity
+    try:
+        cid = ensure_claim(db, sentence_text)
+        rows = db.execute(text(
+            "WITH q AS (SELECT embedding FROM claim_embedding WHERE claim_id = :id) "
+            "SELECT c.claim_id, c.claim_text, c.post_id, "
+            "  (1.0 - (e.embedding <=> q.embedding)) AS similarity "
+            "FROM claim c JOIN claim_embedding e USING (claim_id) CROSS JOIN q "
+            "WHERE c.claim_id != :id AND c.post_id IS NOT NULL "
+            "ORDER BY (e.embedding <=> q.embedding) ASC LIMIT 5"
+        ), {"id": cid}).fetchall()
+        for r in rows:
+            pid = int(r[2])
+            sim = float(r[3])
+            if pid in exclude_post_ids:
+                continue
+            if sim >= OVERLAY_THRESHOLD:
+                return {"claim_id": int(r[0]), "claim_text": str(r[1]),
+                        "post_id": pid, "similarity": sim}
+    except Exception as e:
+        logger.debug(f"Embedding match failed: {e}")
+
+    return None
+
+
+def find_all_onchain_matches(db, sentence_text, top_k=3):
+    """Find all on-chain claims matching a sentence above the overlay threshold."""
+    if not sentence_text or not sentence_text.strip():
+        return []
+    try:
+        cid = ensure_claim(db, sentence_text)
+        rows = db.execute(text(
+            "WITH q AS (SELECT embedding FROM claim_embedding WHERE claim_id = :id) "
+            "SELECT c.claim_id, c.claim_text, c.post_id, "
+            "  (1.0 - (e.embedding <=> q.embedding)) AS similarity "
+            "FROM claim c JOIN claim_embedding e USING (claim_id) CROSS JOIN q "
+            "WHERE c.claim_id != :id AND c.post_id IS NOT NULL "
+            "ORDER BY (e.embedding <=> q.embedding) ASC LIMIT :k"
+        ), {"id": cid, "k": top_k}).fetchall()
+        return [{"claim_id": int(r[0]), "claim_text": str(r[1]),
+                 "post_id": int(r[2]), "similarity": float(r[3])}
+                for r in rows if float(r[3]) >= OVERLAY_THRESHOLD]
+    except Exception as e:
+        logger.debug(f"find_all_onchain_matches failed: {e}")
+        return []

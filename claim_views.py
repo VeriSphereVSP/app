@@ -74,6 +74,7 @@ def all_claims(limit: int = 100, offset: int = 0, db: Session = Depends(get_db))
         LEFT JOIN topic_article ta ON sec.article_id = ta.article_id
         WHERE c.post_id IS NOT NULL
         GROUP BY c.claim_id, c.claim_text, c.post_id, c.created_tms, ta.topic_key
+        HAVING ta.topic_key = MIN(ta.topic_key) OR ta.topic_key IS NULL
         ORDER BY c.post_id
         LIMIT :limit OFFSET :offset
     """), {"limit": limit, "offset": offset}).fetchall()

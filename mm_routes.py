@@ -3,10 +3,6 @@
 # PROPRIETARY — Market Maker API routes.
 # Do NOT reference in whitepaper or public documentation.
 # ============================================================
-#
-# The ONLY public commitment: /api/mm/floor always returns the
-# real-time liquidation floor price (reserves / circulating supply).
-# All other pricing details are implementation internals.
 
 from __future__ import annotations
 
@@ -29,6 +25,10 @@ from mm_pricing import (
     DEFAULT_HALF_SPREAD,
 )
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/api/mm", tags=["market-maker"])
 
 
@@ -37,7 +37,6 @@ router = APIRouter(prefix="/api/mm", tags=["market-maker"])
 # ────────────────────────────────────────────────────────────
 
 def _load_mm_state(db: Session, *, for_update: bool = False):
-    """Load mm_state row. Returns (net_vsp, unit_au, half_spread, usdc_reserves, vsp_circulating)."""
     suffix = " FOR UPDATE" if for_update else ""
     row = db.execute(
         text(
@@ -50,12 +49,7 @@ def _load_mm_state(db: Session, *, for_update: bool = False):
     return row
 
 
-def _update_mm_state(
-    db: Session,
-    net_vsp: int,
-    usdc_reserves: float,
-    vsp_circulating: float,
-):
+def _update_mm_state(db, net_vsp, usdc_reserves, vsp_circulating):
     db.execute(
         text(
             "UPDATE mm_state "
@@ -67,19 +61,8 @@ def _update_mm_state(
     )
 
 
-def _log_trade(
-    db: Session,
-    *,
-    side: str,
-    user_address: str,
-    qty_vsp: float,
-    total_usdc: float,
-    avg_price_usd: float,
-    net_vsp_before: int,
-    net_vsp_after: int,
-    usdc_reserves_after: float,
-    vsp_circulating_after: float,
-):
+def _log_trade(db, *, side, user_address, qty_vsp, total_usdc, avg_price_usd,
+               net_vsp_before, net_vsp_after, usdc_reserves_after, vsp_circulating_after):
     db.execute(
         text(
             "INSERT INTO mm_trade "
@@ -87,18 +70,73 @@ def _log_trade(
             " net_vsp_before, net_vsp_after, usdc_reserves_after, vsp_circulating_after) "
             "VALUES (:side, :user, :qty, :total, :avg, :nb, :na, :ra, :ca)"
         ),
-        {
-            "side": side,
-            "user": user_address,
-            "qty": qty_vsp,
-            "total": total_usdc,
-            "avg": avg_price_usd,
-            "nb": net_vsp_before,
-            "na": net_vsp_after,
-            "ra": usdc_reserves_after,
-            "ca": vsp_circulating_after,
-        },
+        {"side": side, "user": user_address, "qty": qty_vsp, "total": total_usdc,
+         "avg": avg_price_usd, "nb": net_vsp_before, "na": net_vsp_after,
+         "ra": usdc_reserves_after, "ca": vsp_circulating_after},
     )
+
+
+# ── EIP-2612 permit execution ──────────────────────────────
+
+PERMIT_ABI = [
+    {
+        "inputs": [
+            {"name": "owner", "type": "address"},
+            {"name": "spender", "type": "address"},
+            {"name": "value", "type": "uint256"},
+            {"name": "deadline", "type": "uint256"},
+            {"name": "v", "type": "uint8"},
+            {"name": "r", "type": "bytes32"},
+            {"name": "s", "type": "bytes32"},
+        ],
+        "name": "permit",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function",
+    },
+    {
+        "inputs": [{"name": "owner", "type": "address"}],
+        "name": "nonces",
+        "outputs": [{"name": "", "type": "uint256"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+]
+
+
+def _execute_permit(token_address: str, owner: str, spender: str,
+                    value: int, deadline: int, v: int, r: str, s: str):
+    """Call permit() on an ERC-2612 token. MM pays gas."""
+    from web3 import Web3
+    from mm_wallet import w3, sign_and_send
+
+    contract = w3.eth.contract(
+        address=Web3.to_checksum_address(token_address),
+        abi=PERMIT_ABI,
+    )
+
+    r_bytes = bytes.fromhex(r.removeprefix("0x"))
+    s_bytes = bytes.fromhex(s.removeprefix("0x"))
+
+    tx = contract.functions.permit(
+        Web3.to_checksum_address(owner),
+        Web3.to_checksum_address(spender),
+        value,
+        deadline,
+        v,
+        r_bytes,
+        s_bytes,
+    ).build_transaction({
+        "from": Web3.to_checksum_address(MM_ADDRESS),
+        "gas": 120_000,
+    })
+
+    tx_hash = sign_and_send(tx)
+    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=30)
+    if receipt.status == 0:
+        raise HTTPException(400, "Permit transaction reverted on-chain")
+    logger.info("Permit executed: token=%s owner=%s value=%d tx=%s", token_address[:10], owner[:10], value, tx_hash)
+    return tx_hash
 
 
 # ────────────────────────────────────────────────────────────
@@ -107,11 +145,6 @@ def _log_trade(
 
 @router.get("/floor")
 def mm_floor(db: Session = Depends(get_db)):
-    """
-    PUBLIC: Real-time liquidation floor price.
-    This is the minimum price at which any VSP holder can sell.
-    floor = USDC reserves / total VSP in circulation.
-    """
     try:
         row = _load_mm_state(db)
         net_vsp, unit_au, half_spread, usdc_reserves, vsp_circulating = row
@@ -129,24 +162,17 @@ def mm_floor(db: Session = Depends(get_db)):
 
 
 # ────────────────────────────────────────────────────────────
-# Spot quote (indicative, not guaranteed)
+# Spot quote
 # ────────────────────────────────────────────────────────────
 
 @router.get("/quote")
 def mm_quote(db: Session = Depends(get_db)):
-    """
-    Indicative spot prices. Actual fills are volume-integrated and
-    may differ from spot, especially for large orders.
-    """
     try:
         row = _load_mm_state(db)
         net_vsp, unit_au, half_spread, usdc_reserves, vsp_circulating = row
         q = get_spot_quote(
-            net_vsp=net_vsp,
-            usdc_reserves=usdc_reserves,
-            vsp_circulating=vsp_circulating,
-            unit_au=unit_au,
-            half_spread=half_spread,
+            net_vsp=net_vsp, usdc_reserves=usdc_reserves,
+            vsp_circulating=vsp_circulating, unit_au=unit_au, half_spread=half_spread,
         )
         return {
             "mid_price_usd": round(q.mid_price_usd, 8),
@@ -172,30 +198,15 @@ class FillPreviewRequest(BaseModel):
 
 @router.post("/preview")
 def mm_preview(req: FillPreviewRequest, db: Session = Depends(get_db)):
-    """
-    Preview what a fill would cost / yield at current state.
-    Does NOT execute the trade. Returns the volume-integrated total.
-    """
     try:
         row = _load_mm_state(db)
         net_vsp, unit_au, half_spread, usdc_reserves, vsp_circulating = row
-
         if req.side == "buy":
-            fill = compute_buy_fill(
-                net_vsp, req.qty_vsp,
-                usdc_reserves, vsp_circulating,
-                unit_au, half_spread,
-            )
+            fill = compute_buy_fill(net_vsp, req.qty_vsp, usdc_reserves, vsp_circulating, unit_au, half_spread)
         else:
-            fill = compute_sell_fill(
-                net_vsp, req.qty_vsp,
-                usdc_reserves, vsp_circulating,
-                unit_au, half_spread,
-            )
-
+            fill = compute_sell_fill(net_vsp, req.qty_vsp, usdc_reserves, vsp_circulating, unit_au, half_spread)
         return {
-            "side": req.side,
-            "qty_vsp": req.qty_vsp,
+            "side": req.side, "qty_vsp": req.qty_vsp,
             "total_usdc": round(fill.total_usd, 6),
             "avg_price_usd": round(fill.avg_price_usd, 8),
             "ts": datetime.now(timezone.utc).isoformat(),
@@ -207,23 +218,52 @@ def mm_preview(req: FillPreviewRequest, db: Session = Depends(get_db)):
 
 
 # ────────────────────────────────────────────────────────────
-# Execute trade
+# Permit nonce lookup (frontend needs this to sign permits)
 # ────────────────────────────────────────────────────────────
+
+@router.get("/permit-nonce/{token}/{address}")
+def get_permit_nonce(token: str, address: str):
+    """Get EIP-2612 permit nonce for an address on a given token."""
+    from web3 import Web3
+    from mm_wallet import w3
+
+    # Map friendly names to addresses
+    token_map = {"usdc": USDC_ADDRESS, "vsp": VSP_ADDRESS}
+    token_addr = token_map.get(token.lower(), token)
+
+    contract = w3.eth.contract(
+        address=Web3.to_checksum_address(token_addr),
+        abi=PERMIT_ABI,
+    )
+    nonce = contract.functions.nonces(Web3.to_checksum_address(address)).call()
+    return {"nonce": nonce, "token": token_addr}
+
+
+# ────────────────────────────────────────────────────────────
+# Execute trades with EIP-2612 permit (gasless for user)
+# ────────────────────────────────────────────────────────────
+
+class PermitFields(BaseModel):
+    deadline: int
+    v: int
+    r: str
+    s: str
+    value: int  # Approved amount in token smallest unit
+
 
 class MMTradeRequest(BaseModel):
     user_address: str
     qty_vsp: float = Field(..., gt=0)
-    max_total_usdc: float = Field(
-        ..., gt=0,
-        description="Max USDC user is willing to pay (buy) or min willing to receive (sell)",
-    )
+    max_total_usdc: float = Field(..., gt=0)
+    permit: PermitFields | None = None  # Optional — if provided, MM executes permit first
 
 
 @router.post("/buy")
 def mm_buy(req: MMTradeRequest, db: Session = Depends(get_db)):
     """
-    Buy VSP with USDC. Volume-integrated pricing.
-    User specifies qty_vsp and max_total_usdc (slippage protection).
+    Buy VSP with USDC.
+    If permit is provided, MM executes USDC.permit() first (gasless for user).
+    Otherwise, falls back to checking existing allowance.
     """
     try:
         with db.begin():
@@ -231,51 +271,46 @@ def mm_buy(req: MMTradeRequest, db: Session = Depends(get_db)):
             net_vsp, unit_au, half_spread, usdc_reserves, vsp_circulating = row
 
             fill = compute_buy_fill(
-                net_vsp, req.qty_vsp,
-                usdc_reserves, vsp_circulating,
-                unit_au, half_spread,
+                net_vsp, req.qty_vsp, usdc_reserves, vsp_circulating, unit_au, half_spread,
             )
 
             if fill.total_usd > req.max_total_usdc:
-                raise HTTPException(
-                    400,
-                    f"Fill cost {fill.total_usd:.6f} USDC exceeds max {req.max_total_usdc:.6f}",
-                )
+                raise HTTPException(400, f"Fill cost {fill.total_usd:.6f} USDC exceeds max {req.max_total_usdc:.6f}")
 
             usdc_micro = int(fill.total_usd * 1_000_000)
 
-            if allowance(USDC_ADDRESS, req.user_address, MM_ADDRESS) < usdc_micro:
-                raise HTTPException(400, "USDC allowance too low")
+            # Execute permit if provided
+            if req.permit:
+                if req.permit.value < usdc_micro:
+                    raise HTTPException(400, f"Permit value {req.permit.value} < needed {usdc_micro}")
+                _execute_permit(
+                    USDC_ADDRESS, req.user_address, MM_ADDRESS,
+                    req.permit.value, req.permit.deadline,
+                    req.permit.v, req.permit.r, req.permit.s,
+                )
+            else:
+                # Legacy: check existing allowance
+                if allowance(USDC_ADDRESS, req.user_address, MM_ADDRESS) < usdc_micro:
+                    raise HTTPException(400, "USDC allowance too low — provide a permit signature")
 
             # Execute on-chain transfers
             transfer_from(USDC_ADDRESS, req.user_address, MM_ADDRESS, usdc_micro)
             transfer(VSP_ADDRESS, req.user_address, int(req.qty_vsp * 10**18))
 
-            # Update reserves
             new_net = fill.new_net_vsp
             new_reserves = usdc_reserves + fill.total_usd
             new_circ = vsp_circulating + req.qty_vsp
 
             _update_mm_state(db, new_net, new_reserves, new_circ)
-            _log_trade(
-                db,
-                side="buy",
-                user_address=req.user_address,
-                qty_vsp=req.qty_vsp,
-                total_usdc=fill.total_usd,
-                avg_price_usd=fill.avg_price_usd,
-                net_vsp_before=net_vsp,
-                net_vsp_after=new_net,
-                usdc_reserves_after=new_reserves,
-                vsp_circulating_after=new_circ,
-            )
+            _log_trade(db, side="buy", user_address=req.user_address,
+                       qty_vsp=req.qty_vsp, total_usdc=fill.total_usd,
+                       avg_price_usd=fill.avg_price_usd, net_vsp_before=net_vsp,
+                       net_vsp_after=new_net, usdc_reserves_after=new_reserves,
+                       vsp_circulating_after=new_circ)
 
-        return {
-            "ok": True,
-            "qty_vsp": req.qty_vsp,
-            "total_usdc": round(fill.total_usd, 6),
-            "avg_price_usd": round(fill.avg_price_usd, 8),
-        }
+        return {"ok": True, "qty_vsp": req.qty_vsp,
+                "total_usdc": round(fill.total_usd, 6),
+                "avg_price_usd": round(fill.avg_price_usd, 8)}
     except HTTPException:
         raise
     except Exception as e:
@@ -288,9 +323,9 @@ def mm_buy(req: MMTradeRequest, db: Session = Depends(get_db)):
 @router.post("/sell")
 def mm_sell(req: MMTradeRequest, db: Session = Depends(get_db)):
     """
-    Sell VSP for USDC. Volume-integrated pricing.
-    User specifies qty_vsp and max_total_usdc as *minimum* proceeds
-    (slippage protection — trade fails if proceeds < max_total_usdc).
+    Sell VSP for USDC.
+    If permit is provided, MM executes VSP.permit() first (gasless for user).
+    Otherwise, falls back to checking existing allowance.
     """
     try:
         with db.begin():
@@ -298,58 +333,49 @@ def mm_sell(req: MMTradeRequest, db: Session = Depends(get_db)):
             net_vsp, unit_au, half_spread, usdc_reserves, vsp_circulating = row
 
             fill = compute_sell_fill(
-                net_vsp, req.qty_vsp,
-                usdc_reserves, vsp_circulating,
-                unit_au, half_spread,
+                net_vsp, req.qty_vsp, usdc_reserves, vsp_circulating, unit_au, half_spread,
             )
 
             if fill.total_usd < req.max_total_usdc:
-                raise HTTPException(
-                    400,
-                    f"Fill proceeds {fill.total_usd:.6f} USDC below minimum {req.max_total_usdc:.6f}",
-                )
+                raise HTTPException(400, f"Fill proceeds {fill.total_usd:.6f} USDC below minimum {req.max_total_usdc:.6f}")
 
             if fill.total_usd > usdc_reserves:
-                raise HTTPException(
-                    400,
-                    "Insufficient USDC reserves to fill this sell order",
-                )
+                raise HTTPException(400, "Insufficient USDC reserves to fill this sell order")
 
             vsp_wei = int(req.qty_vsp * 10**18)
 
-            if allowance(VSP_ADDRESS, req.user_address, MM_ADDRESS) < vsp_wei:
-                raise HTTPException(400, "VSP allowance too low")
+            # Execute permit if provided
+            if req.permit:
+                if req.permit.value < vsp_wei:
+                    raise HTTPException(400, f"Permit value {req.permit.value} < needed {vsp_wei}")
+                _execute_permit(
+                    VSP_ADDRESS, req.user_address, MM_ADDRESS,
+                    req.permit.value, req.permit.deadline,
+                    req.permit.v, req.permit.r, req.permit.s,
+                )
+            else:
+                if allowance(VSP_ADDRESS, req.user_address, MM_ADDRESS) < vsp_wei:
+                    raise HTTPException(400, "VSP allowance too low — provide a permit signature")
 
             # Execute on-chain transfers
             transfer_from(VSP_ADDRESS, req.user_address, MM_ADDRESS, vsp_wei)
             usdc_micro = int(fill.total_usd * 1_000_000)
             transfer(USDC_ADDRESS, req.user_address, usdc_micro)
 
-            # Update reserves
             new_net = fill.new_net_vsp
             new_reserves = usdc_reserves - fill.total_usd
             new_circ = vsp_circulating - req.qty_vsp
 
             _update_mm_state(db, new_net, new_reserves, new_circ)
-            _log_trade(
-                db,
-                side="sell",
-                user_address=req.user_address,
-                qty_vsp=req.qty_vsp,
-                total_usdc=fill.total_usd,
-                avg_price_usd=fill.avg_price_usd,
-                net_vsp_before=net_vsp,
-                net_vsp_after=new_net,
-                usdc_reserves_after=new_reserves,
-                vsp_circulating_after=new_circ,
-            )
+            _log_trade(db, side="sell", user_address=req.user_address,
+                       qty_vsp=req.qty_vsp, total_usdc=fill.total_usd,
+                       avg_price_usd=fill.avg_price_usd, net_vsp_before=net_vsp,
+                       net_vsp_after=new_net, usdc_reserves_after=new_reserves,
+                       vsp_circulating_after=new_circ)
 
-        return {
-            "ok": True,
-            "qty_vsp": req.qty_vsp,
-            "total_usdc": round(fill.total_usd, 6),
-            "avg_price_usd": round(fill.avg_price_usd, 8),
-        }
+        return {"ok": True, "qty_vsp": req.qty_vsp,
+                "total_usdc": round(fill.total_usd, 6),
+                "avg_price_usd": round(fill.avg_price_usd, 8)}
     except HTTPException:
         raise
     except Exception as e:
