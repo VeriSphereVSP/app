@@ -72,3 +72,7 @@ print(f"  POST_REGISTRY: {POST_REGISTRY_ADDRESS}")
 print(f"  FORWARDER: {FORWARDER_ADDRESS}")
 print(f"  MM_ADDRESS: {MM_ADDRESS}")
 print(f"  RPC_URL: {RPC_URL[:50]}...")
+
+
+# Relay fee: small VSP fee deducted per meta-tx, sent to MM wallet
+RELAY_FEE_PCT = float(os.getenv("RELAY_FEE_PCT", "0.001"))  # 0.1% of transaction value

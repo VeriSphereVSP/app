@@ -13,7 +13,33 @@ from pathlib import Path
 from web3 import Web3
 from config import STAKE_ENGINE_ADDRESS, SCORE_ENGINE_ADDRESS, RPC_URL
 
+# Lazy-loaded
+_stake_rate_policy = None
+
 logger = logging.getLogger(__name__)
+
+import time
+
+# Simple in-memory TTL cache for on-chain reads
+_cache: dict = {}
+_CACHE_TTL = 30  # seconds
+
+def _cached(key: str, fn, ttl: int = _CACHE_TTL):
+    """Return cached value if fresh, otherwise call fn() and cache result."""
+    now = time.time()
+    if key in _cache:
+        val, ts = _cache[key]
+        if now - ts < ttl:
+            return val
+    val = fn()
+    _cache[key] = (val, now)
+    return val
+
+def clear_cache():
+    """Clear all cached chain reads."""
+    _cache.clear()
+
+
 
 _w3 = None
 _stake_engine = None
@@ -55,6 +81,13 @@ STAKE_ENGINE_ABI = _load_abi("StakeEngine") or [
         "name": "sMax",
         "inputs": [],
         "outputs": [{"name": "", "type": "uint256"}],
+        "stateMutability": "view",
+    },
+    {
+        "type": "function",
+        "name": "ratePolicy",
+        "inputs": [],
+        "outputs": [{"name": "", "type": "address"}],
         "stateMutability": "view",
     },
     {
@@ -126,10 +159,12 @@ def _get_score_engine():
 
 def get_stake_totals(post_id):
     """Returns (support, challenge) in VSP units. Already projected."""
-    try:
+    def _read():
         se = _get_stake_engine()
         support_wei, challenge_wei = se.functions.getPostTotals(post_id).call()
         return support_wei / 1e18, challenge_wei / 1e18
+    try:
+        return _cached(f"stakes:{post_id}", _read)
     except Exception as e:
         logger.warning("Failed to read stake totals for post %d: %s", post_id, e)
         return 0.0, 0.0
@@ -159,11 +194,12 @@ def get_verity_score(post_id):
              if challenge > support → -(challenge/total)*100
              if equal or zero → 0
     """
-    try:
+    def _read_vs():
         se = _get_score_engine()
         vs_ray = se.functions.effectiveVSRay(post_id).call()
-        vs = (vs_ray / 1e18) * 100
-        return vs  # 0 is a valid score (contested/neutral)
+        return (vs_ray / 1e18) * 100
+    try:
+        return _cached(f"vs:{post_id}", _read_vs)
     except Exception as e:
         logger.warning("Failed to read verity score for post %d: %s", post_id, e)
 
@@ -184,6 +220,32 @@ def get_verity_score(post_id):
     return 0.0
 
 
+
+
+def _get_rate_bounds():
+    """Read rMin and rMax from StakeRatePolicy on-chain. Returns (rMin, rMax) as fractions (0-1)."""
+    def _read():
+        try:
+            se = _get_stake_engine()
+            # StakeEngine has a ratePolicy() getter
+            rate_policy_addr = se.functions.ratePolicy().call()
+            rate_abi = [
+                {"type": "function", "name": "stakeIntRateMinRay",
+                 "inputs": [], "outputs": [{"type": "uint256"}], "stateMutability": "view"},
+                {"type": "function", "name": "stakeIntRateMaxRay",
+                 "inputs": [], "outputs": [{"type": "uint256"}], "stateMutability": "view"},
+            ]
+            from web3 import Web3
+            w3 = _get_w3()
+            rp = w3.eth.contract(address=Web3.to_checksum_address(rate_policy_addr), abi=rate_abi)
+            r_min = rp.functions.stakeIntRateMinRay().call() / 1e18
+            r_max = rp.functions.stakeIntRateMaxRay().call() / 1e18
+            return (r_min, r_max)
+        except Exception as e:
+            logger.warning("Failed to read rate bounds: %s", e)
+            return (0.01, 1.00)  # fallback
+    return _cached("rate_bounds", _read, ttl=300)  # cache 5 min
+
 def get_estimated_apr(post_id, side="support"):
     """Estimate annualized rate for a position on this post.
     
@@ -197,8 +259,7 @@ def get_estimated_apr(post_id, side="support"):
     Winners (side matches VS sign): earn at +rEff APR (newly minted VSP)
     Losers (side opposes VS sign): lose at -rEff APR (stake burned)
     """
-    R_MIN = 0.01  # 1% APR minimum
-    R_MAX = 1.00  # 100% APR maximum
+    R_MIN, R_MAX = _get_rate_bounds()
     
     try:
         support, challenge = get_stake_totals(post_id)
@@ -255,8 +316,7 @@ def get_apr_breakdown(post_id, side="support"):
       r_eff: effective rate before sign
       is_winner: whether this side is winning
     """
-    R_MIN = 0.01
-    R_MAX = 1.00
+    R_MIN, R_MAX = _get_rate_bounds()
     
     result = {
         "apr": 0.0, "r_min": R_MIN * 100, "r_max": R_MAX * 100,

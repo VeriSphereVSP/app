@@ -25,37 +25,8 @@ def _norm(topic: str) -> str:
 # ── Schema ──────────────────────────────────────────────
 
 def ensure_tables(db: Session):
-    db.execute(sql_text("""
-        CREATE TABLE IF NOT EXISTS topic_article (
-            article_id  SERIAL PRIMARY KEY,
-            topic_key   TEXT NOT NULL UNIQUE,
-            title       TEXT NOT NULL,
-            created_at  TIMESTAMP DEFAULT NOW(),
-            updated_at  TIMESTAMP DEFAULT NOW()
-        )
-    """))
-    db.execute(sql_text("""
-        CREATE TABLE IF NOT EXISTS article_section (
-            section_id  SERIAL PRIMARY KEY,
-            article_id  INTEGER NOT NULL REFERENCES topic_article(article_id),
-            heading     TEXT NOT NULL DEFAULT '',
-            sort_order  INTEGER NOT NULL DEFAULT 0
-        )
-    """))
-    db.execute(sql_text("""
-        CREATE TABLE IF NOT EXISTS article_sentence (
-            sentence_id SERIAL PRIMARY KEY,
-            section_id  INTEGER NOT NULL REFERENCES article_section(section_id),
-            sort_order  INTEGER NOT NULL DEFAULT 0,
-            text        TEXT NOT NULL,
-            post_id     INTEGER,
-            replaced_by INTEGER REFERENCES article_sentence(sentence_id)
-        )
-    """))
-    db.execute(sql_text(
-        "CREATE INDEX IF NOT EXISTS idx_ta_key ON topic_article(topic_key)"
-    ))
-    db.commit()
+    """No-op. Schema is now managed by ops/compose/migrations/040_article_tables.sql."""
+    pass
 
 
 # ── Reads ───────────────────────────────────────────────

@@ -12,12 +12,14 @@ from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 from web3 import Web3
+from chain_indexer import trigger_reindex
 from web3.logs import DISCARD
 
 from config import FORWARDER_ADDRESS, POST_REGISTRY_ADDRESS
 from db import get_db
 from mm_wallet import w3, sign_and_send
 from moderation import check_content
+from rate_limit import relay_rate_limit
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -233,6 +235,50 @@ def _check_duplicate_claim(calldata_hex, req_from, db):
 
 
 
+
+def _collect_relay_fee(user_address: str, tx_value_wei: int = 0):
+    """Collect a percentage-based VSP fee from the user for relay gas costs.
+    Fee = RELAY_FEE_PCT * transaction value. Minimum 0.001 VSP.
+    Uses transferFrom — requires existing allowance (from permit or manual approve).
+    Fee goes to the MM wallet."""
+    from config import RELAY_FEE_PCT, MM_ADDRESS, VSP_TOKEN_ADDRESS
+    if RELAY_FEE_PCT <= 0 or tx_value_wei <= 0:
+        return
+    fee_wei = int(tx_value_wei * RELAY_FEE_PCT)
+    min_fee = int(0.001 * 1e18)  # minimum 0.001 VSP
+    if fee_wei < min_fee:
+        fee_wei = min_fee
+    try:
+        token_abi = [{
+            "inputs": [
+                {"name": "from", "type": "address"},
+                {"name": "to", "type": "address"},
+                {"name": "amount", "type": "uint256"},
+            ],
+            "name": "transferFrom",
+            "outputs": [{"name": "", "type": "bool"}],
+            "stateMutability": "nonpayable",
+            "type": "function",
+        }]
+        token = w3.eth.contract(
+            address=Web3.to_checksum_address(VSP_TOKEN_ADDRESS),
+            abi=token_abi,
+        )
+        mm_addr = Web3.to_checksum_address(MM_ADDRESS)
+        user_addr = Web3.to_checksum_address(user_address)
+        tx = token.functions.transferFrom(
+            user_addr, mm_addr, fee_wei,
+        ).build_transaction({"from": mm_addr, "gas": 80_000})
+        tx_hash = sign_and_send(tx)
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=15)
+        if receipt.status == 1:
+            logger.info("Relay fee collected: %s VSP from %s", RELAY_FEE_VSP, user_address[:10])
+        else:
+            logger.warning("Relay fee collection reverted for %s", user_address[:10])
+    except Exception as e:
+        # Fee collection failure is non-fatal — still execute the meta-tx
+        logger.warning("Relay fee collection failed for %s: %s", user_address[:10], e)
+
 def _execute_permit(permit):
     """Execute an EIP-2612 permit on behalf of the user. Relay pays gas."""
     token_addr = Web3.to_checksum_address(permit.token)
@@ -301,6 +347,7 @@ async def get_nonce(address: str):
 
 
 @router.post("/api/relay")
+@relay_rate_limit
 async def relay(body: RelayRequest, db: Session = Depends(get_db)):
     try:
         fwd = _get_forwarder()
@@ -321,6 +368,14 @@ async def relay(body: RelayRequest, db: Session = Depends(get_db)):
         # Execute permit if provided (relay pays gas)
         if body.permit:
             _execute_permit(body.permit)
+
+        # Collect relay fee (non-fatal if fails)
+        # Extract tx value from permit or estimate from calldata
+        try:
+            tx_value = int(body.permit.value) if body.permit and body.permit.value else int(1e18)
+            _collect_relay_fee(body.request.from_address, tx_value)
+        except Exception as e:
+            logger.debug('Relay fee skip: %s', e)
 
         # Content moderation gate
         _moderate_claim(calldata_hex)

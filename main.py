@@ -22,13 +22,23 @@ from mm_routes import router as mm_router
 from claim_views import router as claim_views_router
 from portfolio_views import router as portfolio_router
 from article_routes import router as article_router
+from rate_limit import RateLimitMiddleware, cleanup_rate_limiter
 
 
 @asynccontextmanager
 async def lifespan(app):
     from chain.indexer import run_indexer
+    from chain_indexer import start_indexer
     indexer_task = asyncio.create_task(run_indexer())
+    start_indexer()
     print("Blockchain event indexer started")
+    # Periodic rate limiter cleanup
+    import asyncio as _aio
+    async def _rl_cleanup():
+        while True:
+            await _aio.sleep(600)
+            cleanup_rate_limiter()
+    _aio.create_task(_rl_cleanup())
     yield
     indexer_task.cancel()
     try:
@@ -38,7 +48,13 @@ async def lifespan(app):
     print("Blockchain event indexer stopped")
 
 
+from chain_indexer import start_indexer
+
 app = FastAPI(title="VeriSphere App API", version="0.1.0", lifespan=lifespan)
+
+
+app.add_middleware(RateLimitMiddleware)
+
 app.include_router(relay_router)
 app.include_router(mm_router)
 app.include_router(claim_views_router)
@@ -269,6 +285,22 @@ def token_balance(address: str):
         print(f"token/balance failed: {e}")
         return {"balance": "0"}
 
+
+
+
+@app.post("/api/reindex/{post_id}")
+def reindex_post(post_id: int, user: str = None):
+    """Trigger immediate reindex of a post and optionally a user's stakes."""
+    try:
+        from chain_indexer import index_post
+        from db import get_session_factory
+        db = get_session_factory()()
+        users = [user] if user else None
+        index_post(db, post_id, user_addresses=users)
+        db.close()
+        return {"ok": True, "post_id": post_id}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 @app.post("/api/claims/stake")
 def stake_endpoint(req: StakeRequest):

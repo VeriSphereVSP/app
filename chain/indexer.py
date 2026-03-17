@@ -67,26 +67,13 @@ def normalize_claim_text(text):
 
 
 def _ensure_indexer_state_table(db):
-    db.execute(sql_text(
-        "CREATE TABLE IF NOT EXISTS indexer_state "
-        "(key TEXT PRIMARY KEY, value BIGINT NOT NULL DEFAULT 0)"
-    ))
-    db.execute(sql_text(
-        "INSERT INTO indexer_state (key, value) VALUES ('last_post_id', 0) "
-        "ON CONFLICT (key) DO NOTHING"
-    ))
-    db.commit()
+    """No-op. Schema managed by migrations/050_claim_post_id.sql."""
+    pass
 
 
 def _ensure_post_id_column(db):
-    try:
-        db.execute(sql_text(
-            "ALTER TABLE claim ADD COLUMN post_id INTEGER DEFAULT NULL"
-        ))
-        db.commit()
-        logger.info("Added post_id column to claim table")
-    except Exception:
-        db.rollback()
+    """No-op. Column added by migrations/050_claim_post_id.sql."""
+    pass
 
 
 def _get_last_post_id(db):

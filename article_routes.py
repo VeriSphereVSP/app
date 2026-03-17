@@ -18,6 +18,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from db import get_db
+from rate_limit import ai_rate_limit
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api", tags=["article"])
@@ -150,6 +151,7 @@ def get_article(topic: str, db: Session = Depends(get_db)):
 
 
 @router.post("/article/{topic}/generate")
+@ai_rate_limit
 def generate_article_endpoint(topic: str, req: GenerateRequest,
                               db: Session = Depends(get_db)):
     """Generate (or regenerate) an article for a topic."""
@@ -325,6 +327,7 @@ def link_post_endpoint(sentence_id: int, req: LinkPostRequest,
 
 
 @router.post("/article/sentence/cleanup")
+@ai_rate_limit
 def cleanup_sentence_endpoint(req: CleanupRequest):
     """AI grammar/spelling cleanup. Returns original + suggested."""
     from article_gen import cleanup_sentence

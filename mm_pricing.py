@@ -31,8 +31,8 @@ from oracle import get_gold_price_usd_per_oz, get_avax_price_usd
 # Configuration (loaded from mm_state or defaults)
 # ────────────────────────────────────────────────────────────
 
-DEFAULT_UNIT_AU = 0.0002        # Fraction of troy oz per unit
-DEFAULT_HALF_SPREAD = 0.00125   # 0.125% half-spread → 0.25% round trip
+DEFAULT_UNIT_AU = 0.0001        # Fraction of troy oz per unit
+DEFAULT_HALF_SPREAD = 0.0025   # 0.25% half-spread → 0.5% round trip
 
 
 # ────────────────────────────────────────────────────────────

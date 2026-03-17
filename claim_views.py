@@ -64,66 +64,10 @@ def _moderate_text(text: str) -> str:
 
 @router.get("/all")
 def all_claims(limit: int = 100, offset: int = 0, db: Session = Depends(get_db)):
-    """List all on-chain claims with metrics."""
-    rows = db.execute(sql_text("""
-        SELECT c.claim_id, c.claim_text, c.post_id, c.created_tms,
-               COALESCE(ta.topic_key, '') as topic
-        FROM claim c
-        LEFT JOIN article_sentence s ON s.post_id = c.post_id
-        LEFT JOIN article_section sec ON s.section_id = sec.section_id
-        LEFT JOIN topic_article ta ON sec.article_id = ta.article_id
-        WHERE c.post_id IS NOT NULL
-        GROUP BY c.claim_id, c.claim_text, c.post_id, c.created_tms, ta.topic_key
-        HAVING ta.topic_key = MIN(ta.topic_key) OR ta.topic_key IS NULL
-        ORDER BY c.post_id
-        LIMIT :limit OFFSET :offset
-    """), {"limit": limit, "offset": offset}).fetchall()
+    """Deprecated: delegates to /fast/all (indexed DB, no RPC calls).
+    Kept for backward compatibility with any external callers."""
+    return claims_fast(limit=limit, db=db)
 
-    if not rows:
-        return {"claims": [], "total": 0}
-
-    views = _views()
-    results = []
-
-    for row in rows:
-        post_id = row[2]
-        if post_id is None:
-            continue
-        try:
-            s = views.functions.getClaimSummary(post_id).call()
-            support = _wei_to_vsp(int(s[1]))
-            challenge = _wei_to_vsp(int(s[2]))
-            total = _wei_to_vsp(int(s[3]))
-            vs = _ray_to_pct(int(s[7]))
-            base_vs = _ray_to_pct(int(s[6]))
-            incoming = int(s[8])
-            outgoing = int(s[9])
-            controversy = total * (100 - abs(vs)) / 100 if total > 0 else 0
-
-            results.append({
-                "post_id": post_id,
-                "text": _moderate_text(str(s[0])),
-                "verity_score": vs,
-                "base_vs": base_vs,
-                "stake_support": round(support, 4),
-                "stake_challenge": round(challenge, 4),
-                "total_stake": round(total, 4),
-                "controversy": round(controversy, 4),
-                "incoming_links": incoming,
-                "outgoing_links": outgoing,
-                "topic": row[4] or "",
-                "created_at": row[3].isoformat() if row[3] else None,
-            })
-        except Exception as e:
-            logger.warning(f"Failed to fetch summary for post {post_id}: {e}")
-            continue
-
-    results.sort(key=lambda x: -x["total_stake"])
-    total_count = db.execute(sql_text(
-        "SELECT COUNT(*) FROM claim WHERE post_id IS NOT NULL"
-    )).scalar() or 0
-
-    return {"claims": results, "total": total_count}
 
 
 @router.get("/{post_id}/summary")
@@ -217,3 +161,103 @@ def claim_edges(post_id: int):
     except Exception as e:
         logger.error(f"claim_edges({post_id}) failed: {e}")
         raise HTTPException(500, f"Failed to fetch edges: {e}")
+
+
+
+@router.get("/search")
+def search_claims(q: str = "", limit: int = 50, db: Session = Depends(get_db)):
+    """Search all on-chain claims by text. Returns claims with metrics from indexed DB."""
+    from chain.chain_db import get_all_posts, get_edges
+
+    posts = get_all_posts(db, limit=500)
+
+    # Filter by search query
+    if q.strip():
+        ql = q.lower()
+        posts = [p for p in posts if ql in p["text"].lower() or ql in str(p["post_id"])]
+
+    claims = []
+    for p in posts[:limit]:
+        incoming = get_edges(db, p["post_id"], "incoming")
+        outgoing = get_edges(db, p["post_id"], "outgoing")
+
+        total = p["support_total"] + p.get("challenge_total", 0)
+        controversy = 0
+        if total > 0:
+            minority = min(p["support_total"], p.get("challenge_total", 0))
+            controversy = minority / total
+
+        topic_row = db.execute(sql_text(
+            "SELECT ta.topic_key FROM article_sentence s "
+            "JOIN article_section sec ON s.section_id = sec.section_id "
+            "JOIN topic_article ta ON sec.article_id = ta.article_id "
+            "WHERE s.post_id = :pid LIMIT 1"
+        ), {"pid": p["post_id"]}).fetchone()
+
+        claims.append({
+            "post_id": p["post_id"],
+            "text": p["text"],
+            "verity_score": round(p["verity_score"], 2),
+            "stake_support": round(p["support_total"], 4),
+            "stake_challenge": round(p.get("challenge_total", 0), 4),
+            "total_stake": round(total, 4),
+            "controversy": round(controversy, 4),
+            "incoming_links": len(incoming),
+            "outgoing_links": len(outgoing),
+            "topic": topic_row[0] if topic_row else None,
+        })
+
+    return {"claims": claims, "total": len(claims)}
+
+@router.get("/fast/all")
+def claims_fast(limit: int = 500, db: Session = Depends(get_db)):
+    """Fast claims explorer using indexed DB data (no RPC calls)."""
+    from chain.chain_db import get_all_posts, get_edges
+    
+    posts = get_all_posts(db, limit=limit)
+    
+    claims = []
+    for p in posts:
+        # Count links
+        incoming = get_edges(db, p["post_id"], "incoming")
+        outgoing = get_edges(db, p["post_id"], "outgoing")
+        
+        total = p["support_total"] + p["challenge_total"]
+        controversy = 0
+        if total > 0:
+            minority = min(p["support_total"], p["challenge_total"])
+            controversy = minority / total
+        
+        # Find topic
+        topic_row = db.execute(sql_text(
+            "SELECT ta.topic_key FROM article_sentence s "
+            "JOIN article_section sec ON s.section_id = sec.section_id "
+            "JOIN topic_article ta ON sec.article_id = ta.article_id "
+            "WHERE s.post_id = :pid LIMIT 1"
+        ), {"pid": p["post_id"]}).fetchone()
+        
+        claims.append({
+            "post_id": p["post_id"],
+            "text": p["text"],
+            "verity_score": round(p["verity_score"], 2),
+            "base_vs": round(p.get("base_vs", 0), 2),
+            "stake_support": round(p["support_total"], 4),
+            "stake_challenge": round(p.get("challenge_total", 0), 4),
+            "total_stake": round(total, 4),
+            "controversy": round(controversy, 4),
+            "incoming_links": len(incoming),
+            "outgoing_links": len(outgoing),
+            "topic": topic_row[0] if topic_row else None,
+            "created_at": None,
+        })
+    
+    total_stake = sum(c["total_stake"] for c in claims)
+    avg_vs = sum(c["verity_score"] for c in claims) / len(claims) if claims else 0
+    
+    return {
+        "claims": claims,
+        "total": len(claims),
+        "total_stake": round(total_stake, 2),
+        "avg_vs": round(avg_vs, 2),
+    }
+
