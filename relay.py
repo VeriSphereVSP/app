@@ -95,6 +95,7 @@ class RelayRequest(BaseModel):
     request: ForwardRequestPayload
     signature: str
     permit: PermitPayload | None = None
+    fee_permit: PermitPayload | None = None  # Permit granting Forwarder VSP allowance for relay fee
 
 
 class NonceResponse(BaseModel):
@@ -352,6 +353,7 @@ async def relay(body: RelayRequest, db: Session = Depends(get_db)):
     try:
         fwd = _get_forwarder()
         req = body.request
+        print(f"RELAY DEBUG: req.gas={req.gas} req.to={req.to[:10]}")
         sig_bytes = bytes.fromhex(body.signature.removeprefix("0x"))
         calldata_hex = req.data.removeprefix("0x")
 
@@ -369,13 +371,13 @@ async def relay(body: RelayRequest, db: Session = Depends(get_db)):
         if body.permit:
             _execute_permit(body.permit)
 
-        # Collect relay fee (non-fatal if fails)
-        # Extract tx value from permit or estimate from calldata
-        try:
-            tx_value = int(body.permit.value) if body.permit and body.permit.value else int(1e18)
-            _collect_relay_fee(body.request.from_address, tx_value)
-        except Exception as e:
-            logger.debug('Relay fee skip: %s', e)
+        # Execute fee permit if provided (grants Forwarder VSP allowance for relay fee)
+        if body.fee_permit:
+            try:
+                _execute_permit(body.fee_permit)
+                logger.info("Fee permit executed for %s", req.from_[:10])
+            except Exception as e:
+                logger.debug("Fee permit skip (non-fatal): %s", e)
 
         # Content moderation gate
         _moderate_claim(calldata_hex)
@@ -410,7 +412,7 @@ async def relay(body: RelayRequest, db: Session = Depends(get_db)):
             "from": w3.eth.default_account or Web3.to_checksum_address(
                 __import__("config").MM_ADDRESS),
             "value": req.value,
-            "gas": req.gas + 150_000,
+            "gas": req.gas + 800_000,
         })
         tx_hash = sign_and_send(tx)
         logger.info("Submitted meta-tx: from=%s to=%s tx=%s", req.from_, req.to, tx_hash)
@@ -456,6 +458,13 @@ async def relay(body: RelayRequest, db: Session = Depends(get_db)):
                     claim_state["creator"] = req.from_
                     response["claim"] = claim_state
                     logger.info("Claim created: post_id=%d text=%s", post_id, claim_text[:50])
+
+                    # Immediate cross-index into all relevant articles
+                    try:
+                        from claim_indexer import cross_index_claim_into_all_articles
+                        cross_index_claim_into_all_articles(db, claim_text, post_id)
+                    except Exception as e:
+                        logger.debug("Cross-index from relay failed (non-fatal): %s", e)
                 else:
                     logger.warning("createClaim succeeded but no PostCreated event found")
             except Exception as e:
@@ -472,6 +481,13 @@ async def relay(body: RelayRequest, db: Session = Depends(get_db)):
                 claim_state = _get_claim_state(post_id, req.from_)
                 response["claim"] = claim_state
                 logger.info("Stake updated: post_id=%d", post_id)
+                # Re-index this post and connected posts so VS/stakes are fresh
+                try:
+                    from chain_indexer import index_post, _reindex_connected
+                    index_post(db, post_id)
+                    _reindex_connected(db, post_id)
+                except Exception as e2:
+                    logger.debug("Post-stake reindex failed (non-fatal): %s", e2)
             except Exception as e:
                 logger.warning("Post-stake processing failed (non-fatal): %s", e)
 

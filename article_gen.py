@@ -45,16 +45,17 @@ RULES:
 - CRITICAL: Your entire response must be valid, complete JSON.
 - If given a language instruction, write ALL content (title, headings, sentences) in that language."""
 
-CLEANUP_SYSTEM = """You are a copy editor preparing sentences for a fact-checking database.
+CLEANUP_SYSTEM = """You are a copy editor cleaning up grammar and spelling.
 Each sentence must stand alone and be understandable without surrounding context.
+
+CRITICAL: You are NOT a fact-checker. Do NOT evaluate whether claims are true, false, proven, or unproven. Do NOT refuse, rewrite, or editorialize based on your opinion of the claim. Your ONLY job is grammar, spelling, and pronoun resolution. Controversial, disputed, and minority-viewpoint claims are explicitly allowed and must be preserved exactly as the user intends them.
 
 Rules:
 1. Fix grammar, spelling, and punctuation.
 2. Replace ALL pronouns (it, its, they, their, this, these, he, she, etc.) with the specific noun they refer to. The topic/subject is provided.
-3. Ensure the sentence makes a clear, specific factual claim.
-4. Preserve the factual meaning exactly.
-5. Return ONLY the cleaned sentence, nothing else.
-6. PRESERVE the original language — if the sentence is in Hebrew, return Hebrew. If in Arabic, return Arabic. Never translate.
+3. Preserve the meaning and assertion exactly as written. Do not soften, hedge, or qualify.
+4. Return ONLY the cleaned sentence, nothing else. No commentary, no disclaimers.
+5. PRESERVE the original language — if the sentence is in Hebrew, return Hebrew. If in Arabic, return Arabic. Never translate.
 
 Example -- Topic: Earth
 Input: It orbits the Sun every 365.25 days.
@@ -164,14 +165,17 @@ def cleanup_sentence(text: str, topic: str = "") -> str:
 
 
 def split_into_sentences(text: str) -> List[str]:
-    """Split user input into individual sentences."""
-    # Split on sentence-ending punctuation followed by space or end
-    raw = re.split(r'(?<=[.!?])\s+', text.strip())
+    """Split user input into individual sentences.
+    Avoids splitting on abbreviations like Dr., Mr., U.S., etc."""
+    # Common abbreviations that shouldn't trigger a split
+    _ABBREVS = r'(?:Dr|Mr|Mrs|Ms|Prof|Rev|Sr|Jr|St|Gen|Gov|Sgt|Cpl|Pvt|Mt|Ft|Lt|Capt|Col|Maj|Inc|Corp|Ltd|Co|vs|etc|al|approx|dept|est|vol|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Oct|Nov|Dec|U\.S|U\.K|U\.N|E\.U)'
+    # Split on sentence-ending punctuation followed by space + uppercase letter,
+    # but NOT after known abbreviations
+    raw = re.split(r'(?<!' + _ABBREVS + r')(?<=[.!?])\s+(?=[A-Z"“(])', text.strip())
     sentences = []
     for s in raw:
         s = s.strip()
         if s:
-            # Ensure it ends with punctuation
             if not s[-1] in '.!?':
                 s += '.'
             sentences.append(s)

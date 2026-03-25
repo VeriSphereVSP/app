@@ -193,10 +193,15 @@ def search_claims(q: str = "", limit: int = 50, db: Session = Depends(get_db)):
             "JOIN topic_article ta ON sec.article_id = ta.article_id "
             "WHERE s.post_id = :pid LIMIT 1"
         ), {"pid": p["post_id"]}).fetchone()
+        if not topic_row:
+            topic_row = db.execute(sql_text(
+                "SELECT topic FROM claim WHERE post_id = :pid AND topic IS NOT NULL LIMIT 1"
+            ), {"pid": p["post_id"]}).fetchone()
 
         claims.append({
             "post_id": p["post_id"],
-            "text": p["text"],
+            "text": _moderate_text(p["text"]),
+            "creator": p.get("creator", ""),
             "verity_score": round(p["verity_score"], 2),
             "stake_support": round(p["support_total"], 4),
             "stake_challenge": round(p.get("challenge_total", 0), 4),
@@ -235,10 +240,15 @@ def claims_fast(limit: int = 500, db: Session = Depends(get_db)):
             "JOIN topic_article ta ON sec.article_id = ta.article_id "
             "WHERE s.post_id = :pid LIMIT 1"
         ), {"pid": p["post_id"]}).fetchone()
+        if not topic_row:
+            topic_row = db.execute(sql_text(
+                "SELECT topic FROM claim WHERE post_id = :pid AND topic IS NOT NULL LIMIT 1"
+            ), {"pid": p["post_id"]}).fetchone()
         
         claims.append({
             "post_id": p["post_id"],
-            "text": p["text"],
+            "text": _moderate_text(p["text"]),
+            "creator": p.get("creator", ""),
             "verity_score": round(p["verity_score"], 2),
             "base_vs": round(p.get("base_vs", 0), 2),
             "stake_support": round(p["support_total"], 4),

@@ -188,6 +188,19 @@ def insert_sentence(db: Session, section_id: int,
 
 
 def update_sentence_post_id(db: Session, sentence_id: int, post_id: int):
+    # Prevent duplicate post_id in the same article
+    existing = db.execute(sql_text(
+        "SELECT 1 FROM article_sentence s "
+        "JOIN article_section sec ON s.section_id = sec.section_id "
+        "WHERE sec.article_id = (SELECT sec2.article_id FROM article_sentence s2 "
+        "  JOIN article_section sec2 ON s2.section_id = sec2.section_id "
+        "  WHERE s2.sentence_id = :sid) "
+        "AND s.post_id = :pid AND s.sentence_id != :sid "
+        "LIMIT 1"
+    ), {"sid": sentence_id, "pid": post_id}).fetchone()
+    if existing:
+        logger.info("Skipping duplicate post_id=%d link for sentence %d (already in article)", post_id, sentence_id)
+        return
     """Link a sentence to its on-chain post_id after registration."""
     db.execute(sql_text(
         "UPDATE article_sentence SET post_id = :p WHERE sentence_id = :s"
@@ -213,3 +226,125 @@ def _rebalance_sort_orders(db: Session, section_id: int):
             "UPDATE article_sentence SET sort_order = :so WHERE sentence_id = :id"
         ), {"so": (i + 1) * 100, "id": sid})
     db.commit()
+
+def refresh_article(db: Session, topic: str) -> bool:
+    """Refresh an article by generating new content and merging it with existing.
+
+    Preserves all existing sentences (and their on-chain claim links).
+    Only adds new sentences that don't already exist.
+    Returns True if new content was added.
+
+    Merge strategy:
+      - For each section in the new generation:
+        1. If a matching section (by heading) exists, add new sentences to it
+        2. If no matching section, create a new section
+      - A sentence is "new" if no existing sentence in the article has
+        similar text (fuzzy match by normalized lowercase comparison)
+      - Existing sentences are never deleted or modified
+    """
+    from article_gen import generate_article
+    from claim_indexer import index_existing_claims_into_article
+
+    key = _norm(topic)
+    article = get_article(db, topic)
+    if not article:
+        return False
+
+    article_id = article["article_id"]
+
+    # Generate fresh content
+    try:
+        fresh = generate_article(topic)
+    except Exception as e:
+        logger.warning("Article refresh generation failed for '%s': %s", topic, e)
+        return False
+
+    # Build index of existing sentences for dedup
+    existing_texts = set()
+    existing_post_ids = set()
+    for sec in article["sections"]:
+        for sent in sec["sentences"]:
+            existing_texts.add(sent["text"].lower().strip())
+            if sent.get("post_id") is not None:
+                existing_post_ids.add(sent["post_id"])
+
+    # Build index of existing sections (normalized heading -> section_id)
+    existing_sections = {}
+    for sec in article["sections"]:
+        h = sec["heading"].lower().strip()
+        existing_sections[h] = sec["section_id"]
+
+    added = 0
+
+    for fresh_sec in fresh.get("sections", []):
+        heading = fresh_sec.get("heading", "")
+        heading_key = heading.lower().strip()
+        new_sents = []
+
+        for sent_text in fresh_sec.get("sentences", []):
+            text = str(sent_text).strip()
+            if not text:
+                continue
+            norm = text.lower().strip()
+            # Check for near-duplicates (exact match or containment)
+            is_dup = False
+            for existing in existing_texts:
+                if norm == existing or norm in existing or existing in norm:
+                    is_dup = True
+                    break
+            if not is_dup:
+                new_sents.append(text)
+
+        if not new_sents:
+            continue
+
+        # Find or create the section
+        if heading_key in existing_sections:
+            section_id = existing_sections[heading_key]
+        else:
+            # Create new section at the end
+            max_order = db.execute(sql_text(
+                "SELECT COALESCE(MAX(sort_order), 0) FROM article_section WHERE article_id = :a"
+            ), {"a": article_id}).fetchone()[0]
+
+            row = db.execute(sql_text(
+                "INSERT INTO article_section (article_id, heading, sort_order) "
+                "VALUES (:a, :h, :so) RETURNING section_id"
+            ), {"a": article_id, "h": heading, "so": max_order + 100}).fetchone()
+            section_id = row[0]
+            existing_sections[heading_key] = section_id
+            logger.info("Created new section '%s' for refresh of '%s'", heading, topic)
+
+        # Get the last sort_order in this section
+        last = db.execute(sql_text(
+            "SELECT MAX(sort_order) FROM article_sentence WHERE section_id = :s"
+        ), {"s": section_id}).fetchone()
+        sort_order = (last[0] or 0) + 100
+
+        # Insert new sentences at the end of the section
+        for text in new_sents:
+            db.execute(sql_text(
+                "INSERT INTO article_sentence (section_id, sort_order, text) "
+                "VALUES (:s, :so, :t)"
+            ), {"s": section_id, "so": sort_order, "t": text})
+            existing_texts.add(text.lower().strip())
+            sort_order += 100
+            added += 1
+
+    # Update timestamps
+    db.execute(sql_text(
+        "UPDATE topic_article SET last_refreshed_at = NOW(), updated_at = NOW() "
+        "WHERE article_id = :a"
+    ), {"a": article_id})
+    db.commit()
+
+    if added > 0:
+        logger.info("Refreshed article '%s': added %d new sentences", topic, added)
+        # Re-index existing on-chain claims into the refreshed article
+        try:
+            index_existing_claims_into_article(db, article_id)
+        except Exception as e:
+            logger.warning("Post-refresh claim indexing failed: %s", e)
+
+    return added > 0
+

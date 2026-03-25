@@ -111,6 +111,17 @@ def is_claim_relevant_to_article(db: Session, article_id: int, claim_text: str) 
 def index_existing_claims_into_article(db: Session, article_id: int):
     """Find on-chain claims that belong in an article and overlay them.
 
+    # Collect all post_ids already in this article to prevent duplicates
+    existing_pids = set()
+    _rows = db.execute(sql_text(
+        "SELECT DISTINCT s.post_id FROM article_sentence s "
+        "JOIN article_section sec ON s.section_id = sec.section_id "
+        "WHERE sec.article_id = :a AND s.post_id IS NOT NULL"
+    ), {"a": article_id}).fetchall()
+    for (_pid,) in _rows:
+        existing_pids.add(_pid)
+
+
     Two modes:
     1. OVERLAY: If an article sentence semantically matches an on-chain claim,
        link the sentence to the claim's post_id.
@@ -218,3 +229,72 @@ def index_existing_claims_into_article(db: Session, article_id: int):
             logger.warning("Failed to index claim post_id=%d: %s", pid, e)
 
     logger.info("Indexed %d on-chain claims into article %d", indexed_count, article_id)
+
+
+def cross_index_claim_into_all_articles(db: Session, claim_text: str, post_id: int):
+    """Index a single on-chain claim into ALL relevant articles.
+
+    Called by chain/indexer.py whenever a new claim is discovered.
+    Checks every existing article for topical relevance and inserts
+    the claim into the best-matching section if not already present.
+    """
+    from article_store import insert_sentence, update_sentence_post_id
+
+    # Get all articles
+    articles = db.execute(sql_text(
+        "SELECT article_id, topic_key, title FROM topic_article ORDER BY updated_at DESC"
+    )).fetchall()
+
+    if not articles:
+        return
+
+    claim_lower = claim_text.lower().strip()
+    indexed_into = 0
+
+    for article_id, topic_key, title in articles:
+        # Check if claim is already in this article (by post_id — authoritative dedup)
+        existing = db.execute(sql_text(
+            "SELECT 1 FROM article_sentence s "
+            "JOIN article_section sec ON s.section_id = sec.section_id "
+            "WHERE sec.article_id = :a AND s.post_id = :pid "
+            "LIMIT 1"
+        ), {"a": article_id, "pid": post_id}).fetchone()
+
+        if existing:
+            continue
+
+        # Check topical relevance
+        if not is_claim_relevant_to_article(db, article_id, claim_text):
+            continue
+
+        # Find best section
+        sec_id = find_best_section(db, article_id, claim_text)
+        if sec_id is None:
+            continue
+
+        # Insert at end of section
+        try:
+            last_sent = db.execute(sql_text(
+                "SELECT sentence_id FROM article_sentence "
+                "WHERE section_id = :s ORDER BY sort_order DESC LIMIT 1"
+            ), {"s": sec_id}).fetchone()
+
+            after_id = last_sent[0] if last_sent else None
+            new_sid = insert_sentence(db, sec_id, after_id, claim_text)
+            update_sentence_post_id(db, new_sid, post_id)
+            indexed_into += 1
+            logger.info(
+                "Cross-indexed claim post_id=%d into article '%s' section %d",
+                post_id, topic_key, sec_id,
+            )
+        except Exception as e:
+            logger.warning(
+                "Failed to cross-index claim post_id=%d into article %d: %s",
+                post_id, article_id, e,
+            )
+
+    if indexed_into > 0:
+        logger.info(
+            "Cross-indexed claim post_id=%d ('%s') into %d article(s)",
+            post_id, claim_text[:40], indexed_into,
+        )

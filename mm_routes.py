@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import text
 
 from db import get_db
+from fee_calculator import compute_fee as calc_fee
 from erc20 import allowance, transfer, transfer_from
 from config import USDC_ADDRESS, VSP_ADDRESS, MM_ADDRESS
 from mm_pricing import (
@@ -207,7 +208,7 @@ def mm_preview(req: FillPreviewRequest, db: Session = Depends(get_db)):
             fill = compute_sell_fill(net_vsp, req.qty_vsp, usdc_reserves, vsp_circulating, unit_au, half_spread)
         return {
             "side": req.side, "qty_vsp": req.qty_vsp,
-            "total_usdc": round(fill.total_usd, 6),
+            "total_usdc": round(total_usdc_with_fee, 6),
             "avg_price_usd": round(fill.avg_price_usd, 8),
             "ts": datetime.now(timezone.utc).isoformat(),
         }
@@ -258,6 +259,73 @@ class MMTradeRequest(BaseModel):
     permit: PermitFields | None = None  # Optional — if provided, MM executes permit first
 
 
+
+@router.get("/preview-buy")
+def preview_buy(qty_vsp: float = None, usdc_amount: float = None, db: Session = Depends(get_db)):
+    """Preview buy with fee breakdown.
+    Specify qty_vsp (exact VSP output) or usdc_amount (exact USDC budget)."""
+    row = _load_mm_state(db)
+    net_vsp, unit_au, half_spread, usdc_reserves, vsp_circulating = row
+
+    if qty_vsp and qty_vsp > 0:
+        fill = compute_buy_fill(net_vsp, qty_vsp, usdc_reserves, vsp_circulating, unit_au, half_spread)
+        fee = calc_fee(db, "buy", qty_vsp)
+        fee_usdc = fee["fee_vsp"] * fill.avg_price_usd
+        return {
+            "mode": "vsp",
+            "qty_vsp": qty_vsp,
+            "subtotal_usdc": round(fill.total_usd, 6),
+            "fee_vsp": fee["fee_vsp"],
+            "fee_usdc": round(fee_usdc, 6),
+            "total_usdc": round(fill.total_usd + fee_usdc, 6),
+            "avg_price": round(fill.avg_price_usd, 6),
+            "breakdown": fee["breakdown"],
+        }
+    elif usdc_amount and usdc_amount > 0:
+        # Iterate to find qty that fits budget including fee
+        fill1 = compute_buy_fill(net_vsp, 1.0, usdc_reserves, vsp_circulating, unit_au, half_spread)
+        price = fill1.avg_price_usd
+        qty_est = usdc_amount / price
+        for _ in range(5):
+            fill = compute_buy_fill(net_vsp, qty_est, usdc_reserves, vsp_circulating, unit_au, half_spread)
+            fee = calc_fee(db, "buy", qty_est)
+            fee_usdc = fee["fee_vsp"] * fill.avg_price_usd
+            total = fill.total_usd + fee_usdc
+            if abs(total - usdc_amount) < 0.01:
+                break
+            qty_est *= usdc_amount / total
+            qty_est = max(qty_est, 0.001)
+        return {
+            "mode": "usdc",
+            "usdc_budget": usdc_amount,
+            "qty_vsp": round(qty_est, 6),
+            "subtotal_usdc": round(fill.total_usd, 6),
+            "fee_vsp": fee["fee_vsp"],
+            "fee_usdc": round(fee_usdc, 6),
+            "total_usdc": round(total, 6),
+            "avg_price": round(fill.avg_price_usd, 6),
+            "breakdown": fee["breakdown"],
+        }
+    return {"error": "Specify qty_vsp or usdc_amount"}
+
+@router.get("/preview-sell")
+def preview_sell(qty_vsp: float, db: Session = Depends(get_db)):
+    """Preview sell with fee breakdown. User sends qty_vsp, receives USDC minus fee."""
+    row = _load_mm_state(db)
+    net_vsp, unit_au, half_spread, usdc_reserves, vsp_circulating = row
+    fill = compute_sell_fill(net_vsp, qty_vsp, usdc_reserves, vsp_circulating, unit_au, half_spread)
+    fee = calc_fee(db, "sell", qty_vsp)
+    fee_usdc = fee["fee_vsp"] * fill.avg_price_usd
+    return {
+        "qty_vsp": qty_vsp,
+        "gross_usdc": round(fill.total_usd, 6),
+        "fee_vsp": fee["fee_vsp"],
+        "fee_usdc": round(fee_usdc, 6),
+        "net_usdc": round(max(fill.total_usd - fee_usdc, 0), 6),
+        "avg_price": round(fill.avg_price_usd, 6),
+        "breakdown": fee["breakdown"],
+    }
+
 @router.post("/buy")
 def mm_buy(req: MMTradeRequest, db: Session = Depends(get_db)):
     """
@@ -293,6 +361,13 @@ def mm_buy(req: MMTradeRequest, db: Session = Depends(get_db)):
                 if allowance(USDC_ADDRESS, req.user_address, MM_ADDRESS) < usdc_micro:
                     raise HTTPException(400, "USDC allowance too low — provide a permit signature")
 
+
+            # Calculate fee (additive: added to USDC cost, user receives full qty)
+            fee_info = calc_fee(db, "buy", req.qty_vsp)
+            fee_usdc = fee_info["fee_vsp"] * fill.avg_price_usd
+            total_usdc_with_fee = fill.total_usd + fee_usdc
+            usdc_micro = int(total_usdc_with_fee * 1_000_000)
+
             # Execute on-chain transfers
             transfer_from(USDC_ADDRESS, req.user_address, MM_ADDRESS, usdc_micro)
             transfer(VSP_ADDRESS, req.user_address, int(req.qty_vsp * 10**18))
@@ -309,7 +384,10 @@ def mm_buy(req: MMTradeRequest, db: Session = Depends(get_db)):
                        vsp_circulating_after=new_circ)
 
         return {"ok": True, "qty_vsp": req.qty_vsp,
-                "total_usdc": round(fill.total_usd, 6),
+                "fee_vsp": fee_info["fee_vsp"],
+                "fee_usdc": round(fee_usdc, 6),
+                "gross_usdc": round(fill.total_usd, 6),
+                "total_usdc": round(net_usdc, 6),
                 "avg_price_usd": round(fill.avg_price_usd, 8)}
     except HTTPException:
         raise
@@ -357,9 +435,16 @@ def mm_sell(req: MMTradeRequest, db: Session = Depends(get_db)):
                 if allowance(VSP_ADDRESS, req.user_address, MM_ADDRESS) < vsp_wei:
                     raise HTTPException(400, "VSP allowance too low — provide a permit signature")
 
+            # Calculate fee (subtracted from USDC proceeds)
+            fee_info = calc_fee(db, "sell", req.qty_vsp)
+            fee_usdc = fee_info["fee_vsp"] * fill.avg_price_usd
+            net_usdc = fill.total_usd - fee_usdc
+            if net_usdc <= 0:
+                raise HTTPException(400, "Trade too small to cover fees")
+
             # Execute on-chain transfers
             transfer_from(VSP_ADDRESS, req.user_address, MM_ADDRESS, vsp_wei)
-            usdc_micro = int(fill.total_usd * 1_000_000)
+            usdc_micro = int(net_usdc * 1_000_000)
             transfer(USDC_ADDRESS, req.user_address, usdc_micro)
 
             new_net = fill.new_net_vsp
@@ -374,7 +459,10 @@ def mm_sell(req: MMTradeRequest, db: Session = Depends(get_db)):
                        vsp_circulating_after=new_circ)
 
         return {"ok": True, "qty_vsp": req.qty_vsp,
-                "total_usdc": round(fill.total_usd, 6),
+                "fee_vsp": fee_info["fee_vsp"],
+                "fee_usdc": round(fee_usdc, 6),
+                "gross_usdc": round(fill.total_usd, 6),
+                "total_usdc": round(net_usdc, 6),
                 "avg_price_usd": round(fill.avg_price_usd, 8)}
     except HTTPException:
         raise

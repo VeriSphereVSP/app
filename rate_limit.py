@@ -64,7 +64,7 @@ GENERAL_RATE_LIMIT = 120        # requests per window
 GENERAL_RATE_WINDOW = 60        # seconds
 
 # Relay rate limits (per user address)
-RELAY_RATE_LIMIT = 20           # relay txs per window
+RELAY_RATE_LIMIT = 60           # relay txs per window
 RELAY_RATE_WINDOW = 300         # 5 minutes
 
 # AI endpoint rate limits (per IP)

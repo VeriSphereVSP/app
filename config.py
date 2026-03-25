@@ -34,7 +34,15 @@ LINK_GRAPH_ADDRESS = DEPLOYED.get("LinkGraph", "")
 STAKE_ENGINE_ADDRESS = DEPLOYED.get("StakeEngine", "")
 SCORE_ENGINE_ADDRESS = DEPLOYED.get("ScoreEngine", "")
 PROTOCOL_VIEWS_ADDRESS = DEPLOYED.get("ProtocolViews", "")
+# Forwarder is deployed separately from core (see app/contracts/)
+# Its address is either in the core deployment JSON (legacy) or in app/deployments/forwarder.json
 FORWARDER_ADDRESS = DEPLOYED.get("Forwarder", "")
+if not FORWARDER_ADDRESS:
+    import json as _json
+    _fwd_path = Path(__file__).parent / "deployments" / "forwarder.json"
+    if _fwd_path.exists():
+        FORWARDER_ADDRESS = _json.loads(_fwd_path.read_text()).get("Forwarder", "")
+
 
 # External tokens
 USDC_ADDRESS = os.getenv("USDC_ADDRESS", "0x5425890298aed601595a70ab815c96711a31bc65")

@@ -281,6 +281,23 @@ def _set_last_block(db: Session, contract_name: str, block: int):
     db.commit()
 
 
+
+def _reindex_connected(db: Session, post_id: int):
+    """Re-index all posts connected to this post via links (one hop)."""
+    try:
+        rows = db.execute(sql_text(
+            "SELECT DISTINCT from_post_id FROM chain_link WHERE to_post_id = :pid "
+            "UNION "
+            "SELECT DISTINCT to_post_id FROM chain_link WHERE from_post_id = :pid "
+            "UNION "
+            "SELECT DISTINCT link_post_id FROM chain_link WHERE from_post_id = :pid OR to_post_id = :pid"
+        ), {"pid": post_id}).fetchall()
+        for (connected_pid,) in rows:
+            if connected_pid != post_id:
+                index_post(db, connected_pid)
+    except Exception as e:
+        logger.debug("_reindex_connected(%d) failed: %s", post_id, e)
+
 def poll_events(db: Session):
     """Poll for new events from all contracts and index affected posts."""
     w3 = _get_w3()
@@ -366,8 +383,13 @@ def poll_events(db: Session):
                 link_pid = event.args.linkPostId
                 is_challenge = event.args.isChallenge
                 index_link(db, link_pid, from_pid, to_pid, is_challenge)
-                # Re-index the target post (its effective VS may have changed)
+                # Re-index all connected posts (link affects VS of targets)
                 index_post(db, to_pid)
+                index_post(db, from_pid)
+                index_post(db, link_pid)
+                # Also re-index any posts linked to/from the affected claims
+                _reindex_connected(db, to_pid)
+                _reindex_connected(db, from_pid)
         except Exception as e:
             logger.warning("Error polling LinkGraph events: %s", e)
         _set_last_block(db, "LinkGraph", to_block)

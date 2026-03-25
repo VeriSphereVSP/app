@@ -133,6 +133,13 @@ def _upsert_claim(db, claim_text, post_id):
     _try_link_sentences(db, claim_text, post_id)
     logger.info("Indexed new on-chain claim: id=%d post_id=%d text=%s", cid, post_id, claim_text[:60])
 
+    # Cross-index into all relevant articles
+    try:
+        from claim_indexer import cross_index_claim_into_all_articles
+        cross_index_claim_into_all_articles(db, claim_text, post_id)
+    except Exception as e:
+        logger.warning("Cross-indexing failed for post_id=%d: %s", post_id, e)
+
 
 def _try_link_sentences(db, claim_text, post_id):
     """Link any article_sentence rows that match this claim text but have no post_id."""
@@ -144,6 +151,13 @@ def _try_link_sentences(db, claim_text, post_id):
         if result.rowcount > 0:
             db.commit()
             logger.info("Auto-linked %d sentence(s) to post_id=%d", result.rowcount, post_id)
+
+            # Also cross-index this claim into other articles where relevant
+            try:
+                from claim_indexer import cross_index_claim_into_all_articles
+                cross_index_claim_into_all_articles(db, claim_text, post_id)
+            except Exception as e:
+                logger.debug("Cross-index after link failed: %s", e)
     except Exception as e:
         logger.warning("Failed to auto-link sentences for post_id=%d: %s", post_id, e)
         try:

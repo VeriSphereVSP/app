@@ -1,3 +1,4 @@
+from moderation import check_content_fast
 # app/article_routes.py
 """
 Article API endpoints.
@@ -49,7 +50,8 @@ class RegisterRequest(BaseModel):
 # ── Helpers ─────────────────────────────────────────────
 
 def _enrich_sentences(article: dict) -> dict:
-    """Add VS, stake totals to each sentence that has a post_id."""
+    """Add VS, stake totals to each sentence that has a post_id.
+    Also filters blocked content on display."""
     try:
         from chain.chain_reader import get_stake_totals, get_verity_score
     except ImportError:
@@ -72,8 +74,89 @@ def _enrich_sentences(article: dict) -> dict:
                 sent["stake_support"] = 0
                 sent["stake_challenge"] = 0
                 sent["verity_score"] = 0
+
+    # Display-time moderation filter
+    for section in article.get("sections", []):
+        for sent in section.get("sentences", []):
+            mod = check_content_fast(sent.get("text", ""))
+            if not mod.allowed:
+                sent["text"] = "[Content hidden — policy violation]"
+                sent["moderated"] = True
+
     return article
 
+
+
+
+def _semantic_dedup(article: dict):
+    """Remove duplicate and near-duplicate sentences from article display.
+    Rules:
+      - On-chain sentences (post_id != null): ALWAYS kept, even if near-dupes of each other
+      - Off-chain near-duplicate of an on-chain sentence: REMOVED
+      - Off-chain near-duplicate of an earlier off-chain sentence: REMOVED (keep first)
+    """
+    from embedding import embed
+    from similarity import cosine_similarity
+
+    DEDUP_THRESHOLD = 0.85  # Cosine similarity above this = near-duplicate
+
+    # First pass: collect and embed all on-chain sentences (across entire article)
+    onchain_embeddings = []
+    for section in article.get("sections", []):
+        for sent in section.get("sentences", []):
+            if sent.get("post_id") is not None:
+                try:
+                    vec = embed(sent["text"])
+                    onchain_embeddings.append(vec)
+                except Exception:
+                    pass
+
+    # Second pass: filter each section
+    # Track kept off-chain embeddings globally (across sections) to dedup across sections too
+    kept_offchain_embeddings = []
+
+    for section in article.get("sections", []):
+        filtered = []
+        for sent in section.get("sentences", []):
+            # Always keep on-chain sentences
+            if sent.get("post_id") is not None:
+                filtered.append(sent)
+                continue
+
+            text = sent.get("text", "").strip()
+            if not text:
+                continue  # Drop empty sentences
+
+            try:
+                vec = embed(text)
+            except Exception:
+                filtered.append(sent)
+                continue
+
+            # Check against on-chain sentences
+            is_dupe = False
+            for oc_vec in onchain_embeddings:
+                if cosine_similarity(vec, oc_vec) >= DEDUP_THRESHOLD:
+                    is_dupe = True
+                    break
+
+            if is_dupe:
+                continue  # Drop: near-dupe of on-chain sentence
+
+            # Check against already-kept off-chain sentences
+            for kept_vec in kept_offchain_embeddings:
+                if cosine_similarity(vec, kept_vec) >= DEDUP_THRESHOLD:
+                    is_dupe = True
+                    break
+
+            if is_dupe:
+                continue  # Drop: near-dupe of earlier off-chain sentence
+
+            # Keep this sentence
+            filtered.append(sent)
+            kept_offchain_embeddings.append(vec)
+
+        section["sentences"] = filtered
 
 def _ensure_sentence_in_claim_db(db: Session, text: str) -> int:
     """Ensure a sentence exists in the claim table, return claim_id."""
@@ -122,6 +205,22 @@ def _link_unlinked_sentences(db: Session, article: dict):
         logger.info("Patched %d unlinked sentences with on-chain post_ids", patched)
 
 
+
+
+def _increment_view_count(db: Session, article_id: int):
+    """Increment the view counter for an article. Non-fatal."""
+    try:
+        db.execute(sql_text(
+            "UPDATE topic_article SET view_count = COALESCE(view_count, 0) + 1 "
+            "WHERE article_id = :a"
+        ), {"a": article_id})
+        db.commit()
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+
 # ── Endpoints ───────────────────────────────────────────
 
 @router.get("/article/{topic:path}")
@@ -147,6 +246,44 @@ def get_article(topic: str, db: Session = Depends(get_db)):
     except Exception as e:
         logger.warning("Claim re-indexing failed (non-fatal): %s", e)
 
+
+    # Lazy refresh: if article is stale (>24h since last refresh), trigger background refresh
+    import threading
+    try:
+        refreshed_at = db.execute(sql_text(
+            "SELECT last_refreshed_at FROM topic_article WHERE article_id = :a"
+        ), {"a": article["article_id"]}).fetchone()
+        if refreshed_at and refreshed_at[0]:
+            from datetime import datetime, timedelta, timezone
+            age = datetime.now(timezone.utc) - refreshed_at[0].replace(tzinfo=timezone.utc)
+            stale = age > timedelta(hours=24)
+        else:
+            stale = True  # Never refreshed
+
+        if stale:
+            def _bg_refresh(topic_key):
+                try:
+                    from db import get_session_factory
+                    from article_store import refresh_article
+                    session = get_session_factory()()
+                    try:
+                        refresh_article(session, topic_key)
+                    finally:
+                        session.close()
+                except Exception as e:
+                    logger.debug("Background refresh failed for '%s': %s", topic_key, e)
+
+            threading.Thread(
+                target=_bg_refresh,
+                args=(article["topic_key"],),
+                daemon=True,
+                name=f"refresh-{article['topic_key'][:20]}",
+            ).start()
+    except Exception:
+        pass  # Non-fatal — don't block article view
+
+
+    _increment_view_count(db, article["article_id"])
     return _enrich_sentences(article)
 
 
@@ -258,8 +395,8 @@ def edit_sentence_endpoint(sentence_id: int, req: EditRequest,
 
     section_id, old_order, old_text, old_post_id = old
 
-    # Split new text into sentences
-    new_sentences = split_into_sentences(req.new_text)
+    # Insert as a single sentence — claims are atomic
+    new_sentences = [req.new_text.strip()]
     created = []
 
     after_id = sentence_id
@@ -368,3 +505,78 @@ def get_user_stakes(post_id: int, user: str = None):
         logger.warning("Failed to read stakes for post %d: %s", post_id, e)
         return {"post_id": post_id, "stake_support": 0, "stake_challenge": 0,
                 "verity_score": 0, "user_support": 0, "user_challenge": 0}
+
+@router.get("/topics/popular")
+def popular_topics(limit: int = 8, db: Session = Depends(get_db)):
+    """Return the most-viewed topics for the landing page."""
+    from sqlalchemy import text as sql_text
+    rows = db.execute(sql_text(
+        "SELECT topic_key, title, view_count FROM topic_article "
+        "ORDER BY COALESCE(view_count, 0) DESC, title ASC LIMIT :l"
+    ), {"l": limit}).fetchall()
+
+    return {"topics": [
+        {"key": r[0], "title": r[1], "views": r[2]}
+        for r in rows
+    ]}
+
+
+
+class DetectTopicRequest(BaseModel):
+    claim_text: str
+    post_id: int
+
+@router.post("/claims/detect-topic")
+def detect_topic_endpoint(req: DetectTopicRequest, db: Session = Depends(get_db)):
+    """Auto-detect topic for a standalone claim, store the association,
+    and trigger background article generation if needed.
+    Returns immediately with the detected topic."""
+    from topic_detect import detect_topic, ensure_article_for_claim
+
+    topic = detect_topic(req.claim_text)
+    if not topic:
+        return {"topic": None, "status": "detection_failed"}
+
+    # Store topic association in the claim table
+    try:
+        db.execute(sql_text(
+            "UPDATE claim SET topic = :t WHERE post_id = :pid"
+        ), {"t": topic, "pid": req.post_id})
+        db.commit()
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+
+    # Ensure article exists (generates in background if not)
+    try:
+        ensure_article_for_claim(db, req.claim_text, req.post_id, topic)
+    except Exception as e:
+        logger.warning("ensure_article_for_claim failed: %s", e)
+
+    return {"topic": topic, "status": "ok"}
+
+
+
+@router.post("/moderate")
+def moderate_endpoint(req: CleanupRequest):
+    """Check if content passes moderation. Returns {allowed, reason}."""
+    from moderation import check_content
+    result = check_content(req.text)
+    return {"allowed": result.allowed, "reason": result.reason}
+
+
+
+@router.post("/article/{topic:path}/refresh")
+def refresh_article_endpoint(topic: str, db: Session = Depends(get_db)):
+    """On-demand article refresh. Generates new content and merges with existing.
+    Preserves all existing sentences and their on-chain claim links."""
+    from article_store import refresh_article
+    try:
+        added = refresh_article(db, topic)
+        return {"refreshed": added, "topic": topic}
+    except Exception as e:
+        logger.warning("Article refresh failed for '%s': %s", topic, e)
+        raise HTTPException(500, f"Refresh failed: {e}")
+

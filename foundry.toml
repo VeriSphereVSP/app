@@ -1,0 +1,22 @@
+[profile.default]
+src = "contracts"
+test = "contracts/test"
+script = "contracts/script"
+out = "contracts/out"
+libs = ["contracts/lib"]
+cache = true
+optimizer = true
+optimizer_runs = 200
+via_ir = true
+
+fs_permissions = [
+  { access = "read-write", path = "./deployments" },
+  { access = "read-write", path = "./broadcast" }
+]
+
+remappings = [
+    "openzeppelin-contracts/=contracts/lib/openzeppelin-contracts/",
+]
+
+[rpc_endpoints]
+fuji = "${AVALANCHE_FUJI_RPC}"

@@ -13,11 +13,12 @@ from sqlalchemy.orm import Session
 from sqlalchemy import text
 
 from db import get_db
-from config import USDC_ADDRESS, VSP_ADDRESS
+from config import USDC_ADDRESS, VSP_ADDRESS, FORWARDER_ADDRESS
 from semantic import compute_one
 from chain.claim_registry import create_claim
 from chain.stake import stake_claim
 from relay import router as relay_router
+from supersedes import router as supersedes_router
 from mm_routes import router as mm_router
 from claim_views import router as claim_views_router
 from portfolio_views import router as portfolio_router
@@ -39,6 +40,37 @@ async def lifespan(app):
             await _aio.sleep(600)
             cleanup_rate_limiter()
     _aio.create_task(_rl_cleanup())
+
+    # Daily article refresh — refreshes stale articles in the background
+    async def _daily_refresh():
+        import asyncio
+        while True:
+            await asyncio.sleep(3600)  # Check every hour
+            try:
+                from db import get_session_factory
+                from article_store import refresh_article
+                from sqlalchemy import text as sql_text
+                session = get_session_factory()()
+                try:
+                    # Find articles not refreshed in 24h, ordered by view_count
+                    stale = session.execute(sql_text(
+                        "SELECT topic_key FROM topic_article "
+                        "WHERE last_refreshed_at IS NULL "
+                        "   OR last_refreshed_at < NOW() - INTERVAL '24 hours' "
+                        "ORDER BY COALESCE(view_count, 0) DESC LIMIT 5"
+                    )).fetchall()
+                    for (topic_key,) in stale:
+                        try:
+                            refresh_article(session, topic_key)
+                        except Exception as e:
+                            print(f"Daily refresh failed for '{topic_key}': {e}")
+                        await asyncio.sleep(10)  # Don't hammer the LLM
+                finally:
+                    session.close()
+            except Exception as e:
+                print(f"Daily refresh loop error: {e}")
+    _aio.create_task(_daily_refresh())
+
     yield
     indexer_task.cancel()
     try:
@@ -56,6 +88,7 @@ app = FastAPI(title="VeriSphere App API", version="0.1.0", lifespan=lifespan)
 app.add_middleware(RateLimitMiddleware)
 
 app.include_router(relay_router)
+app.include_router(supersedes_router)
 app.include_router(mm_router)
 app.include_router(claim_views_router)
 app.include_router(portfolio_router)
@@ -69,6 +102,41 @@ def healthz():
     return {"ok": "true"}
 
 
+
+@app.get("/api/fees")
+def get_fees(db: Session = Depends(get_db)):
+    """Full fee schedule with cost breakdown and examples."""
+    from fee_calculator import get_fee_schedule
+    return get_fee_schedule(db)
+
+@app.get("/api/fees/estimate")
+def estimate_fee(tx_type: str, value_vsp: float = 1.0, db: Session = Depends(get_db)):
+    """Estimate fee for a specific transaction type and value."""
+    from fee_calculator import compute_fee
+    return compute_fee(db, tx_type, value_vsp)
+
+@app.post("/api/fees/costs")
+def update_cost(cost_key: str, monthly_usd: float, db: Session = Depends(get_db)):
+    """Update an operating cost (admin). Fee recalculates automatically."""
+    from fee_calculator import invalidate_cache
+    db.execute(sql_text(
+        "UPDATE operating_costs SET monthly_usd = :usd, updated_at = NOW() WHERE cost_key = :key"
+    ), {"key": cost_key, "usd": monthly_usd})
+    db.commit()
+    invalidate_cache()
+    return {"ok": True}
+
+@app.post("/api/fees/params")
+def update_fee_param(param_key: str, value: str, db: Session = Depends(get_db)):
+    """Update a fee parameter (admin). Fee recalculates automatically."""
+    from fee_calculator import invalidate_cache
+    db.execute(sql_text(
+        "UPDATE fee_params SET value = :val, updated_at = NOW() WHERE param_key = :key"
+    ), {"key": param_key, "val": value})
+    db.commit()
+    invalidate_cache()
+    return {"ok": True}
+
 @app.get("/api/contracts")
 def get_contracts():
     if not ADDRESSES_PATH.exists():
@@ -77,6 +145,7 @@ def get_contracts():
         with ADDRESSES_PATH.open() as f:
             contracts = json.load(f)
         contracts["USDC"] = USDC_ADDRESS
+        contracts["Forwarder"] = FORWARDER_ADDRESS
         contracts["VSPToken"] = VSP_ADDRESS
         contracts = {k: v.lower() if isinstance(v, str) else v for k, v in contracts.items()}
         print(f"Returning {len(contracts)} contracts from /api/contracts")
