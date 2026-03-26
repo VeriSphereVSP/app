@@ -1,20 +1,13 @@
-# OS / Editor
-.DS_Store
-.idea/
-.vscode/
+# Build artifacts
+broadcast/
+cache/
+contracts/out/
+contracts/lib/
 
-# Logs
-*.log
-
-# Secrets / env
-.env
-.env.*
-
-.venv/
+# Python
 __pycache__/
 *.pyc
-.pytest_cache/
+.env
 
-# Allow deployment addresses
-!deployments/
-!deployments/*.json
+# Node
+node_modules/
