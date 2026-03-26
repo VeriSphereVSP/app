@@ -83,6 +83,13 @@ def _enrich_sentences(article: dict) -> dict:
                 sent["text"] = "[Content hidden — policy violation]"
                 sent["moderated"] = True
 
+    # Semantic dedup: remove off-chain near-duplicates
+    try:
+        _semantic_dedup(article)
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning("Semantic dedup failed: %s", e)
+
     return article
 
 
@@ -98,7 +105,7 @@ def _semantic_dedup(article: dict):
     from embedding import embed
     from similarity import cosine_similarity
 
-    DEDUP_THRESHOLD = 0.85  # Cosine similarity above this = near-duplicate
+    DEDUP_THRESHOLD = 0.70  # Cosine similarity above this = near-duplicate
 
     # First pass: collect and embed all on-chain sentences (across entire article)
     onchain_embeddings = []
@@ -296,6 +303,7 @@ def generate_article_endpoint(topic: str, req: GenerateRequest,
 
 
 def _generate_and_store(topic: str, db: Session, refresh: bool) -> dict:
+    print(f"GENERATE_AND_STORE CALLED: topic={topic} refresh={refresh}")
     from article_store import ensure_tables, get_article as load_article, store_article
     from article_gen import generate_article
     ensure_tables(db)
@@ -307,6 +315,12 @@ def _generate_and_store(topic: str, db: Session, refresh: bool) -> dict:
 
     logger.info("Generating article for '%s'", topic)
     result = generate_article(topic)
+    # Validate generated title matches the requested topic
+    gen_title = (result.get("title") or "").lower().strip()
+    topic_lower = topic.lower().strip()
+    if gen_title and topic_lower not in gen_title and gen_title not in topic_lower:
+        logger.warning("Generation rejected: got '%s' for topic '%s', retrying", result.get("title"), topic)
+        result = generate_article(topic)  # One retry
 
     store_article(db, topic, result["title"], result["sections"])
     article = load_article(db, topic)

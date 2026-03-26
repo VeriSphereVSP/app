@@ -258,6 +258,12 @@ def refresh_article(db: Session, topic: str) -> bool:
     except Exception as e:
         logger.warning("Article refresh generation failed for '%s': %s", topic, e)
         return False
+    # Validate: reject if the generated title doesn't match the topic
+    gen_title = (fresh.get("title") or "").lower().strip()
+    topic_lower = topic.lower().strip()
+    if gen_title and topic_lower not in gen_title and gen_title not in topic_lower:
+        logger.warning("Refresh rejected: generated '%s' but expected '%s'", fresh.get("title"), topic)
+        return False
 
     # Build index of existing sentences for dedup
     existing_texts = set()
