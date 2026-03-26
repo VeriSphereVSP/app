@@ -43,6 +43,16 @@ def _stake():
         abi=STAKE_ENGINE_ABI,
     )
 
+def _score():
+    import json as _json
+    from config import SCORE_ENGINE_ADDRESS
+    if not SCORE_ENGINE_ADDRESS:
+        raise HTTPException(503, "ScoreEngine not configured")
+    return w3.eth.contract(
+        address=Web3.to_checksum_address(SCORE_ENGINE_ADDRESS),
+        abi=_json.loads(open("/core/out/ScoreEngine.sol/ScoreEngine.json").read())["abi"],
+    )
+
 
 def _ray_to_pct(ray_value: int) -> float:
     return round(ray_value / _RAY * 100, 2)
@@ -102,6 +112,7 @@ def claim_edges(post_id: int):
     try:
         views = _views()
         stake_engine = _stake()
+        score_engine = _score()
 
         raw_incoming = views.functions.getIncomingEdges(post_id).call()
         raw_outgoing = views.functions.getOutgoingEdges(post_id).call()
@@ -134,6 +145,11 @@ def claim_edges(post_id: int):
             except Exception:
                 result["link_support"] = 0
                 result["link_challenge"] = 0
+            try:
+                vs_ray = score_engine.functions.effectiveVSRay(link_post_id).call()
+                result["link_vs"] = (vs_ray / 1e18) * 100
+            except Exception:
+                result["link_vs"] = 0
             return result
 
         incoming: List[Dict[str, Any]] = []
