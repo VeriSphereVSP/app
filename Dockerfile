@@ -29,7 +29,7 @@ RUN pip install --no-cache-dir sqlalchemy python-dotenv psycopg2-binary
 RUN pip list | grep -E "sqlalchemy|python-dotenv|psycopg2" || exit 1
 
 # Copy application code
-COPY app/app ./app
+COPY app/ /app/
 COPY app/ops ./ops
 
 EXPOSE 8070

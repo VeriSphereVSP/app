@@ -237,48 +237,6 @@ def _check_duplicate_claim(calldata_hex, req_from, db):
 
 
 
-def _collect_relay_fee(user_address: str, tx_value_wei: int = 0):
-    """Collect a percentage-based VSP fee from the user for relay gas costs.
-    Fee = RELAY_FEE_PCT * transaction value. Minimum 0.001 VSP.
-    Uses transferFrom — requires existing allowance (from permit or manual approve).
-    Fee goes to the MM wallet."""
-    from config import RELAY_FEE_PCT, MM_ADDRESS, VSP_TOKEN_ADDRESS
-    if RELAY_FEE_PCT <= 0 or tx_value_wei <= 0:
-        return
-    fee_wei = int(tx_value_wei * RELAY_FEE_PCT)
-    min_fee = int(0.001 * 1e18)  # minimum 0.001 VSP
-    if fee_wei < min_fee:
-        fee_wei = min_fee
-    try:
-        token_abi = [{
-            "inputs": [
-                {"name": "from", "type": "address"},
-                {"name": "to", "type": "address"},
-                {"name": "amount", "type": "uint256"},
-            ],
-            "name": "transferFrom",
-            "outputs": [{"name": "", "type": "bool"}],
-            "stateMutability": "nonpayable",
-            "type": "function",
-        }]
-        token = w3.eth.contract(
-            address=Web3.to_checksum_address(VSP_TOKEN_ADDRESS),
-            abi=token_abi,
-        )
-        mm_addr = Web3.to_checksum_address(MM_ADDRESS)
-        user_addr = Web3.to_checksum_address(user_address)
-        tx = token.functions.transferFrom(
-            user_addr, mm_addr, fee_wei,
-        ).build_transaction({"from": mm_addr, "gas": 80_000})
-        tx_hash = sign_and_send(tx)
-        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=15)
-        if receipt.status == 1:
-            logger.info("Relay fee collected: %s VSP from %s", RELAY_FEE_VSP, user_address[:10])
-        else:
-            logger.warning("Relay fee collection reverted for %s", user_address[:10])
-    except Exception as e:
-        # Fee collection failure is non-fatal — still execute the meta-tx
-        logger.warning("Relay fee collection failed for %s: %s", user_address[:10], e)
 
 def _execute_permit(permit):
     """Execute an EIP-2612 permit on behalf of the user. Relay pays gas."""
@@ -462,7 +420,9 @@ async def relay(body: RelayRequest, db: Session = Depends(get_db)):
                     # Immediate cross-index into all relevant articles
                     try:
                         from claim_indexer import cross_index_claim_into_all_articles
+                        from chain_indexer import _queue_article_refresh
                         cross_index_claim_into_all_articles(db, claim_text, post_id)
+                        _queue_article_refresh(db, post_id)
                     except Exception as e:
                         logger.debug("Cross-index from relay failed (non-fatal): %s", e)
                 else:
@@ -483,9 +443,10 @@ async def relay(body: RelayRequest, db: Session = Depends(get_db)):
                 logger.info("Stake updated: post_id=%d", post_id)
                 # Re-index this post and connected posts so VS/stakes are fresh
                 try:
-                    from chain_indexer import index_post, _reindex_connected
+                    from chain_indexer import index_post, _reindex_connected, _queue_article_refresh
                     index_post(db, post_id)
                     _reindex_connected(db, post_id)
+                    _queue_article_refresh(db, post_id)
                 except Exception as e2:
                     logger.debug("Post-stake reindex failed (non-fatal): %s", e2)
             except Exception as e:

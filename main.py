@@ -1,7 +1,7 @@
 # app/main.py
 import asyncio
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Request
 from lang_detect import detect_language, lang_instruction, is_rtl
 from pydantic import BaseModel, Field
 from typing import Dict, Any, Optional
@@ -11,6 +11,7 @@ import json
 
 from sqlalchemy.orm import Session
 from sqlalchemy import text
+from sqlalchemy import text as sql_text
 
 from db import get_db
 from config import USDC_ADDRESS, VSP_ADDRESS, FORWARDER_ADDRESS
@@ -45,7 +46,7 @@ async def lifespan(app):
     async def _daily_refresh():
         import asyncio
         while True:
-            await asyncio.sleep(3600)  # Check every hour
+            await asyncio.sleep(900)  # Safety net: 15 min (chain events trigger immediate rebuilds)
             try:
                 from db import get_session_factory
                 from article_store import refresh_article
@@ -97,6 +98,19 @@ app.include_router(article_router)
 ADDRESSES_PATH = Path("/app/broadcast/Deploy.s.sol/43113/addresses.json")
 
 
+
+# ── Admin auth ─────────────────────────────────────────────────────────────────
+import os as _os
+ADMIN_API_KEY = _os.getenv("ADMIN_API_KEY", "")
+
+def require_admin(request):
+    """Check X-Admin-Key header against ADMIN_API_KEY env var."""
+    if not ADMIN_API_KEY:
+        raise HTTPException(403, "Admin API key not configured. Set ADMIN_API_KEY env var.")
+    key = request.headers.get("X-Admin-Key", "")
+    if key != ADMIN_API_KEY:
+        raise HTTPException(403, "Invalid admin key")
+
 @app.get("/healthz")
 def healthz():
     return {"ok": "true"}
@@ -116,7 +130,8 @@ def estimate_fee(tx_type: str, value_vsp: float = 1.0, db: Session = Depends(get
     return compute_fee(db, tx_type, value_vsp)
 
 @app.post("/api/fees/costs")
-def update_cost(cost_key: str, monthly_usd: float, db: Session = Depends(get_db)):
+def update_cost(cost_key: str, monthly_usd: float, request: Request = None, db: Session = Depends(get_db)):
+    require_admin(request)
     """Update an operating cost (admin). Fee recalculates automatically."""
     from fee_calculator import invalidate_cache
     db.execute(sql_text(
@@ -127,7 +142,8 @@ def update_cost(cost_key: str, monthly_usd: float, db: Session = Depends(get_db)
     return {"ok": True}
 
 @app.post("/api/fees/params")
-def update_fee_param(param_key: str, value: str, db: Session = Depends(get_db)):
+def update_fee_param(param_key: str, value: str, request: Request = None, db: Session = Depends(get_db)):
+    require_admin(request)
     """Update a fee parameter (admin). Fee recalculates automatically."""
     from fee_calculator import invalidate_cache
     db.execute(sql_text(
@@ -313,12 +329,11 @@ class StakeRequest(BaseModel):
 @app.get("/api/token/allowance")
 def token_allowance(owner: str, spender: str):
     """Read VSP token allowance. Frontend calls this instead of readContract."""
+    from mm_wallet import w3
     from web3 import Web3
-    from config import RPC_URL
     from chain.abi import VSP_TOKEN_ABI
     from config import VSP_TOKEN_ADDRESS
     try:
-        w3 = Web3(Web3.HTTPProvider(RPC_URL))
         token = w3.eth.contract(
             address=Web3.to_checksum_address(VSP_TOKEN_ADDRESS),
             abi=VSP_TOKEN_ABI,
@@ -336,12 +351,11 @@ def token_allowance(owner: str, spender: str):
 @app.get("/api/token/balance")
 def token_balance(address: str):
     """Read VSP token balance. Frontend calls this instead of readContract."""
+    from mm_wallet import w3
     from web3 import Web3
-    from config import RPC_URL
     from chain.abi import VSP_TOKEN_ABI
     from config import VSP_TOKEN_ADDRESS
     try:
-        w3 = Web3(Web3.HTTPProvider(RPC_URL))
         token = w3.eth.contract(
             address=Web3.to_checksum_address(VSP_TOKEN_ADDRESS),
             abi=VSP_TOKEN_ABI,

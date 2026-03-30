@@ -25,6 +25,24 @@ def _norm(topic: str) -> str:
 # ── Schema ──────────────────────────────────────────────
 
 def ensure_tables(db: Session):
+    # Migrate: add cached_response + response_hash columns if missing
+    try:
+        from sqlalchemy import text as sql_text
+        db.execute(sql_text(
+            "ALTER TABLE topic_article "
+            "ADD COLUMN IF NOT EXISTS cached_response JSONB"
+        ))
+        db.execute(sql_text(
+            "ALTER TABLE topic_article "
+            "ADD COLUMN IF NOT EXISTS response_hash VARCHAR(16)"
+        ))
+        db.commit()
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+
     """No-op. Schema is now managed by ops/compose/migrations/040_article_tables.sql."""
     pass
 
@@ -304,9 +322,39 @@ def refresh_article(db: Session, topic: str) -> bool:
         if not new_sents:
             continue
 
-        # Find or create the section
+        # Find or create the section (fuzzy match to avoid duplicates)
+        matched_section = None
         if heading_key in existing_sections:
-            section_id = existing_sections[heading_key]
+            matched_section = existing_sections[heading_key]
+        else:
+            # Try fuzzy heading match before creating a new section
+            try:
+                from embedding import embed
+                from similarity import cosine_similarity
+                h_vec = embed(heading_key)
+                best_sim = 0.0
+                for existing_h, sec_id in existing_sections.items():
+                    e_vec = embed(existing_h)
+                    sim = cosine_similarity(h_vec, e_vec)
+                    if sim > best_sim:
+                        best_sim = sim
+                        matched_section = sec_id
+                if best_sim < 0.75:
+                    matched_section = None
+            except Exception:
+                pass
+            if not matched_section:
+                # Word overlap fallback
+                h_words = set(heading_key.split()) - {"and", "the", "of", "in", "a", "an"}
+                for existing_h, sec_id in existing_sections.items():
+                    e_words = set(existing_h.split()) - {"and", "the", "of", "in", "a", "an"}
+                    overlap = len(h_words & e_words)
+                    min_len = min(len(h_words), len(e_words))
+                    if min_len > 0 and overlap / min_len >= 0.5 and overlap >= 2:
+                        matched_section = sec_id
+                        break
+        if matched_section:
+            section_id = matched_section
         else:
             # Create new section at the end
             max_order = db.execute(sql_text(
@@ -354,3 +402,114 @@ def refresh_article(db: Session, topic: str) -> bool:
 
     return added > 0
 
+
+
+def build_and_cache_response(db_or_factory, topic_key: str):
+    """Build the full enriched article response and cache it as JSONB.
+    Called after generation, refresh, or chain event.
+    This is the ONLY place that does the expensive work (RPC, embedding, dedup).
+    The result is stored so GET /api/article/{topic} can serve it with zero processing."""
+    import hashlib, json, logging
+    from sqlalchemy import text as sql_text
+    logger = logging.getLogger(__name__)
+
+    # Get a session
+    if hasattr(db_or_factory, 'execute'):
+        db = db_or_factory
+        owns_session = False
+    else:
+        db = db_or_factory()
+        owns_session = True
+
+    try:
+        article = get_article(db, topic_key)
+        if not article:
+            return
+
+        article_id = article["article_id"]
+
+        # ── Expensive enrichment (runs once, result is cached) ──
+
+        # 1. Link unlinked sentences to on-chain claims via embedding similarity
+        try:
+            from article_routes import _link_unlinked_sentences
+            _link_unlinked_sentences(db, article)
+        except Exception as e:
+            logger.debug("Link unlinked failed: %s", e)
+
+        # 2. Index existing on-chain claims into this article
+        try:
+            from claim_indexer import index_existing_claims_into_article
+            index_existing_claims_into_article(db, article_id)
+            article = get_article(db, topic_key)
+            if not article:
+                return
+        except Exception as e:
+            logger.debug("Claim indexing failed: %s", e)
+
+        # 3. Enrich with live VS/stake data from chain (RPC calls)
+        try:
+            from chain.chain_reader import get_stake_totals, get_verity_score
+            for section in article.get("sections", []):
+                for sent in section.get("sentences", []):
+                    pid = sent.get("post_id")
+                    if pid is not None:
+                        try:
+                            s, ch = get_stake_totals(pid)
+                            sent["stake_support"] = s
+                            sent["stake_challenge"] = ch
+                            sent["verity_score"] = get_verity_score(pid)
+                        except Exception:
+                            sent["stake_support"] = 0
+                            sent["stake_challenge"] = 0
+                            sent["verity_score"] = 0
+                    else:
+                        sent["stake_support"] = 0
+                        sent["stake_challenge"] = 0
+                        sent["verity_score"] = 0
+        except ImportError:
+            pass
+
+        # 4. Content moderation filter
+        try:
+            from moderation import check_content_fast
+            for section in article.get("sections", []):
+                for sent in section.get("sentences", []):
+                    mod = check_content_fast(sent.get("text", ""))
+                    if not mod.allowed:
+                        sent["text"] = "[Content hidden — policy violation]"
+                        sent["moderated"] = True
+        except Exception:
+            pass
+
+        # 5. Semantic dedup
+        try:
+            from article_routes import _semantic_dedup
+            _semantic_dedup(article)
+        except Exception:
+            pass
+
+        # ── Cache the fully-built result ──
+        response_json = json.dumps(article, default=str)
+        response_hash = hashlib.md5(response_json.encode()).hexdigest()[:16]
+
+        db.execute(sql_text(
+            "UPDATE topic_article SET "
+            "cached_response = CAST(:resp AS jsonb), "
+            "response_hash = :h, "
+            "last_refreshed_at = NOW() "
+            "WHERE article_id = :a"
+        ), {"resp": response_json, "h": response_hash, "a": article_id})
+        db.commit()
+
+        logger.info("Cached article response for '%s' (hash=%s)", topic_key, response_hash)
+
+    except Exception as e:
+        logger.warning("build_and_cache_response failed for '%s': %s", topic_key, e)
+        try:
+            db.rollback()
+        except Exception:
+            pass
+    finally:
+        if owns_session:
+            db.close()

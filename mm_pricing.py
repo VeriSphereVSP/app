@@ -43,18 +43,16 @@ def _base_price(n: float, gold_usd: float, unit_au: float) -> float:
     """
     Base (mid) price at a given net_vsp position.
 
-    For n >= 0: log-squared supply curve anchored to gold.
+    For n >= 0: log-linear supply curve anchored to gold.
         price = log10(n + 10)^2 * unit_au * gold_usd
 
     For n < 0: reserve distribution curve.
-        price = liquidation_floor * decay_factor
-        where decay_factor smoothly approaches 0 as reserves drain.
-        This is handled separately in _reserve_price().
+        Handled separately in _reserve_price().
 
     Returns price in USD per 1 VSP.
     """
     if n >= 0:
-        return (1 + math.log10(max(1, n))) * unit_au * gold_usd
+        return math.log10(n + 10) ** 2 * unit_au * gold_usd
     # Negative territory handled by caller via _reserve_price
     # This shouldn't be reached, but defensive:
     return unit_au * gold_usd * 0.01

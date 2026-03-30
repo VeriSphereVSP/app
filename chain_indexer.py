@@ -443,3 +443,37 @@ def trigger_reindex(post_id: int, user_address: str | None = None):
         db.close()
     except Exception as e:
         logger.warning("Trigger reindex failed for post %d: %s", post_id, e)
+def _queue_article_refresh(db, post_id):
+    """Trigger immediate background article cache rebuild for any topic
+    affected by this post. Called by relay.py after stake/claim changes."""
+    import threading, logging
+    logger = logging.getLogger(__name__)
+    try:
+        from sqlalchemy import text as sql_text
+        rows = db.execute(sql_text(
+            "SELECT DISTINCT topic_key FROM article_sentence "
+            "WHERE post_id = :pid"
+        ), {"pid": post_id}).fetchall()
+
+        for (topic_key,) in rows:
+            def _rebuild(tk):
+                try:
+                    from db import get_session_factory
+                    from article_store import build_and_cache_response
+                    build_and_cache_response(get_session_factory(), tk)
+                except Exception as e:
+                    logger.debug("Article cache rebuild failed for '%s': %s", tk, e)
+
+            threading.Thread(
+                target=_rebuild,
+                args=(topic_key,),
+                daemon=True,
+                name=f"rebuild-{topic_key[:20]}",
+            ).start()
+
+        if rows:
+            logger.info("Triggered cache rebuild for %d topics (post_id=%d)",
+                        len(rows), post_id)
+    except Exception as e:
+        logger.warning("Article refresh trigger failed (non-fatal): %s", e)
+

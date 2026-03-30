@@ -11,3 +11,17 @@ __pycache__/
 
 # Node
 node_modules/
+
+# Generated deployment addresses (written by deploy.sh)
+deployments/fuji.json
+deployments/mainnet.json
+deployments/fuji-addresses.json
+
+# Forge build artifacts (forwarder)
+cache/
+out/
+broadcast/
+
+__pycache__/
+*.pyc
+.env

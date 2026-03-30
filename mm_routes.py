@@ -387,7 +387,7 @@ def mm_buy(req: MMTradeRequest, db: Session = Depends(get_db)):
                 "fee_vsp": fee_info["fee_vsp"],
                 "fee_usdc": round(fee_usdc, 6),
                 "gross_usdc": round(fill.total_usd, 6),
-                "total_usdc": round(net_usdc, 6),
+                "total_usdc": round(total_usdc_with_fee, 6),
                 "avg_price_usd": round(fill.avg_price_usd, 8)}
     except HTTPException:
         raise

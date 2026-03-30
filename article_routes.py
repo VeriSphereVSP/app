@@ -19,6 +19,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from db import get_db
+from sqlalchemy import text as sql_text
 from rate_limit import ai_rate_limit
 
 logger = logging.getLogger(__name__)
@@ -232,66 +233,53 @@ def _increment_view_count(db: Session, article_id: int):
 
 @router.get("/article/{topic:path}")
 def get_article(topic: str, db: Session = Depends(get_db)):
-    """Get a full article. If it doesn't exist, generate it."""
-    from article_store import ensure_tables, get_article as load_article
+    """Get a full article. Serves pre-built cached JSON — zero processing."""
+    from article_store import ensure_tables
     ensure_tables(db)
 
+    # Try cached response first (one SELECT, zero processing)
+    row = db.execute(sql_text(
+        "SELECT article_id, cached_response FROM topic_article "
+        "WHERE LOWER(topic_key) = LOWER(:t)"
+    ), {"t": topic}).fetchone()
+
+    if row and row[1]:
+        # Cache hit — serve as-is
+        _increment_view_count(db, row[0])
+        return row[1]
+
+    # No cache: check if article exists but cache is cold
+    from article_store import get_article as load_article
     article = load_article(db, topic)
-    if not article:
-        # Auto-generate
-        return _generate_and_store(topic, db, refresh=False)
+    if article:
+        # Build cache in background; serve enriched version this one time
+        import threading
+        def _bg_cache(topic_key):
+            try:
+                from db import get_session_factory
+                from article_store import build_and_cache_response
+                build_and_cache_response(get_session_factory(), topic_key)
+            except Exception as e:
+                logger.debug("Background cache build failed: %s", e)
+        threading.Thread(target=_bg_cache, args=(topic,), daemon=True).start()
 
-    # Patch any sentences that match on-chain claims but aren't linked yet
-    _link_unlinked_sentences(db, article)
+        _increment_view_count(db, article["article_id"])
+        return _enrich_sentences(article)
 
-    # Index any on-chain claims that are relevant but not yet in this article
-    try:
-        from claim_indexer import index_existing_claims_into_article
-        index_existing_claims_into_article(db, article["article_id"])
-        # Re-load to include any newly indexed claims
-        article = load_article(db, topic)
-    except Exception as e:
-        logger.warning("Claim re-indexing failed (non-fatal): %s", e)
-
-
-    # Lazy refresh: if article is stale (>24h since last refresh), trigger background refresh
-    import threading
-    try:
-        refreshed_at = db.execute(sql_text(
-            "SELECT last_refreshed_at FROM topic_article WHERE article_id = :a"
-        ), {"a": article["article_id"]}).fetchone()
-        if refreshed_at and refreshed_at[0]:
-            from datetime import datetime, timedelta, timezone
-            age = datetime.now(timezone.utc) - refreshed_at[0].replace(tzinfo=timezone.utc)
-            stale = age > timedelta(hours=24)
-        else:
-            stale = True  # Never refreshed
-
-        if stale:
-            def _bg_refresh(topic_key):
-                try:
-                    from db import get_session_factory
-                    from article_store import refresh_article
-                    session = get_session_factory()()
-                    try:
-                        refresh_article(session, topic_key)
-                    finally:
-                        session.close()
-                except Exception as e:
-                    logger.debug("Background refresh failed for '%s': %s", topic_key, e)
-
-            threading.Thread(
-                target=_bg_refresh,
-                args=(article["topic_key"],),
-                daemon=True,
-                name=f"refresh-{article['topic_key'][:20]}",
-            ).start()
-    except Exception:
-        pass  # Non-fatal — don't block article view
+    # No article at all — generate (only slow path: first visit ever)
+    return _generate_and_store(topic, db, refresh=False)
 
 
-    _increment_view_count(db, article["article_id"])
-    return _enrich_sentences(article)
+@router.get("/article/{topic:path}/version")
+def get_article_version(topic: str, db: Session = Depends(get_db)):
+    """Return the current article version hash.
+    Frontend polls this every 30s to detect updates."""
+    row = db.execute(sql_text(
+        "SELECT response_hash FROM topic_article WHERE LOWER(topic_key) = LOWER(:t)"
+    ), {"t": topic}).fetchone()
+    if not row:
+        return {"hash": None}
+    return {"hash": row[0]}
 
 
 @router.post("/article/{topic}/generate")
@@ -343,6 +331,17 @@ def _generate_and_store(topic: str, db: Session, refresh: bool) -> dict:
         article = load_article(db, topic)
     except Exception as e:
         logger.warning("Claim indexing failed (non-fatal): %s", e)
+
+    # Build cached response in background for future instant serving
+    import threading
+    def _bg_cache(topic_key):
+        try:
+            from db import get_session_factory
+            from article_store import build_and_cache_response
+            build_and_cache_response(get_session_factory(), topic_key)
+        except Exception as e:
+            logger.debug("Post-generate cache build failed: %s", e)
+    threading.Thread(target=_bg_cache, args=(topic,), daemon=True).start()
 
     return _enrich_sentences(article)
 
@@ -413,9 +412,32 @@ def edit_sentence_endpoint(sentence_id: int, req: EditRequest,
     new_sentences = [req.new_text.strip()]
     created = []
 
-    after_id = sentence_id
+    # Re-evaluate section placement if text changed significantly
+    target_section_id = section_id
+    try:
+        from embedding import embed
+        from similarity import cosine_similarity
+        old_vec = embed(old_text)
+        new_vec = embed(req.new_text.strip())
+        sim = cosine_similarity(old_vec, new_vec)
+        if sim < 0.85:  # Text changed significantly
+            from claim_indexer import find_best_section
+            # Get article_id from section
+            art_row = db.execute(sql_text(
+                "SELECT article_id FROM article_section WHERE section_id = :s"
+            ), {"s": section_id}).fetchone()
+            if art_row:
+                better_section = find_best_section(db, art_row[0], req.new_text.strip())
+                if better_section and better_section != section_id:
+                    target_section_id = better_section
+                    logger.info("Edit moved to different section: %d -> %d (sim=%.3f)",
+                                section_id, better_section, sim)
+    except Exception as e:
+        logger.debug("Section re-evaluation failed (keeping original): %s", e)
+
+    after_id = sentence_id if target_section_id == section_id else None
     for sent_text in new_sentences:
-        new_sid = insert_sentence(db, section_id, after_id, sent_text)
+        new_sid = insert_sentence(db, target_section_id, after_id, sent_text)
         try:
             _ensure_sentence_in_claim_db(db, sent_text)
         except Exception:
@@ -474,6 +496,27 @@ def link_post_endpoint(sentence_id: int, req: LinkPostRequest,
     from article_store import ensure_tables, update_sentence_post_id
     ensure_tables(db)
     update_sentence_post_id(db, sentence_id, req.post_id)
+
+    # Rebuild article cache so the linked post_id appears immediately
+    try:
+        topic_row = db.execute(sql_text(
+            "SELECT ta.topic_key FROM topic_article ta "
+            "JOIN article_sentence s ON s.article_id = ta.article_id "
+            "WHERE s.sentence_id = :sid"
+        ), {"sid": sentence_id}).fetchone()
+        if topic_row:
+            import threading
+            def _rebuild(tk):
+                try:
+                    from db import get_session_factory
+                    from article_store import build_and_cache_response
+                    build_and_cache_response(get_session_factory(), tk)
+                except Exception:
+                    pass
+            threading.Thread(target=_rebuild, args=(topic_row[0],), daemon=True).start()
+    except Exception:
+        pass
+
     return {"sentence_id": sentence_id, "post_id": req.post_id}
 
 
@@ -586,9 +629,18 @@ def moderate_endpoint(req: CleanupRequest):
 def refresh_article_endpoint(topic: str, db: Session = Depends(get_db)):
     """On-demand article refresh. Generates new content and merges with existing.
     Preserves all existing sentences and their on-chain claim links."""
-    from article_store import refresh_article
+    from article_store import refresh_article, build_and_cache_response
     try:
         added = refresh_article(db, topic)
+        # Rebuild cached response with new content
+        import threading
+        def _bg_cache(t):
+            try:
+                from db import get_session_factory
+                build_and_cache_response(get_session_factory(), t)
+            except Exception:
+                pass
+        threading.Thread(target=_bg_cache, args=(topic,), daemon=True).start()
         return {"refreshed": added, "topic": topic}
     except Exception as e:
         logger.warning("Article refresh failed for '%s': %s", topic, e)

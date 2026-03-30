@@ -60,25 +60,44 @@ def find_best_section(db: Session, article_id: int, claim_text: str) -> Optional
     if not sections:
         return None
 
+    # Try embedding similarity first (accurate for temporal/semantic placement)
+    try:
+        from embedding import embed
+        from similarity import cosine_similarity
+        claim_vec = embed(claim_text)
+        best_id = None
+        best_sim = -1.0
+        for sec_id, heading in sections:
+            sents = db.execute(sql_text(
+                "SELECT text FROM article_sentence WHERE section_id = :s ORDER BY sort_order"
+            ), {"s": sec_id}).fetchall()
+            sec_text = heading + ". " + " ".join(r[0] for r in sents[:8])
+            sec_vec = embed(sec_text)
+            sim = cosine_similarity(claim_vec, sec_vec)
+            if sim > best_sim:
+                best_sim = sim
+                best_id = sec_id
+        if best_sim >= 0.25:
+            return best_id
+        logger.debug("No section above embedding threshold (best=%.3f)", best_sim)
+    except Exception as e:
+        logger.debug("Embedding section match failed, falling back to stems: %s", e)
+
+    # Fallback: stem overlap
     claim_st = _stems(claim_text)
     if not claim_st:
         return None
-
     best_id = None
     best_overlap = 0
-
     for sec_id, heading in sections:
         sents = db.execute(sql_text(
             "SELECT text FROM article_sentence WHERE section_id = :s ORDER BY sort_order"
         ), {"s": sec_id}).fetchall()
         sec_st = _section_stems([r[0] for r in sents], heading)
         overlap = len(claim_st & sec_st)
-        # Require at least 1 overlapping stem beyond just the topic name
         if overlap > best_overlap:
             best_overlap = overlap
             best_id = sec_id
-
-    # Threshold: need at least 1 stem overlap
     return best_id if best_overlap >= 1 else None
 
 
