@@ -20,7 +20,7 @@ from chain.claim_registry import create_claim
 from chain.stake import stake_claim
 from relay import router as relay_router
 from supersedes import router as supersedes_router
-from mm_routes import router as mm_router
+from mm.mm_routes import router as mm_router
 from claim_views import router as claim_views_router
 from portfolio_views import router as portfolio_router
 from article_routes import router as article_router

@@ -24,7 +24,7 @@ import math
 from dataclasses import dataclass
 from typing import Optional
 
-from oracle import get_gold_price_usd_per_oz, get_avax_price_usd
+from mm.oracle import get_gold_price_usd_per_oz, get_avax_price_usd
 
 
 # ────────────────────────────────────────────────────────────
