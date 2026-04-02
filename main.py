@@ -23,7 +23,7 @@ from supersedes import router as supersedes_router
 from mm.mm_routes import router as mm_router
 from claim_views import router as claim_views_router
 from portfolio_views import router as portfolio_router
-from article_routes import router as article_router
+from articles.article_routes import router as article_router
 from rate_limit import RateLimitMiddleware, cleanup_rate_limiter
 
 
@@ -49,7 +49,7 @@ async def lifespan(app):
             await asyncio.sleep(900)  # Safety net: 15 min (chain events trigger immediate rebuilds)
             try:
                 from db import get_session_factory
-                from article_store import refresh_article
+                from articles.article_store import refresh_article
                 from sqlalchemy import text as sql_text
                 session = get_session_factory()()
                 try:

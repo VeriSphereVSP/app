@@ -459,7 +459,7 @@ def _queue_article_refresh(db, post_id):
             def _rebuild(tk):
                 try:
                     from db import get_session_factory
-                    from article_store import build_and_cache_response
+                    from articles.article_store import build_and_cache_response
                     build_and_cache_response(get_session_factory(), tk)
                 except Exception as e:
                     logger.debug("Article cache rebuild failed for '%s': %s", tk, e)

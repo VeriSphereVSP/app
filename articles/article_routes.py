@@ -175,7 +175,7 @@ def _ensure_sentence_in_claim_db(db: Session, text: str) -> int:
 def _link_unlinked_sentences(db: Session, article: dict):
     """For any article sentence with post_id=NULL, find matching on-chain claims
     using semantic embedding similarity — not just exact text match."""
-    from article_store import update_sentence_post_id
+    from articles.article_store import update_sentence_post_id
     from semantic import find_best_onchain_match
     patched = 0
     already_used = set()
@@ -234,7 +234,7 @@ def _increment_view_count(db: Session, article_id: int):
 @router.get("/article/{topic:path}")
 def get_article(topic: str, db: Session = Depends(get_db)):
     """Get a full article. Serves pre-built cached JSON — zero processing."""
-    from article_store import ensure_tables
+    from articles.article_store import ensure_tables
     ensure_tables(db)
 
     # Try cached response first (one SELECT, zero processing)
@@ -249,7 +249,7 @@ def get_article(topic: str, db: Session = Depends(get_db)):
         return row[1]
 
     # No cache: check if article exists but cache is cold
-    from article_store import get_article as load_article
+    from articles.article_store import get_article as load_article
     article = load_article(db, topic)
     if article:
         # Build cache in background; serve enriched version this one time
@@ -257,7 +257,7 @@ def get_article(topic: str, db: Session = Depends(get_db)):
         def _bg_cache(topic_key):
             try:
                 from db import get_session_factory
-                from article_store import build_and_cache_response
+                from articles.article_store import build_and_cache_response
                 build_and_cache_response(get_session_factory(), topic_key)
             except Exception as e:
                 logger.debug("Background cache build failed: %s", e)
@@ -292,8 +292,8 @@ def generate_article_endpoint(topic: str, req: GenerateRequest,
 
 def _generate_and_store(topic: str, db: Session, refresh: bool) -> dict:
     print(f"GENERATE_AND_STORE CALLED: topic={topic} refresh={refresh}")
-    from article_store import ensure_tables, get_article as load_article, store_article
-    from article_gen import generate_article
+    from articles.article_store import ensure_tables, get_article as load_article, store_article
+    from articles.article_gen import generate_article
     ensure_tables(db)
 
     if not refresh:
@@ -325,7 +325,7 @@ def _generate_and_store(topic: str, db: Session, refresh: bool) -> dict:
 
     # Index existing on-chain claims into this new article
     try:
-        from claim_indexer import index_existing_claims_into_article
+        from articles.claim_indexer import index_existing_claims_into_article
         index_existing_claims_into_article(db, article["article_id"])
         # Re-load to include any indexed claims
         article = load_article(db, topic)
@@ -337,7 +337,7 @@ def _generate_and_store(topic: str, db: Session, refresh: bool) -> dict:
     def _bg_cache(topic_key):
         try:
             from db import get_session_factory
-            from article_store import build_and_cache_response
+            from articles.article_store import build_and_cache_response
             build_and_cache_response(get_session_factory(), topic_key)
         except Exception as e:
             logger.debug("Post-generate cache build failed: %s", e)
@@ -349,8 +349,8 @@ def _generate_and_store(topic: str, db: Session, refresh: bool) -> dict:
 @router.post("/article/sentence/insert")
 def insert_sentence_endpoint(req: InsertRequest, db: Session = Depends(get_db)):
     """Insert a new sentence into a section."""
-    from article_store import ensure_tables, insert_sentence
-    from article_gen import split_into_sentences
+    from articles.article_store import ensure_tables, insert_sentence
+    from articles.article_gen import split_into_sentences
     ensure_tables(db)
 
     sentences = split_into_sentences(req.text)
@@ -374,7 +374,7 @@ def insert_sentence_endpoint(req: InsertRequest, db: Session = Depends(get_db)):
         ), {"t": sent_text}).fetchone()
         existing_pid = existing_post[0] if existing_post else None
         if existing_pid:
-            from article_store import update_sentence_post_id
+            from articles.article_store import update_sentence_post_id
             update_sentence_post_id(db, sid, existing_pid)
 
         inserted.append({"sentence_id": sid, "text": sent_text, "post_id": existing_pid})
@@ -391,10 +391,10 @@ def edit_sentence_endpoint(sentence_id: int, req: EditRequest,
     The frontend is responsible for creating the on-chain challenge link
     (new_post_id challenges old_post_id) since that requires the user's wallet.
     """
-    from article_store import (
+    from articles.article_store import (
         ensure_tables, insert_sentence, mark_replaced,
     )
-    from article_gen import split_into_sentences
+    from articles.article_gen import split_into_sentences
     from sqlalchemy import text as sql_text
     ensure_tables(db)
 
@@ -421,7 +421,7 @@ def edit_sentence_endpoint(sentence_id: int, req: EditRequest,
         new_vec = embed(req.new_text.strip())
         sim = cosine_similarity(old_vec, new_vec)
         if sim < 0.85:  # Text changed significantly
-            from claim_indexer import find_best_section
+            from articles.claim_indexer import find_best_section
             # Get article_id from section
             art_row = db.execute(sql_text(
                 "SELECT article_id FROM article_section WHERE section_id = :s"
@@ -450,7 +450,7 @@ def edit_sentence_endpoint(sentence_id: int, req: EditRequest,
         ), {"t": sent_text}).fetchone()
         existing_pid = existing_post[0] if existing_post else None
         if existing_pid:
-            from article_store import update_sentence_post_id
+            from articles.article_store import update_sentence_post_id
             update_sentence_post_id(db, new_sid, existing_pid)
 
         created.append({
@@ -493,7 +493,7 @@ class LinkPostRequest(BaseModel):
 def link_post_endpoint(sentence_id: int, req: LinkPostRequest,
                        db: Session = Depends(get_db)):
     """Link a sentence to its on-chain post_id after client-side registration."""
-    from article_store import ensure_tables, update_sentence_post_id
+    from articles.article_store import ensure_tables, update_sentence_post_id
     ensure_tables(db)
     update_sentence_post_id(db, sentence_id, req.post_id)
 
@@ -509,7 +509,7 @@ def link_post_endpoint(sentence_id: int, req: LinkPostRequest,
             def _rebuild(tk):
                 try:
                     from db import get_session_factory
-                    from article_store import build_and_cache_response
+                    from articles.article_store import build_and_cache_response
                     build_and_cache_response(get_session_factory(), tk)
                 except Exception:
                     pass
@@ -524,7 +524,7 @@ def link_post_endpoint(sentence_id: int, req: LinkPostRequest,
 @ai_rate_limit
 def cleanup_sentence_endpoint(req: CleanupRequest):
     """AI grammar/spelling cleanup. Returns original + suggested."""
-    from article_gen import cleanup_sentence
+    from articles.article_gen import cleanup_sentence
     original = req.text.strip()
     suggested = cleanup_sentence(original, topic=req.topic)
     return {"original": original, "suggested": suggested}
@@ -535,7 +535,7 @@ def disambiguate_endpoint(q: str, db: Session = Depends(get_db)):
     """Typeahead disambiguation for search bar."""
     if not q or len(q.strip()) < 1:
         return {"results": []}
-    from article_store import ensure_tables, disambiguate
+    from articles.article_store import ensure_tables, disambiguate
     ensure_tables(db)
     return {"results": disambiguate(db, q.strip())}
 
@@ -588,7 +588,7 @@ def detect_topic_endpoint(req: DetectTopicRequest, db: Session = Depends(get_db)
     """Auto-detect topic for a standalone claim, store the association,
     and trigger background article generation if needed.
     Returns immediately with the detected topic."""
-    from topic_detect import detect_topic, ensure_article_for_claim
+    from articles.topic_detect import detect_topic, ensure_article_for_claim
 
     topic = detect_topic(req.claim_text)
     if not topic:
@@ -629,7 +629,7 @@ def moderate_endpoint(req: CleanupRequest):
 def refresh_article_endpoint(topic: str, db: Session = Depends(get_db)):
     """On-demand article refresh. Generates new content and merges with existing.
     Preserves all existing sentences and their on-chain claim links."""
-    from article_store import refresh_article, build_and_cache_response
+    from articles.article_store import refresh_article, build_and_cache_response
     try:
         added = refresh_article(db, topic)
         # Rebuild cached response with new content

@@ -147,7 +147,7 @@ def index_existing_claims_into_article(db: Session, article_id: int):
     2. INSERT: If no matching sentence exists but the claim is topically relevant,
        insert it into the best section.
     """
-    from article_store import insert_sentence, update_sentence_post_id
+    from articles.article_store import insert_sentence, update_sentence_post_id
 
     claims = db.execute(sql_text(
         "SELECT claim_id, claim_text, post_id FROM claim "
@@ -257,7 +257,7 @@ def cross_index_claim_into_all_articles(db: Session, claim_text: str, post_id: i
     Checks every existing article for topical relevance and inserts
     the claim into the best-matching section if not already present.
     """
-    from article_store import insert_sentence, update_sentence_post_id
+    from articles.article_store import insert_sentence, update_sentence_post_id
 
     # Get all articles
     articles = db.execute(sql_text(

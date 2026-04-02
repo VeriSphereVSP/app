@@ -260,8 +260,8 @@ def refresh_article(db: Session, topic: str) -> bool:
         similar text (fuzzy match by normalized lowercase comparison)
       - Existing sentences are never deleted or modified
     """
-    from article_gen import generate_article
-    from claim_indexer import index_existing_claims_into_article
+    from articles.article_gen import generate_article
+    from articles.claim_indexer import index_existing_claims_into_article
 
     key = _norm(topic)
     article = get_article(db, topic)
@@ -432,14 +432,14 @@ def build_and_cache_response(db_or_factory, topic_key: str):
 
         # 1. Link unlinked sentences to on-chain claims via embedding similarity
         try:
-            from article_routes import _link_unlinked_sentences
+            from articles.article_routes import _link_unlinked_sentences
             _link_unlinked_sentences(db, article)
         except Exception as e:
             logger.debug("Link unlinked failed: %s", e)
 
         # 2. Index existing on-chain claims into this article
         try:
-            from claim_indexer import index_existing_claims_into_article
+            from articles.claim_indexer import index_existing_claims_into_article
             index_existing_claims_into_article(db, article_id)
             article = get_article(db, topic_key)
             if not article:
@@ -484,7 +484,7 @@ def build_and_cache_response(db_or_factory, topic_key: str):
 
         # 5. Semantic dedup
         try:
-            from article_routes import _semantic_dedup
+            from articles.article_routes import _semantic_dedup
             _semantic_dedup(article)
         except Exception:
             pass

@@ -135,7 +135,7 @@ def _upsert_claim(db, claim_text, post_id):
 
     # Cross-index into all relevant articles
     try:
-        from claim_indexer import cross_index_claim_into_all_articles
+        from articles.claim_indexer import cross_index_claim_into_all_articles
         cross_index_claim_into_all_articles(db, claim_text, post_id)
     except Exception as e:
         logger.warning("Cross-indexing failed for post_id=%d: %s", post_id, e)
@@ -154,7 +154,7 @@ def _try_link_sentences(db, claim_text, post_id):
 
             # Also cross-index this claim into other articles where relevant
             try:
-                from claim_indexer import cross_index_claim_into_all_articles
+                from articles.claim_indexer import cross_index_claim_into_all_articles
                 cross_index_claim_into_all_articles(db, claim_text, post_id)
             except Exception as e:
                 logger.debug("Cross-index after link failed: %s", e)

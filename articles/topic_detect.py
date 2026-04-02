@@ -49,7 +49,7 @@ def ensure_article_for_claim(db: Session, claim_text: str, post_id: int, topic: 
     """Ensure an article exists for the topic and the claim is in it.
     If the article doesn't exist, generates it in a background thread.
     If it does exist, inserts the claim into the best section."""
-    from article_store import get_article, store_article, insert_sentence, update_sentence_post_id, _norm
+    from articles.article_store import get_article, store_article, insert_sentence, update_sentence_post_id, _norm
 
     topic_key = _norm(topic)
 
@@ -72,7 +72,7 @@ def ensure_article_for_claim(db: Session, claim_text: str, post_id: int, topic: 
         if not already:
             # Insert into best section
             try:
-                from claim_indexer import find_best_section
+                from articles.claim_indexer import find_best_section
                 sec_id = find_best_section(db, article_id, claim_text)
                 if sec_id:
                     last = db.execute(sql_text(
@@ -91,9 +91,9 @@ def ensure_article_for_claim(db: Session, claim_text: str, post_id: int, topic: 
     def _generate():
         try:
             from db import get_session_factory
-            from article_gen import generate_article
-            from article_store import store_article, get_article as load_article, insert_sentence, update_sentence_post_id
-            from claim_indexer import find_best_section
+            from articles.article_gen import generate_article
+            from articles.article_store import store_article, get_article as load_article, insert_sentence, update_sentence_post_id
+            from articles.claim_indexer import find_best_section
 
             session = get_session_factory()()
             try:
@@ -116,7 +116,7 @@ def ensure_article_for_claim(db: Session, claim_text: str, post_id: int, topic: 
 
                     # Also cross-index into other relevant articles
                     try:
-                        from claim_indexer import cross_index_claim_into_all_articles
+                        from articles.claim_indexer import cross_index_claim_into_all_articles
                         cross_index_claim_into_all_articles(session, claim_text, post_id)
                     except Exception:
                         pass

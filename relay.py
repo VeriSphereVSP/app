@@ -419,7 +419,7 @@ async def relay(body: RelayRequest, db: Session = Depends(get_db)):
 
                     # Immediate cross-index into all relevant articles
                     try:
-                        from claim_indexer import cross_index_claim_into_all_articles
+                        from articles.claim_indexer import cross_index_claim_into_all_articles
                         from chain_indexer import _queue_article_refresh
                         cross_index_claim_into_all_articles(db, claim_text, post_id)
                         _queue_article_refresh(db, post_id)
