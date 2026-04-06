@@ -287,3 +287,36 @@ def claims_fast(limit: int = 500, db: Session = Depends(get_db)):
         "avg_vs": round(avg_vs, 2),
     }
 
+
+
+@router.get("/{post_id}/queue")
+def claim_queue(post_id: int, db: Session = Depends(get_db)):
+    """Get all stakers and their positions for a post."""
+    rows = db.execute(sql_text(
+        "SELECT user_address, side, amount, weighted_position, entry_epoch, tranche, position_weight "
+        "FROM chain_user_stake WHERE post_id = :pid AND amount > 0 ORDER BY side, weighted_position"
+    ), {"pid": post_id}).fetchall()
+    
+    support = []
+    challenge = []
+    for r in rows:
+        entry = {
+            "address": r[0],
+            "amount": round(r[2], 4),
+            "position": round(r[3], 4),
+            "entry_epoch": r[4],
+            "tranche": r[5],
+            "position_weight": r[6],
+        }
+        if r[1] == 0:
+            support.append(entry)
+        else:
+            challenge.append(entry)
+    
+    return {
+        "post_id": post_id,
+        "support": support,
+        "challenge": challenge,
+        "support_total": sum(s["amount"] for s in support),
+        "challenge_total": sum(c["amount"] for c in challenge),
+    }
