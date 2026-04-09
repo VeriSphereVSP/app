@@ -181,11 +181,11 @@ def claim_edges(post_id: int):
 
 
 @router.get("/search")
-def search_claims(q: str = "", limit: int = 50, db: Session = Depends(get_db)):
+def search_claims(q: str = "", limit: int = 50, include_links: bool = False, db: Session = Depends(get_db)):
     """Search all on-chain claims by text. Returns claims with metrics from indexed DB."""
     from chain.chain_db import get_all_posts, get_edges
 
-    posts = get_all_posts(db, limit=500)
+    posts = get_all_posts(db, limit=500, include_links=include_links)
 
     # Filter by search query
     if q.strip():
@@ -231,11 +231,28 @@ def search_claims(q: str = "", limit: int = 50, db: Session = Depends(get_db)):
     return {"claims": claims, "total": len(claims)}
 
 @router.get("/fast/all")
-def claims_fast(limit: int = 500, db: Session = Depends(get_db)):
-    """Fast claims explorer using indexed DB data (no RPC calls)."""
+def claims_fast(limit: int = 500, include_links: bool = True, db: Session = Depends(get_db)):
+    """Fast claims explorer using indexed DB data (no RPC calls).
+    Returns both claims (content_type=0) and links (content_type=1)."""
     from chain.chain_db import get_all_posts, get_edges
     
-    posts = get_all_posts(db, limit=limit)
+    posts = get_all_posts(db, limit=limit, include_links=include_links)
+    
+    # Build a lookup of link metadata: link_post_id -> {from_post_id, to_post_id, is_challenge, from_text, to_text}
+    link_meta = {}
+    if include_links:
+        link_rows = db.execute(sql_text(
+            "SELECT l.link_post_id, l.from_post_id, l.to_post_id, l.is_challenge, "
+            "       cf.claim_text, ct.claim_text "
+            "FROM chain_link l "
+            "LEFT JOIN chain_claim_text cf ON cf.post_id = l.from_post_id "
+            "LEFT JOIN chain_claim_text ct ON ct.post_id = l.to_post_id"
+        )).fetchall()
+        for r in link_rows:
+            link_meta[r[0]] = {
+                "from_post_id": r[1], "to_post_id": r[2], "is_challenge": r[3],
+                "from_text": r[4] or "", "to_text": r[5] or "",
+            }
     
     claims = []
     for p in posts:
@@ -244,10 +261,10 @@ def claims_fast(limit: int = 500, db: Session = Depends(get_db)):
         outgoing = get_edges(db, p["post_id"], "outgoing")
         
         total = p["support_total"] + p["challenge_total"]
-        controversy = 0
-        if total > 0:
-            minority = min(p["support_total"], p["challenge_total"])
-            controversy = minority / total
+        # New controversy: total stake × (1 - |VS|/100)
+        # Captures both scale (more stake = more meaningful) and dispute level
+        vs_abs = abs(p.get("verity_score", 0)) / 100.0
+        controversy = total * (1 - vs_abs)
         
         # Find topic
         topic_row = db.execute(sql_text(
@@ -261,9 +278,12 @@ def claims_fast(limit: int = 500, db: Session = Depends(get_db)):
                 "SELECT topic FROM claim WHERE post_id = :pid AND topic IS NOT NULL LIMIT 1"
             ), {"pid": p["post_id"]}).fetchone()
         
-        claims.append({
+        is_link = p.get("content_type", 0) == 1
+        entry = {
             "post_id": p["post_id"],
-            "text": _moderate_text(p["text"]),
+            "content_type": p.get("content_type", 0),
+            "is_link": is_link,
+            "text": _moderate_text(p["text"]) if not is_link else "",
             "creator": p.get("creator", ""),
             "verity_score": round(p["verity_score"], 2),
             "base_vs": round(p.get("base_vs", 0), 2),
@@ -275,7 +295,20 @@ def claims_fast(limit: int = 500, db: Session = Depends(get_db)):
             "outgoing_links": len(outgoing),
             "topic": topic_row[0] if topic_row else None,
             "created_at": None,
-        })
+        }
+        
+        # Enrich link entries
+        if is_link and p["post_id"] in link_meta:
+            m = link_meta[p["post_id"]]
+            entry["from_post_id"] = m["from_post_id"]
+            entry["to_post_id"] = m["to_post_id"]
+            entry["is_challenge"] = m["is_challenge"]
+            entry["from_text"] = _moderate_text(m["from_text"])
+            entry["to_text"] = _moderate_text(m["to_text"])
+            # For sorting purposes, use the target claim text
+            entry["text"] = entry["to_text"]
+        
+        claims.append(entry)
     
     total_stake = sum(c["total_stake"] for c in claims)
     avg_vs = sum(c["verity_score"] for c in claims) / len(claims) if claims else 0

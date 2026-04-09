@@ -96,7 +96,7 @@ def get_global(db: Session, key: str) -> float | None:
     return row[0] if row else None
 
 
-def get_all_posts(db: Session, limit: int = 500) -> list[dict]:
+def get_all_posts(db: Session, limit: int = 500, include_links: bool = True) -> list[dict]:
     """Returns all indexed posts for Claims Explorer."""
     rows = db.execute(sql_text(
         "SELECT p.post_id, p.content_type, p.creator, "
@@ -104,8 +104,8 @@ def get_all_posts(db: Session, limit: int = 500) -> list[dict]:
         "t.claim_text "
         "FROM chain_post p "
         "LEFT JOIN chain_claim_text t ON p.post_id = t.post_id "
-        "WHERE p.content_type = 0 "  # claims only
-        "ORDER BY (p.support_total + p.challenge_total) DESC "
+        + ("WHERE p.content_type = 0 " if not include_links else "")
+        + "ORDER BY (p.support_total + p.challenge_total) DESC "
         "LIMIT :lim"
     ), {"lim": limit}).fetchall()
 
