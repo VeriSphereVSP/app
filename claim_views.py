@@ -295,6 +295,7 @@ def claims_fast(limit: int = 500, include_links: bool = True, db: Session = Depe
             "outgoing_links": len(outgoing),
             "topic": topic_row[0] if topic_row else None,
             "created_at": None,
+            "created_epoch": p.get("created_epoch"),
         }
         
         # Enrich link entries

@@ -99,7 +99,7 @@ def get_global(db: Session, key: str) -> float | None:
 def get_all_posts(db: Session, limit: int = 500, include_links: bool = True) -> list[dict]:
     """Returns all indexed posts for Claims Explorer."""
     rows = db.execute(sql_text(
-        "SELECT p.post_id, p.content_type, p.creator, "
+        "SELECT p.post_id, p.content_type, p.creator, p.created_epoch, "
         "p.support_total, p.challenge_total, p.base_vs, p.effective_vs, p.is_active, "
         "t.claim_text "
         "FROM chain_post p "
@@ -111,9 +111,9 @@ def get_all_posts(db: Session, limit: int = 500, include_links: bool = True) -> 
 
     return [{
         "post_id": r[0], "content_type": r[1], "creator": r[2],
-        "support_total": r[3], "challenge_total": r[4],
-        "base_vs": r[5], "verity_score": r[6], "is_active": r[7],
-        "text": r[8] or "",
+        "support_total": r[4], "challenge_total": r[5],
+        "base_vs": r[6], "verity_score": r[7], "is_active": r[8],
+        "text": r[9] or "", "created_epoch": r[3],
     } for r in rows]
 
 
