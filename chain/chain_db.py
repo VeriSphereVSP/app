@@ -123,7 +123,8 @@ def get_user_positions(db: Session, user_address: str) -> list[dict]:
         "SELECT us.post_id, us.side, us.amount, us.tranche, us.position_weight, "
         "p.content_type, p.support_total, p.challenge_total, "
         "p.base_vs, p.effective_vs, p.is_active, "
-        "COALESCE(t.claim_text, '') as claim_text "
+        "COALESCE(t.claim_text, '') as claim_text, "
+        "p.created_epoch, p.creator "
         "FROM chain_user_stake us "
         "JOIN chain_post p ON us.post_id = p.post_id "
         "LEFT JOIN chain_claim_text t ON us.post_id = t.post_id "
@@ -146,6 +147,13 @@ def get_user_positions(db: Session, user_address: str) -> list[dict]:
         is_active = r[10]
         text = r[11]
 
+        created_epoch = r[12] if len(r) > 12 else None
+        creator = r[13] if len(r) > 13 else None
+        from_post_id = None
+        to_post_id = None
+        is_challenge = None
+        from_text_raw = None
+        to_text_raw = None
         # For links, build descriptive text
         if content_type != 0 and not text:
             link_row = db.execute(sql_text(
@@ -157,9 +165,14 @@ def get_user_positions(db: Session, user_address: str) -> list[dict]:
                 "WHERE l.link_post_id = :pid"
             ), {"pid": post_id}).fetchone()
             if link_row:
-                verb = "challenges" if link_row[2] else "supports"
-                from_t = (link_row[3] or f"#{link_row[0]}")[:30]
-                to_t = (link_row[4] or f"#{link_row[1]}")[:30]
+                from_post_id = link_row[0]
+                to_post_id = link_row[1]
+                is_challenge = bool(link_row[2])
+                from_text_raw = link_row[3] or ""
+                to_text_raw = link_row[4] or ""
+                verb = "challenges" if is_challenge else "supports"
+                from_t = (from_text_raw or f"#{from_post_id}")[:30]
+                to_t = (to_text_raw or f"#{to_post_id}")[:30]
                 text = f'"{from_t}" {verb} "{to_t}"'
 
         # Determine winning/losing
@@ -196,7 +209,15 @@ def get_user_positions(db: Session, user_address: str) -> list[dict]:
         positions.append({
             "post_id": post_id,
             "post_type": "link" if content_type != 0 else "claim",
+            "is_link": content_type != 0,
             "text": text,
+            "created_epoch": created_epoch,
+            "creator": creator,
+            "from_post_id": from_post_id,
+            "to_post_id": to_post_id,
+            "is_challenge": is_challenge,
+            "from_text": from_text_raw,
+            "to_text": to_text_raw,
             "user_support": amount if side == 0 else 0,
             "user_challenge": amount if side == 1 else 0,
             "user_total": amount,
