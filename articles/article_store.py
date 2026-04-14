@@ -25,43 +25,10 @@ def _norm(topic: str) -> str:
 # ── Schema ──────────────────────────────────────────────
 
 def ensure_tables(db: Session):
-    # Migrate: add is_hidden for dedup-persisted sentences
-    try:
-        db.execute(sql_text(
-            "ALTER TABLE article_sentence ADD COLUMN IF NOT EXISTS is_hidden BOOLEAN NOT NULL DEFAULT FALSE"
-        ))
-    except Exception:
-        pass
-    # Migrate: add embedding column for cached sentence embeddings
-    try:
-        db.execute(sql_text(
-            "ALTER TABLE article_sentence ADD COLUMN IF NOT EXISTS embedding JSONB"
-        ))
-    except Exception:
-        pass
-    # Migrate: add cached_response + response_hash columns if missing
-    try:
-        from sqlalchemy import text as sql_text
-        db.execute(sql_text(
-            "ALTER TABLE topic_article "
-            "ADD COLUMN IF NOT EXISTS cached_response JSONB"
-        ))
-        db.execute(sql_text(
-            "ALTER TABLE topic_article "
-            "ADD COLUMN IF NOT EXISTS response_hash VARCHAR(16)"
-        ))
-        db.commit()
-    except Exception:
-        try:
-            db.rollback()
-        except Exception:
-            pass
-
-    """No-op. Schema is now managed by ops/compose/migrations/040_article_tables.sql."""
-    pass
-
-
-# ── Reads ───────────────────────────────────────────────
+    """No-op. Schema is managed by ops/compose/migrations/*.sql, applied
+    at container startup via `python migrate.py`. This stub remains for
+    backward compatibility with callers that expect the function to exist."""
+    return
 
 def get_article(db: Session, topic: str) -> Optional[Dict[str, Any]]:
     """Load a full article with sections and sentences."""
