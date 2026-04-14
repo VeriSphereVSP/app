@@ -332,16 +332,23 @@ def _generate_and_store(topic: str, db: Session, refresh: bool) -> dict:
     except Exception as e:
         logger.warning("Claim indexing failed (non-fatal): %s", e)
 
-    # Build cached response in background for future instant serving
+    # Run dedup + cache build in background for future instant serving
     import threading
-    def _bg_cache(topic_key):
+    article_id_for_bg = article["article_id"]
+    def _bg_cache(topic_key, art_id):
         try:
             from db import get_session_factory
-            from articles.article_store import build_and_cache_response
-            build_and_cache_response(get_session_factory(), topic_key)
+            from articles.article_store import persist_dedup, build_and_cache_response
+            Sess = get_session_factory()
+            db = Sess()
+            try:
+                persist_dedup(db, art_id)
+            finally:
+                db.close()
+            build_and_cache_response(Sess, topic_key)
         except Exception as e:
-            logger.debug("Post-generate cache build failed: %s", e)
-    threading.Thread(target=_bg_cache, args=(topic,), daemon=True).start()
+            logger.debug("Post-generate dedup+cache build failed: %s", e)
+    threading.Thread(target=_bg_cache, args=(topic, article_id_for_bg), daemon=True).start()
 
     return _enrich_sentences(article)
 

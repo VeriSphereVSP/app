@@ -465,6 +465,13 @@ async def relay(body: RelayRequest, db: Session = Depends(get_db)):
                     post_id = logs[0].args.postId
                     claim_text = _decode_claim_text(calldata_hex)
                     _mark_claim_on_chain(db, claim_text, post_id)
+                    # Incremental cache update: link this new claim to any article
+                    # sentence with matching text
+                    try:
+                        from articles.article_store import apply_new_post
+                        apply_new_post(db, post_id, claim_text)
+                    except Exception as e:
+                        logger.debug("apply_new_post failed (non-fatal): %s", e)
                     claim_state = _get_claim_state(post_id, req.from_)
                     claim_state["text"] = claim_text
                     claim_state["creator"] = req.from_

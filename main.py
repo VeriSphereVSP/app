@@ -400,13 +400,26 @@ def token_balance(address: str):
 
 @app.post("/api/reindex/{post_id}")
 def reindex_post(post_id: int, user: str = None):
-    """Trigger immediate reindex of a post and optionally a user's stakes."""
+    """Trigger immediate reindex of a post, user stakes, and invalidate article cache."""
     try:
         from chain_indexer import index_post
         from db import get_session_factory
+        from sqlalchemy import text as sql_text
         db = get_session_factory()()
         users = [user] if user else None
         index_post(db, post_id, user_addresses=users)
+        # Note: link_unlinked_sentences runs during build_and_cache_response anyway,
+        # so we don't need to do it here. Just invalidate the cache.
+        # Invalidate article caches that reference this post
+        db.execute(sql_text(
+            "UPDATE topic_article SET cached_response = NULL "
+            "WHERE article_id IN ("
+            "  SELECT DISTINCT sec.article_id FROM article_section sec "
+            "  JOIN article_sentence s ON s.section_id = sec.section_id "
+            "  WHERE s.post_id = :pid"
+            ")"
+        ), {"pid": post_id})
+        db.commit()
         db.close()
         return {"ok": True, "post_id": post_id}
     except Exception as e:

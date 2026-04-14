@@ -25,6 +25,20 @@ def _norm(topic: str) -> str:
 # ── Schema ──────────────────────────────────────────────
 
 def ensure_tables(db: Session):
+    # Migrate: add is_hidden for dedup-persisted sentences
+    try:
+        db.execute(sql_text(
+            "ALTER TABLE article_sentence ADD COLUMN IF NOT EXISTS is_hidden BOOLEAN NOT NULL DEFAULT FALSE"
+        ))
+    except Exception:
+        pass
+    # Migrate: add embedding column for cached sentence embeddings
+    try:
+        db.execute(sql_text(
+            "ALTER TABLE article_sentence ADD COLUMN IF NOT EXISTS embedding JSONB"
+        ))
+    except Exception:
+        pass
     # Migrate: add cached_response + response_hash columns if missing
     try:
         from sqlalchemy import text as sql_text
@@ -69,7 +83,7 @@ def get_article(db: Session, topic: str) -> Optional[Dict[str, Any]]:
     for sec_id, heading, _ in secs:
         sents = db.execute(sql_text(
             "SELECT sentence_id, sort_order, text, post_id, replaced_by "
-            "FROM article_sentence WHERE section_id = :s ORDER BY sort_order"
+            "FROM article_sentence WHERE section_id = :s AND is_hidden = FALSE ORDER BY sort_order"
         ), {"s": sec_id}).fetchall()
 
         sentences = []
@@ -430,22 +444,9 @@ def build_and_cache_response(db_or_factory, topic_key: str):
 
         # ── Expensive enrichment (runs once, result is cached) ──
 
-        # 1. Link unlinked sentences to on-chain claims via embedding similarity
-        try:
-            from articles.article_routes import _link_unlinked_sentences
-            _link_unlinked_sentences(db, article)
-        except Exception as e:
-            logger.debug("Link unlinked failed: %s", e)
+        # 1. SKIPPED: semantic linking is O(sentences * claims), runs only at generation time
 
-        # 2. Index existing on-chain claims into this article
-        try:
-            from articles.claim_indexer import index_existing_claims_into_article
-            index_existing_claims_into_article(db, article_id)
-            article = get_article(db, topic_key)
-            if not article:
-                return
-        except Exception as e:
-            logger.debug("Claim indexing failed: %s", e)
+        # 2. SKIPPED: index_existing_claims_into_article is slow; runs at generation time instead
 
         # 3. Enrich with live VS/stake data from chain (RPC calls)
         try:
@@ -482,12 +483,8 @@ def build_and_cache_response(db_or_factory, topic_key: str):
         except Exception:
             pass
 
-        # 5. Semantic dedup
-        try:
-            from articles.article_routes import _semantic_dedup
-            _semantic_dedup(article)
-        except Exception:
-            pass
+        # 5. SKIPPED: _semantic_dedup makes N OpenAI embedding calls per rebuild.
+        # Runs at article generation time instead.
 
         # ── Cache the fully-built result ──
         response_json = json.dumps(article, default=str)
@@ -513,3 +510,275 @@ def build_and_cache_response(db_or_factory, topic_key: str):
     finally:
         if owns_session:
             db.close()
+
+
+def apply_stake_delta(
+    db_or_factory,
+    post_id: int,
+    support_total: float,
+    challenge_total: float,
+    verity_score: float,
+):
+    """Patch any cached article JSON containing a sentence with this post_id.
+    
+    Much faster than nulling the cache. Finds sentences in O(articles) and
+    updates three fields per match in the JSONB column. Called from the chain
+    indexer's StakeAdded / StakeWithdrawn / PostUpdated handler."""
+    import json, logging
+    from sqlalchemy import text as sql_text
+    logger = logging.getLogger(__name__)
+    
+    if hasattr(db_or_factory, "execute"):
+        db = db_or_factory
+        owns = False
+    else:
+        db = db_or_factory()
+        owns = True
+    try:
+        # Find all articles whose cached JSON contains this post_id.
+        # The JSON path is sections[*].sentences[*].post_id. We rely on the
+        # fact that a matching article_sentence row also exists (indexed link).
+        rows = db.execute(sql_text(
+            "SELECT DISTINCT ta.article_id, ta.topic_key "
+            "FROM topic_article ta "
+            "JOIN article_section sec ON sec.article_id = ta.article_id "
+            "JOIN article_sentence s ON s.section_id = sec.section_id "
+            "WHERE s.post_id = :pid AND ta.cached_response IS NOT NULL"
+        ), {"pid": post_id}).fetchall()
+        
+        for article_id, topic_key in rows:
+            try:
+                row = db.execute(sql_text(
+                    "SELECT cached_response FROM topic_article WHERE article_id = :a"
+                ), {"a": article_id}).fetchone()
+                if not row or not row[0]:
+                    continue
+                
+                doc = row[0] if isinstance(row[0], dict) else json.loads(row[0])
+                patched = False
+                for section in doc.get("sections", []):
+                    for sent in section.get("sentences", []):
+                        if sent.get("post_id") == post_id:
+                            sent["stake_support"] = support_total
+                            sent["stake_challenge"] = challenge_total
+                            sent["verity_score"] = verity_score
+                            patched = True
+                
+                if patched:
+                    db.execute(sql_text(
+                        "UPDATE topic_article SET cached_response = CAST(:resp AS jsonb), "
+                        "last_refreshed_at = NOW() WHERE article_id = :a"
+                    ), {"resp": json.dumps(doc, default=str), "a": article_id})
+                    logger.info("apply_stake_delta: patched post %d in article '%s'",
+                                post_id, topic_key)
+            except Exception as e:
+                logger.warning("apply_stake_delta failed for article_id=%d: %s",
+                               article_id, e)
+        db.commit()
+    except Exception as e:
+        logger.warning("apply_stake_delta failed: %s", e)
+        try: db.rollback()
+        except Exception: pass
+    finally:
+        if owns:
+            db.close()
+
+
+def apply_new_post(db_or_factory, post_id: int, claim_text: str):
+    """When a new claim is created, link it to any article sentence whose
+    text exactly matches (case-insensitive, trimmed). Updates both the
+    article_sentence DB row and the cached article JSON.
+    
+    This is the fast path. Semantic matching (non-exact) runs only during
+    full article generation."""
+    import json, logging
+    from sqlalchemy import text as sql_text
+    logger = logging.getLogger(__name__)
+    
+    if hasattr(db_or_factory, "execute"):
+        db = db_or_factory
+        owns = False
+    else:
+        db = db_or_factory()
+        owns = True
+    try:
+        normalized = (claim_text or "").strip()
+        if not normalized:
+            return
+        
+        # Find article_sentence rows with matching text that don't yet have post_id
+        rows = db.execute(sql_text(
+            "SELECT s.sentence_id, s.section_id, sec.article_id, ta.topic_key "
+            "FROM article_sentence s "
+            "JOIN article_section sec ON s.section_id = sec.section_id "
+            "JOIN topic_article ta ON sec.article_id = ta.article_id "
+            "WHERE LOWER(TRIM(s.text)) = LOWER(:t) AND s.post_id IS NULL"
+        ), {"t": normalized}).fetchall()
+        
+        if not rows:
+            return
+        
+        # Update each matching sentence
+        article_ids = set()
+        for sid, _sec_id, art_id, _topic in rows:
+            db.execute(sql_text(
+                "UPDATE article_sentence SET post_id = :pid WHERE sentence_id = :sid"
+            ), {"pid": post_id, "sid": sid})
+            article_ids.add(art_id)
+        
+        # Patch cached JSON for each affected article
+        for art_id in article_ids:
+            try:
+                row = db.execute(sql_text(
+                    "SELECT cached_response, topic_key FROM topic_article WHERE article_id = :a"
+                ), {"a": art_id}).fetchone()
+                if not row or not row[0]:
+                    continue
+                
+                doc = row[0] if isinstance(row[0], dict) else json.loads(row[0])
+                patched = False
+                for section in doc.get("sections", []):
+                    for sent in section.get("sentences", []):
+                        if (sent.get("post_id") is None
+                            and sent.get("text", "").strip().lower() == normalized.lower()):
+                            sent["post_id"] = post_id
+                            sent["stake_support"] = 0.0
+                            sent["stake_challenge"] = 0.0
+                            sent["verity_score"] = 0.0
+                            patched = True
+                
+                if patched:
+                    db.execute(sql_text(
+                        "UPDATE topic_article SET cached_response = CAST(:resp AS jsonb), "
+                        "last_refreshed_at = NOW() WHERE article_id = :a"
+                    ), {"resp": json.dumps(doc, default=str), "a": art_id})
+                    logger.info("apply_new_post: linked post %d to article_id=%d",
+                                post_id, art_id)
+            except Exception as e:
+                logger.warning("apply_new_post patch failed for article_id=%d: %s",
+                               art_id, e)
+        
+        db.commit()
+    except Exception as e:
+        logger.warning("apply_new_post failed: %s", e)
+        try: db.rollback()
+        except Exception: pass
+    finally:
+        if owns:
+            db.close()
+
+
+
+def persist_dedup(db, article_id: int):
+    """Run dedup using batched embeddings and persist decisions via is_hidden.
+    
+    Embeddings are cached in article_sentence.embedding (JSONB) so we only embed
+    each sentence once across all dedup runs. Drops duplicates by setting is_hidden.
+    """
+    import json, logging
+    from sqlalchemy import text as sql_text
+    logger = logging.getLogger(__name__)
+    try:
+        # Step 1: collect all non-hidden sentences for this article with embeddings from DB
+        rows = db.execute(sql_text(
+            "SELECT s.sentence_id, s.text, s.post_id, s.embedding "
+            "FROM article_sentence s "
+            "JOIN article_section sec ON s.section_id = sec.section_id "
+            "WHERE sec.article_id = :a AND s.is_hidden = FALSE "
+            "ORDER BY s.section_id, s.sort_order"
+        ), {"a": article_id}).fetchall()
+        
+        if not rows:
+            return
+        
+        # Step 2: find sentences without cached embeddings and batch-embed them
+        needs_embed = [(r[0], r[1]) for r in rows if r[3] is None]
+        embeddings_by_id = {}
+        for r in rows:
+            if r[3] is not None:
+                # Already have cached embedding
+                if isinstance(r[3], str):
+                    embeddings_by_id[r[0]] = json.loads(r[3])
+                else:
+                    embeddings_by_id[r[0]] = r[3]
+        
+        if needs_embed:
+            from embedding import embed_batch
+            texts_to_embed = [t for (_, t) in needs_embed]
+            logger.info("persist_dedup: embedding %d new sentences in article %d",
+                        len(texts_to_embed), article_id)
+            vecs = embed_batch(texts_to_embed)
+            
+            # Persist new embeddings
+            for (sid, _), vec in zip(needs_embed, vecs):
+                embeddings_by_id[sid] = vec
+                try:
+                    db.execute(sql_text(
+                        "UPDATE article_sentence SET embedding = CAST(:e AS jsonb) "
+                        "WHERE sentence_id = :sid"
+                    ), {"e": json.dumps(vec), "sid": sid})
+                except Exception as e:
+                    logger.debug("Failed to persist embedding for sid=%d: %s", sid, e)
+            db.commit()
+        
+        # Step 3: dedup decision using cached vectors
+        from similarity import cosine_similarity
+        DEDUP_THRESHOLD = 0.70
+        
+        onchain_vecs = [embeddings_by_id[r[0]] for r in rows
+                        if r[2] is not None and r[0] in embeddings_by_id]
+        
+        to_hide = []
+        kept_offchain_vecs = []
+        for r in rows:
+            sid, text, post_id, _ = r
+            if post_id is not None:
+                continue  # always keep on-chain
+            text_s = (text or "").strip()
+            if not text_s:
+                to_hide.append(sid)
+                continue
+            vec = embeddings_by_id.get(sid)
+            if vec is None:
+                continue  # couldn't embed, keep
+            
+            is_dupe = False
+            for ov in onchain_vecs:
+                if cosine_similarity(vec, ov) >= DEDUP_THRESHOLD:
+                    is_dupe = True
+                    break
+            if not is_dupe:
+                for kv in kept_offchain_vecs:
+                    if cosine_similarity(vec, kv) >= DEDUP_THRESHOLD:
+                        is_dupe = True
+                        break
+            
+            if is_dupe:
+                to_hide.append(sid)
+            else:
+                kept_offchain_vecs.append(vec)
+        
+        if to_hide:
+            db.execute(sql_text(
+                "UPDATE article_sentence SET is_hidden = TRUE WHERE sentence_id = ANY(:ids)"
+            ), {"ids": to_hide})
+            db.commit()
+            logger.info("persist_dedup: hid %d duplicates in article %d",
+                        len(to_hide), article_id)
+    except Exception as e:
+        logger.warning("persist_dedup failed for article_id=%d: %s", article_id, e)
+        try: db.rollback()
+        except Exception: pass
+
+
+def _get_article_internal(db, article_id: int) -> dict:
+    """Internal helper: get article by article_id (not topic_key)."""
+    from sqlalchemy import text as sql_text
+    row = db.execute(sql_text(
+        "SELECT article_id, topic_key FROM topic_article WHERE article_id = :a"
+    ), {"a": article_id}).fetchone()
+    if not row:
+        return None
+    topic = row[1]
+    return get_article(db, topic)
+

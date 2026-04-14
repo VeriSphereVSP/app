@@ -17,3 +17,21 @@ def embed(text: str) -> List[float]:
     client = OpenAI(api_key=OPENAI_API_KEY, timeout=20.0)
     resp = client.embeddings.create(model=EMBEDDINGS_MODEL, input=text)
     return list(resp.data[0].embedding)
+
+
+def embed_batch(texts: List[str], batch_size: int = 100) -> List[List[float]]:
+    """Embed many texts in batched OpenAI API calls.
+    Much faster than calling embed() once per text."""
+    if not texts:
+        return []
+    if EMBEDDINGS_PROVIDER == "stub":
+        return [embed_stub(t) for t in texts]
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY not set")
+    client = OpenAI(api_key=OPENAI_API_KEY, timeout=60.0)
+    results = []
+    for i in range(0, len(texts), batch_size):
+        chunk = texts[i:i + batch_size]
+        resp = client.embeddings.create(model=EMBEDDINGS_MODEL, input=chunk)
+        results.extend([list(d.embedding) for d in resp.data])
+    return results
