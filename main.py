@@ -225,6 +225,33 @@ def get_user_stake_endpoint(post_id: int, user: str = None):
     return result
 
 
+
+@app.post("/api/user-stakes")
+def get_user_stakes_batch(body: dict):
+    """Get user's stake on multiple posts in a single request.
+    
+    Body: {"user": "0x...", "post_ids": [1, 2, 3, ...]}
+    Returns: {"stakes": {"1": {user_support: ..., user_challenge: ...}, ...}}
+    """
+    user = body.get("user")
+    post_ids = body.get("post_ids", [])
+    stakes = {}
+    if not user or not post_ids:
+        return {"stakes": stakes}
+    try:
+        from chain.chain_reader import get_user_stake
+        for pid in post_ids:
+            try:
+                stakes[str(pid)] = {
+                    "user_support": get_user_stake(user, pid, 0),
+                    "user_challenge": get_user_stake(user, pid, 1),
+                }
+            except Exception:
+                stakes[str(pid)] = {"user_support": 0, "user_challenge": 0}
+    except Exception as e:
+        print(f"Batch user-stakes failed: {e}")
+    return {"stakes": stakes}
+
 @app.get("/api/claims/{post_id}/debug")
 def debug_claim(post_id: int):
     """Debug: show raw on-chain data for a claim to verify VS calculation."""

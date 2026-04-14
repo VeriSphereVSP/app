@@ -252,16 +252,19 @@ def user_portfolio(address: str, db: Session = Depends(get_db)):
         status = pos["position_status"]
         if status == "winning":
             summary["winning_count"] += 1
+            summary["winning_stake"] = summary.get("winning_stake", 0.0) + pos["user_total"]
         elif status == "losing":
             summary["losing_count"] += 1
+            summary["losing_stake"] = summary.get("losing_stake", 0.0) + pos["user_total"]
         else:
             summary["neutral_count"] += 1
+            summary["neutral_stake"] = summary.get("neutral_stake", 0.0) + pos["user_total"]
 
     status_order = {"winning": 0, "losing": 2, "neutral": 1, "hedged": 1}
     positions.sort(key=lambda p: (status_order.get(p["position_status"], 3), -p["user_total"]))
 
-    for k in ["total_staked", "total_support", "total_challenge"]:
-        summary[k] = round(summary[k], 6)
+    for k in ["total_staked", "total_support", "total_challenge", "winning_stake", "losing_stake", "neutral_stake"]:
+        summary[k] = round(summary.get(k, 0.0), 6)
 
     # Compute weighted average APR
     weighted_apr = 0.0
@@ -318,6 +321,9 @@ def portfolio_fast(address: str, db: Session = Depends(get_db)):
     winning = sum(1 for p in positions if p["position_status"] == "winning")
     losing = sum(1 for p in positions if p["position_status"] == "losing")
     neutral = sum(1 for p in positions if p["position_status"] == "neutral")
+    winning_stake = sum(p["user_total"] for p in positions if p["position_status"] == "winning")
+    losing_stake = sum(p["user_total"] for p in positions if p["position_status"] == "losing")
+    neutral_stake = sum(p["user_total"] for p in positions if p["position_status"] == "neutral")
     
     # Weighted APR
     weighted_apr = 0.0
@@ -352,6 +358,9 @@ def portfolio_fast(address: str, db: Session = Depends(get_db)):
             "winning_count": winning,
             "losing_count": losing,
             "neutral_count": neutral,
+            "winning_stake": round(winning_stake, 4),
+            "losing_stake": round(losing_stake, 4),
+            "neutral_stake": round(neutral_stake, 4),
             "weighted_apr": round(weighted_apr / total_for_apr, 1) if total_for_apr > 0 else 0.0,
         },
         "positions": positions,
