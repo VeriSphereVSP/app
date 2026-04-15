@@ -42,34 +42,67 @@ async def lifespan(app):
             cleanup_rate_limiter()
     _aio.create_task(_rl_cleanup())
 
-    # Daily article refresh — refreshes stale articles in the background
+    # Background article refresh — autotunes interval to spread load over 24h
     async def _daily_refresh():
-        import asyncio
+        import asyncio, statistics, time
+        from db import get_session_factory
+        from articles.article_store import refresh_article, persist_dedup, build_and_cache_response
+        from sqlalchemy import text as sql_text
+        CYCLE_SECONDS = 86400  # 24h target
+        recent_elapsed = []
+        # Initial sleep to avoid hitting LLM during app startup
+        await asyncio.sleep(120)
         while True:
-            await asyncio.sleep(900)  # Safety net: 15 min (chain events trigger immediate rebuilds)
             try:
-                from db import get_session_factory
-                from articles.article_store import refresh_article
-                from sqlalchemy import text as sql_text
-                session = get_session_factory()()
+                Sess = get_session_factory()
+                # Pick the article with the oldest last_refreshed_at
+                db = Sess()
                 try:
-                    # Find articles not refreshed in 24h, ordered by view_count
-                    stale = session.execute(sql_text(
-                        "SELECT topic_key FROM topic_article "
-                        "WHERE last_refreshed_at IS NULL "
-                        "   OR last_refreshed_at < NOW() - INTERVAL '24 hours' "
-                        "ORDER BY COALESCE(view_count, 0) DESC LIMIT 5"
-                    )).fetchall()
-                    for (topic_key,) in stale:
-                        try:
-                            refresh_article(session, topic_key)
-                        except Exception as e:
-                            print(f"Daily refresh failed for '{topic_key}': {e}")
-                        await asyncio.sleep(10)  # Don't hammer the LLM
+                    row = db.execute(sql_text(
+                        "SELECT topic_key, article_id FROM topic_article "
+                        "ORDER BY last_refreshed_at NULLS FIRST LIMIT 1"
+                    )).fetchone()
+                    n_row = db.execute(sql_text("SELECT COUNT(*) FROM topic_article")).fetchone()
+                    N = n_row[0] if n_row else 1
                 finally:
-                    session.close()
+                    db.close()
+                
+                if row:
+                    topic_key, article_id = row
+                    t0 = time.time()
+                    
+                    def _do_refresh():
+                        sess = Sess()
+                        try:
+                            refresh_article(sess, topic_key)
+                        finally:
+                            sess.close()
+                        sess = Sess()
+                        try:
+                            persist_dedup(sess, article_id)
+                        finally:
+                            sess.close()
+                        build_and_cache_response(Sess, topic_key)
+                    
+                    try:
+                        await asyncio.to_thread(_do_refresh)
+                        elapsed = time.time() - t0
+                        recent_elapsed.append(elapsed)
+                        if len(recent_elapsed) > 10:
+                            recent_elapsed.pop(0)
+                        avg = statistics.mean(recent_elapsed)
+                        print(f"bg-refresh: '{topic_key}' done in {elapsed:.1f}s (avg {avg:.1f}s, N={N})")
+                    except Exception as e:
+                        print(f"bg-refresh failed for '{topic_key}': {e}")
+                
+                # Autotune: spread CYCLE_SECONDS evenly across N articles
+                avg = statistics.mean(recent_elapsed) if recent_elapsed else 30.0
+                sleep_s = max(60, (CYCLE_SECONDS - N * avg) / max(N, 1))
+                print(f"bg-refresh: sleeping {sleep_s:.0f}s before next (N={N}, avg={avg:.1f}s)")
+                await asyncio.sleep(sleep_s)
             except Exception as e:
-                print(f"Daily refresh loop error: {e}")
+                print(f"bg-refresh loop error: {e}")
+                await asyncio.sleep(120)
     _aio.create_task(_daily_refresh())
 
     yield

@@ -121,12 +121,23 @@ def claim_edges(post_id: int):
             claim_post_id: int,
             link_post_id: int,
             is_challenge: bool,
+            target_post_id: int,
         ) -> Dict[str, Any]:
             result: Dict[str, Any] = {
                 "claim_post_id": claim_post_id,
                 "link_post_id": link_post_id,
                 "is_challenge": is_challenge,
             }
+            # Edge contribution to target's effective VS, in VSP-equivalent units
+            try:
+                contrib_ray = score_engine.functions.getEdgeContribution(
+                    target_post_id, link_post_id
+                ).call()
+                # Contract returns (parentVS_RAY * parentTotal_wei * linkStake_wei * linkVS_RAY)
+                # / (sumOutgoing_wei * RAY * RAY) — net unit is wei (VSP * 1e18)
+                result["edge_contribution"] = contrib_ray / 1e18
+            except Exception:
+                result["edge_contribution"] = 0
             try:
                 cs = views.functions.getClaimSummary(claim_post_id).call()
                 result["claim_text"] = _moderate_text(str(cs[0]))
@@ -158,6 +169,7 @@ def claim_edges(post_id: int):
                 claim_post_id=int(edge[0]),
                 link_post_id=int(edge[1]),
                 is_challenge=bool(edge[2]),
+                target_post_id=post_id,
             ))
 
         outgoing: List[Dict[str, Any]] = []
@@ -166,6 +178,7 @@ def claim_edges(post_id: int):
                 claim_post_id=int(edge[0]),
                 link_post_id=int(edge[1]),
                 is_challenge=bool(edge[2]),
+                target_post_id=int(edge[0]),
             ))
 
         return {

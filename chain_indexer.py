@@ -343,6 +343,22 @@ def poll_events(db: Session):
             users = list(affected_users.get(pid, []))
             index_post(db, pid, user_addresses=users)
 
+        # Incremental cache update: patch any cached article containing these posts
+        # with fresh stake/VS values. Much faster than invalidating + rebuilding.
+        if affected_posts:
+            try:
+                from articles.article_store import apply_stake_delta
+                from chain.chain_reader import get_stake_totals, get_verity_score
+                for pid in affected_posts:
+                    try:
+                        s, ch = get_stake_totals(pid)
+                        vs = get_verity_score(pid)
+                        apply_stake_delta(db, pid, s, ch, vs)
+                    except Exception as e:
+                        logger.debug("apply_stake_delta(%d) failed: %s", pid, e)
+            except Exception as e:
+                logger.debug("Stake-delta update failed: %s", e)
+
         _set_last_block(db, "StakeEngine", to_block)
 
     # PostRegistry events
@@ -444,36 +460,8 @@ def trigger_reindex(post_id: int, user_address: str | None = None):
     except Exception as e:
         logger.warning("Trigger reindex failed for post %d: %s", post_id, e)
 def _queue_article_refresh(db, post_id):
-    """Trigger immediate background article cache rebuild for any topic
-    affected by this post. Called by relay.py after stake/claim changes."""
-    import threading, logging
-    logger = logging.getLogger(__name__)
-    try:
-        from sqlalchemy import text as sql_text
-        rows = db.execute(sql_text(
-            "SELECT DISTINCT topic_key FROM article_sentence "
-            "WHERE post_id = :pid"
-        ), {"pid": post_id}).fetchall()
-
-        for (topic_key,) in rows:
-            def _rebuild(tk):
-                try:
-                    from db import get_session_factory
-                    from articles.article_store import build_and_cache_response
-                    build_and_cache_response(get_session_factory(), tk)
-                except Exception as e:
-                    logger.debug("Article cache rebuild failed for '%s': %s", tk, e)
-
-            threading.Thread(
-                target=_rebuild,
-                args=(topic_key,),
-                daemon=True,
-                name=f"rebuild-{topic_key[:20]}",
-            ).start()
-
-        if rows:
-            logger.info("Triggered cache rebuild for %d topics (post_id=%d)",
-                        len(rows), post_id)
-    except Exception as e:
-        logger.warning("Article refresh trigger failed (non-fatal): %s", e)
+    """No-op. Article caches are now maintained incrementally via apply_stake_delta
+    (called from chain_indexer event loop) and apply_new_post (from relay.py).
+    Kept as a stub for backward compatibility with callers."""
+    return
 

@@ -749,3 +749,76 @@ def _get_article_internal(db, article_id: int) -> dict:
     topic = row[1]
     return get_article(db, topic)
 
+
+
+def background_refresh_worker():
+    """Autotuned background worker. Refreshes the oldest article continuously,
+    sleeping between runs so the total cycle takes 24h regardless of N articles
+    or per-refresh duration.
+    
+    sleep_time = max(0, (24h - N * avg_elapsed) / N)
+    
+    Single thread per app process. Idempotent on restart (resumes from
+    last_refreshed_at ordering)."""
+    import logging, threading, time, statistics
+    from sqlalchemy import text as sql_text
+    logger = logging.getLogger(__name__)
+    CYCLE_SECONDS = 86400  # 24h target full cycle
+    recent_elapsed = []  # rolling avg of last 10 refreshes
+    
+    def _worker():
+        from db import get_session_factory
+        Sess = get_session_factory()
+        # Initial sleep to avoid hitting LLM during app startup
+        time.sleep(60)
+        
+        while True:
+            try:
+                db = Sess()
+                # Pick the oldest article by last_refreshed_at (NULLs first)
+                row = db.execute(sql_text(
+                    "SELECT topic_key, article_id FROM topic_article "
+                    "ORDER BY last_refreshed_at NULLS FIRST LIMIT 1"
+                )).fetchone()
+                
+                # Count for autotune
+                n_row = db.execute(sql_text(
+                    "SELECT COUNT(*) FROM topic_article"
+                )).fetchone()
+                N = n_row[0] if n_row else 1
+                db.close()
+                
+                if not row:
+                    time.sleep(300)
+                    continue
+                
+                topic_key, article_id = row
+                t0 = time.time()
+                try:
+                    refresh_article(Sess(), topic_key)
+                    persist_dedup(Sess(), article_id)
+                    build_and_cache_response(Sess, topic_key)
+                    elapsed = time.time() - t0
+                    recent_elapsed.append(elapsed)
+                    if len(recent_elapsed) > 10:
+                        recent_elapsed.pop(0)
+                    logger.info("bg-refresh: '%s' done in %.1fs (avg %.1fs over %d runs)",
+                                topic_key, elapsed,
+                                statistics.mean(recent_elapsed), len(recent_elapsed))
+                except Exception as e:
+                    logger.warning("bg-refresh failed for '%s': %s", topic_key, e)
+                    elapsed = time.time() - t0
+                
+                # Autotune sleep: distribute remaining 24h budget across N articles
+                avg_elapsed = statistics.mean(recent_elapsed) if recent_elapsed else 30.0
+                sleep_time = max(60, (CYCLE_SECONDS - N * avg_elapsed) / max(N, 1))
+                logger.info("bg-refresh: sleeping %.0fs before next refresh (N=%d, avg=%.1fs)",
+                            sleep_time, N, avg_elapsed)
+                time.sleep(sleep_time)
+            except Exception as e:
+                logger.warning("bg-refresh worker error: %s", e)
+                time.sleep(60)
+    
+    t = threading.Thread(target=_worker, daemon=True, name="bg-article-refresh")
+    t.start()
+    logger.info("Background article refresh worker started")
