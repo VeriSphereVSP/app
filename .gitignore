@@ -1,27 +1,33 @@
-# Build artifacts
-broadcast/
-cache/
-contracts/out/
-contracts/lib/
 
+# Build artifacts
+# Forge build artifacts (forwarder)
+# Generated deployment addresses (written by deploy.sh)
+# Local process/log files
+# Node
 # Python
-__pycache__/
+# Python bytecode
+# Python virtual environments
+# Test / tooling caches
+*$py.class
+*.egg-info/
+*.py[cod]
 *.pyc
 .env
-
-# Node
-node_modules/
-
-# Generated deployment addresses (written by deploy.sh)
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.venv/
+.vs-app.log
+.vs-app.pid
+__pycache__/
+broadcast/
+cache/
+contracts/lib/
+contracts/out/
+deployments/fuji-addresses.json
 deployments/fuji.json
 deployments/mainnet.json
-deployments/fuji-addresses.json
-
-# Forge build artifacts (forwarder)
-cache/
+env/
+node_modules/
 out/
-broadcast/
-
-__pycache__/
-*.pyc
-.env
+venv/
