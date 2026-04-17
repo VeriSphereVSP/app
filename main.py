@@ -24,6 +24,7 @@ from mm.mm_routes import router as mm_router
 from claim_views import router as claim_views_router
 from portfolio_views import router as portfolio_router
 from articles.article_routes import router as article_router
+from semantic_dedup import router as semantic_dedup_router
 from rate_limit import RateLimitMiddleware, cleanup_rate_limiter
 
 
@@ -127,6 +128,7 @@ app.include_router(mm_router)
 app.include_router(claim_views_router)
 app.include_router(portfolio_router)
 app.include_router(article_router)
+app.include_router(semantic_dedup_router)
 
 ADDRESSES_PATH = Path("/app/broadcast/Deploy.s.sol/43113/addresses.json")
 
