@@ -85,6 +85,9 @@ def user_portfolio(address: str, db: Session = Depends(get_db)):
 
         if sup == 0 and chal == 0:
             continue
+        # PATCH: skip ghost lots in RPC endpoint (dust from fully-burned positions)
+        if (sup + chal) < 1e-4:
+            continue
 
         pos: Dict[str, Any] = {
             "post_id": post_id,
@@ -314,6 +317,8 @@ def portfolio_fast(address: str, db: Session = Depends(get_db)):
             logging.getLogger(__name__).warning("On-demand user index failed: %s", e)
     
     positions = get_user_positions(db, address)
+    # PATCH: filter ghost lots (burned-to-zero positions that still exist in DB)
+    positions = [p for p in positions if p.get("user_total", 0) >= 0.001]
     
     total_staked = sum(p["user_total"] for p in positions)
     total_support = sum(p["user_support"] for p in positions)

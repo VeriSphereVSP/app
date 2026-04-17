@@ -47,4 +47,12 @@ def sign_and_send(tx: dict) -> str:
             tx["gas"] = 250_000
 
     signed = account.sign_transaction(tx)
-    return w3.eth.send_raw_transaction(signed.raw_transaction).hex()
+    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+    # Wait for receipt before returning so the caller's next tx sees the
+    # updated chain state. Avoids race conditions on stake flips
+    # (withdraw old side then stake new side).
+    try:
+        w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+    except Exception:
+        pass  # if it timed out, return the hash anyway; relay can detect failure later
+    return tx_hash.hex()
