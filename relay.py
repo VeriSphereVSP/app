@@ -62,6 +62,94 @@ def _decode_revert_reason(err) -> str:
     return "Transaction would fail on-chain. Common causes: insufficient VSP balance, duplicate action, or contract constraint."
 
 
+
+
+    """Get the stake() function selector from the StakeEngine ABI."""
+    abi = _load_abi("StakeEngine")
+    if abi:
+        for entry in abi:
+            if entry.get("type") == "function" and entry.get("name") == "stake":
+                inputs = entry.get("inputs", [])
+                types = ",".join(i["type"] for i in inputs)
+                sig = f"stake({types})"
+                import hashlib
+                from Crypto.Hash import keccak as _keccak
+                k = _keccak.new(digest_bits=256)
+                k.update(sig.encode())
+                return k.hexdigest()[:8]
+    # Fallback: compute from known signature
+    try:
+        from Crypto.Hash import keccak as _keccak
+        k = _keccak.new(digest_bits=256)
+        k.update(b"stake(uint256,uint8,uint256)")
+        return k.hexdigest()[:8]
+    except ImportError:
+        return None
+
+
+
+
+    """Call updatePost on all claims linked to this post via incoming edges.
+    Non-fatal: if any update fails, we proceed with the stake anyway."""
+    try:
+        from config import LINK_GRAPH_ADDRESS, STAKE_ENGINE_ADDRESS
+        if not LINK_GRAPH_ADDRESS or not STAKE_ENGINE_ADDRESS:
+            return
+
+        lg_abi = _load_abi("LinkGraph") or [{
+            "type": "function",
+            "name": "getIncoming",
+            "inputs": [{"name": "claimPostId", "type": "uint256"}],
+            "outputs": [{"name": "", "type": "tuple[]", "components": [
+                {"name": "fromClaimPostId", "type": "uint256"},
+                {"name": "linkPostId", "type": "uint256"},
+                {"name": "isChallenge", "type": "bool"},
+            ]}],
+            "stateMutability": "view",
+        }]
+
+        se_abi = _load_abi("StakeEngine") or [{
+            "type": "function",
+            "name": "updatePost",
+            "inputs": [{"name": "postId", "type": "uint256"}],
+            "outputs": [],
+            "stateMutability": "nonpayable",
+        }]
+
+        lg = w3.eth.contract(
+            address=Web3.to_checksum_address(LINK_GRAPH_ADDRESS), abi=lg_abi)
+        se = w3.eth.contract(
+            address=Web3.to_checksum_address(STAKE_ENGINE_ADDRESS), abi=se_abi)
+
+        incoming = lg.functions.getIncoming(post_id).call()
+        if not incoming:
+            return
+
+        parent_ids = set()
+        for edge in incoming:
+            parent_ids.add(edge[0])  # fromClaimPostId
+            parent_ids.add(edge[1])  # linkPostId
+
+        updated = 0
+        for pid in parent_ids:
+            try:
+                tx = se.functions.updatePost(pid).build_transaction({
+                    "from": Web3.to_checksum_address(
+                        __import__("config").MM_ADDRESS),
+                    "gas": 500_000,
+                })
+                sign_and_send(tx)
+                updated += 1
+            except Exception as e:
+                logger.debug("updatePost(%d) failed (non-fatal): %s", pid, e)
+
+        if updated:
+            logger.info("SC-03: Updated %d parent epochs for post %d", updated, post_id)
+
+    except Exception as e:
+        logger.debug("Parent epoch update failed (non-fatal): %s", e)
+
+
 router = APIRouter()
 
 RECEIPT_TIMEOUT = 30
@@ -421,103 +509,4 @@ async def relay(body: RelayRequest, db: Session = Depends(get_db)):
                 raise HTTPException(400, reason)
 
         # Submit transaction
-        tx = fwd.functions.execute(request_data).build_transaction({
-            "from": w3.eth.default_account or Web3.to_checksum_address(
-                __import__("config").MM_ADDRESS),
-            "value": req.value,
-            "gas": req.gas + 800_000,
-        })
-        tx_hash = sign_and_send(tx)
-        logger.info("Submitted meta-tx: from=%s to=%s tx=%s", req.from_, req.to, tx_hash)
 
-        # Wait for receipt
-        try:
-            receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=RECEIPT_TIMEOUT)
-        except Exception as e:
-            logger.warning("Receipt timeout: %s", e)
-            raise HTTPException(500,
-                f"Transaction submitted ({tx_hash}) but could not confirm. "
-                "Please check the transaction on the explorer.")
-
-        if receipt.status == 0:
-            logger.warning("Meta-tx REVERTED: tx=%s gasUsed=%d", tx_hash, receipt.gasUsed)
-
-            # For createClaim reverts, try DuplicateClaim recovery
-            if is_create:
-                dup = _check_duplicate_claim(calldata_hex, req.from_, db)
-                if dup:
-                    dup["tx_hash"] = tx_hash
-                    return dup
-
-            raise HTTPException(400,
-                "Transaction reverted on-chain. "
-                "Common causes: insufficient VSP balance, duplicate claim, or contract error.")
-
-        logger.info("Meta-tx confirmed: tx=%s gasUsed=%d", tx_hash, receipt.gasUsed)
-
-        response = {"ok": True, "tx_hash": tx_hash}
-
-        # Detect createClaim success
-        if is_create:
-            try:
-                reg = _get_post_registry()
-                logs = reg.events.PostCreated().process_receipt(receipt, errors=DISCARD)
-                if logs:
-                    post_id = logs[0].args.postId
-                    claim_text = _decode_claim_text(calldata_hex)
-                    _mark_claim_on_chain(db, claim_text, post_id)
-                    # Incremental cache update: link this new claim to any article
-                    # sentence with matching text
-                    try:
-                        from articles.article_store import apply_new_post
-                        apply_new_post(db, post_id, claim_text)
-                    except Exception as e:
-                        logger.debug("apply_new_post failed (non-fatal): %s", e)
-                    claim_state = _get_claim_state(post_id, req.from_)
-                    claim_state["text"] = claim_text
-                    claim_state["creator"] = req.from_
-                    response["claim"] = claim_state
-                    logger.info("Claim created: post_id=%d text=%s", post_id, claim_text[:50])
-
-                    # Immediate cross-index into all relevant articles
-                    try:
-                        from articles.claim_indexer import cross_index_claim_into_all_articles
-                        from chain_indexer import _queue_article_refresh
-                        cross_index_claim_into_all_articles(db, claim_text, post_id)
-                        _queue_article_refresh(db, post_id)
-                    except Exception as e:
-                        logger.debug("Cross-index from relay failed (non-fatal): %s", e)
-                else:
-                    logger.warning("createClaim succeeded but no PostCreated event found")
-            except Exception as e:
-                logger.warning("Post-create processing failed (non-fatal): %s", e)
-
-        # Detect stake/withdraw (target is StakeEngine)
-        from config import STAKE_ENGINE_ADDRESS
-        is_stake = req.to.lower() == STAKE_ENGINE_ADDRESS.lower()
-
-        if is_stake:
-            try:
-                data = bytes.fromhex(calldata_hex)
-                post_id = int.from_bytes(data[4:36], "big")
-                claim_state = _get_claim_state(post_id, req.from_)
-                response["claim"] = claim_state
-                logger.info("Stake updated: post_id=%d", post_id)
-                # Re-index this post and connected posts so VS/stakes are fresh
-                try:
-                    from chain_indexer import index_post, _reindex_connected, _queue_article_refresh
-                    index_post(db, post_id)
-                    _reindex_connected(db, post_id)
-                    _queue_article_refresh(db, post_id)
-                except Exception as e2:
-                    logger.debug("Post-stake reindex failed (non-fatal): %s", e2)
-            except Exception as e:
-                logger.warning("Post-stake processing failed (non-fatal): %s", e)
-
-        return response
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.exception("Relay failed")
-        raise HTTPException(500, str(e))
