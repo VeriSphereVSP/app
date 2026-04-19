@@ -199,7 +199,7 @@ def _link_unlinked_sentences(db: Session, article: dict):
                 match = find_best_onchain_match(db, text, exclude_post_ids=already_used)
                 if match:
                     update_sentence_post_id(db, sid, match["post_id"])
-                    invalidate_article_cache(db, sid)
+                    _invalidate_and_rebuild(db, sid)
                     sent["post_id"] = match["post_id"]
                     already_used.add(match["post_id"])
                     patched += 1
@@ -230,7 +230,49 @@ def _increment_view_count(db: Session, article_id: int):
         except Exception:
             pass
 
+
+def _invalidate_and_rebuild(db: Session, sentence_id: int):
+    """Invalidate article cache and trigger immediate background rebuild."""
+    import threading
+    from db import get_session_factory
+    _invalidate_and_rebuild(db, sentence_id)
+    # Find the topic key for this sentence
+    try:
+        row = db.execute(sql_text(
+            "SELECT ta.topic_key FROM topic_article ta "
+            "JOIN article_section sec ON sec.article_id = ta.article_id "
+            "JOIN article_sentence s ON s.section_id = sec.section_id "
+            "WHERE s.sentence_id = :sid LIMIT 1"
+        ), {"sid": sentence_id}).fetchone()
+        if row:
+            topic_key = row[0]
+            def _bg_rebuild():
+                try:
+                    Sess = get_session_factory()
+                    from articles.article_store import build_and_cache_response
+                    build_and_cache_response(Sess, topic_key)
+                    logger.info("Immediate cache rebuild complete: %s", topic_key)
+                except Exception as e:
+                    logger.warning("Immediate cache rebuild failed for %s: %s", topic_key, e)
+            threading.Thread(target=_bg_rebuild, daemon=True).start()
+            logger.info("Immediate cache rebuild queued for %s", topic_key)
+    except Exception as e:
+        logger.warning("Could not queue rebuild for sentence %d: %s", sentence_id, e)
+
 # ── Endpoints ───────────────────────────────────────────
+
+@router.get("/article/{topic:path}/version")
+def get_article_version(topic: str, db: Session = Depends(get_db)):
+    """Return the current article version hash.
+    Frontend polls this every 30s to detect updates."""
+    row = db.execute(sql_text(
+        "SELECT response_hash FROM topic_article WHERE LOWER(topic_key) = LOWER(:t)"
+    ), {"t": topic}).fetchone()
+    if not row:
+        return {"hash": None}
+    return {"hash": row[0]}
+
+
 
 @router.get("/article/{topic:path}")
 def get_article(topic: str, db: Session = Depends(get_db)):
@@ -269,18 +311,6 @@ def get_article(topic: str, db: Session = Depends(get_db)):
 
     # No article at all — generate (only slow path: first visit ever)
     return _generate_and_store(topic, db, refresh=False)
-
-
-@router.get("/article/{topic:path}/version")
-def get_article_version(topic: str, db: Session = Depends(get_db)):
-    """Return the current article version hash.
-    Frontend polls this every 30s to detect updates."""
-    row = db.execute(sql_text(
-        "SELECT response_hash FROM topic_article WHERE LOWER(topic_key) = LOWER(:t)"
-    ), {"t": topic}).fetchone()
-    if not row:
-        return {"hash": None}
-    return {"hash": row[0]}
 
 
 @router.post("/article/{topic}/generate")
@@ -384,7 +414,7 @@ def insert_sentence_endpoint(req: InsertRequest, db: Session = Depends(get_db)):
         if existing_pid:
             from articles.article_store import update_sentence_post_id
             update_sentence_post_id(db, sid, existing_pid)
-            invalidate_article_cache(db, sid)
+            _invalidate_and_rebuild(db, sid)
 
         inserted.append({"sentence_id": sid, "text": sent_text, "post_id": existing_pid})
         after_id = sid  # Chain insertions
@@ -461,7 +491,7 @@ def edit_sentence_endpoint(sentence_id: int, req: EditRequest,
         if existing_pid:
             from articles.article_store import update_sentence_post_id
             update_sentence_post_id(db, new_sid, existing_pid)
-            invalidate_article_cache(db, new_sid)
+            _invalidate_and_rebuild(db, new_sid)
 
         created.append({
             "sentence_id": new_sid,
@@ -506,7 +536,7 @@ def link_post_endpoint(sentence_id: int, req: LinkPostRequest,
     from articles.article_store import ensure_tables, update_sentence_post_id
     ensure_tables(db)
     update_sentence_post_id(db, sentence_id, req.post_id)
-    invalidate_article_cache(db, sentence_id)
+    _invalidate_and_rebuild(db, sentence_id)
 
     # Rebuild article cache so the linked post_id appears immediately
     try:
