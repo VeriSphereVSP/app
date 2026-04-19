@@ -207,6 +207,34 @@ def update_sentence_post_id(db: Session, sentence_id: int, post_id: int):
     db.commit()
 
 
+
+
+def invalidate_article_cache(db: Session, sentence_id: int):
+    """Invalidate the cached article response for the article containing this sentence.
+    Also sets last_refreshed_at = NULL so the background refresh picks it up next."""
+    try:
+        row = db.execute(sql_text(
+            "SELECT ta.article_id, ta.topic_key FROM topic_article ta "
+            "JOIN article_section sec ON sec.article_id = ta.article_id "
+            "JOIN article_sentence s ON s.section_id = sec.section_id "
+            "WHERE s.sentence_id = :sid LIMIT 1"
+        ), {"sid": sentence_id}).fetchone()
+        if row:
+            article_id, topic_key = row
+            db.execute(sql_text(
+                "UPDATE topic_article SET "
+                "last_refreshed_at = NULL WHERE article_id = :a"
+            ), {"a": article_id})
+            db.commit()
+            logger.info("Cache invalidated for article %d (%s) — queued for priority refresh",
+                        article_id, topic_key)
+    except Exception as e:
+        logger.warning("Cache invalidation failed for sentence %d: %s", sentence_id, e)
+        try:
+            db.rollback()
+        except Exception:
+            pass
+
 def mark_replaced(db: Session, old_sentence_id: int, new_sentence_id: int):
     """Mark a sentence as replaced by another."""
     db.execute(sql_text(

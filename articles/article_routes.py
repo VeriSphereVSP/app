@@ -175,7 +175,7 @@ def _ensure_sentence_in_claim_db(db: Session, text: str) -> int:
 def _link_unlinked_sentences(db: Session, article: dict):
     """For any article sentence with post_id=NULL, find matching on-chain claims
     using semantic embedding similarity — not just exact text match."""
-    from articles.article_store import update_sentence_post_id
+    from articles.article_store import update_sentence_post_id, invalidate_article_cache
     from semantic import find_best_onchain_match
     patched = 0
     already_used = set()
@@ -199,6 +199,7 @@ def _link_unlinked_sentences(db: Session, article: dict):
                 match = find_best_onchain_match(db, text, exclude_post_ids=already_used)
                 if match:
                     update_sentence_post_id(db, sid, match["post_id"])
+                    invalidate_article_cache(db, sid)
                     sent["post_id"] = match["post_id"]
                     already_used.add(match["post_id"])
                     patched += 1
@@ -383,6 +384,7 @@ def insert_sentence_endpoint(req: InsertRequest, db: Session = Depends(get_db)):
         if existing_pid:
             from articles.article_store import update_sentence_post_id
             update_sentence_post_id(db, sid, existing_pid)
+            invalidate_article_cache(db, sid)
 
         inserted.append({"sentence_id": sid, "text": sent_text, "post_id": existing_pid})
         after_id = sid  # Chain insertions
@@ -459,6 +461,7 @@ def edit_sentence_endpoint(sentence_id: int, req: EditRequest,
         if existing_pid:
             from articles.article_store import update_sentence_post_id
             update_sentence_post_id(db, new_sid, existing_pid)
+            invalidate_article_cache(db, new_sid)
 
         created.append({
             "sentence_id": new_sid,
@@ -503,6 +506,7 @@ def link_post_endpoint(sentence_id: int, req: LinkPostRequest,
     from articles.article_store import ensure_tables, update_sentence_post_id
     ensure_tables(db)
     update_sentence_post_id(db, sentence_id, req.post_id)
+    invalidate_article_cache(db, sentence_id)
 
     # Rebuild article cache so the linked post_id appears immediately
     try:

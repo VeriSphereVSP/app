@@ -213,12 +213,25 @@ def index_global_stats(db: Session):
             ON CONFLICT (key) DO UPDATE SET value_num = :val, updated_at = now()
         """), {"val": s_max})
 
-        num_tranches = se.functions.numTranches().call()
-        db.execute(sql_text("""
-            INSERT INTO chain_global (key, value_num, updated_at)
-            VALUES ('num_tranches', :val, now())
-            ON CONFLICT (key) DO UPDATE SET value_num = :val, updated_at = now()
-        """), {"val": num_tranches})
+        # sMax decay parameters (governance-configurable since SC-02)
+        try:
+            decay_rate = se.functions.sMaxDecayRateRay().call()
+            db.execute(sql_text("""
+                INSERT INTO chain_global (key, value_num, updated_at)
+                VALUES ('smax_decay_rate_ray', :val, now())
+                ON CONFLICT (key) DO UPDATE SET value_num = :val, updated_at = now()
+            """), {"val": decay_rate / 1e18})
+        except Exception:
+            pass
+        try:
+            decay_max = se.functions.sMaxDecayMaxEpochs().call()
+            db.execute(sql_text("""
+                INSERT INTO chain_global (key, value_num, updated_at)
+                VALUES ('smax_decay_max_epochs', :val, now())
+                ON CONFLICT (key) DO UPDATE SET value_num = :val, updated_at = now()
+            """), {"val": decay_max})
+        except Exception:
+            pass
 
         db.commit()
     except Exception as e:

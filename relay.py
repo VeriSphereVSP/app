@@ -20,6 +20,7 @@ from db import get_db
 from mm_wallet import w3, sign_and_send
 from moderation import check_content
 from rate_limit import relay_rate_limit
+from relay_guard import check_relay_request, record_revert, invalidate_balance_cache, GuardError
 
 logger = logging.getLogger(__name__)
 # Known custom errors — selector → human message
