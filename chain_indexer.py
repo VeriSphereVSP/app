@@ -36,7 +36,19 @@ from config import (
 
 logger = logging.getLogger(__name__)
 
-POLL_INTERVAL = 10  # seconds
+# APP-04: Input validation for on-chain claim text
+MAX_CLAIM_DB_LENGTH = 5000
+
+def _validate_claim_text(text: str) -> str:
+    """Sanitize claim text from on-chain before DB insertion."""
+    if not text:
+        return ""
+    cleaned = "".join(ch for ch in text if ch == '\n' or ch == '\t' or (ord(ch) >= 32))
+    if len(cleaned) > MAX_CLAIM_DB_LENGTH:
+        cleaned = cleaned[:MAX_CLAIM_DB_LENGTH]
+    return cleaned
+
+POLL_INTERVAL = 3  # DB-first: reduced from 10s  # seconds
 BLOCK_BATCH = 2000  # blocks per poll
 
 # ── Web3 setup ────────────────────────────────────────
@@ -127,12 +139,18 @@ def index_post(db: Session, post_id: int, user_addresses: list[str] | None = Non
             try:
                 # getPost returns (creator, timestamp, contentType, contentId, fee)
                 content_id = post_data[3]
-                claim_text = reg.functions.getClaim(content_id).call()
+                claim_text = _validate_claim_text(reg.functions.getClaim(content_id).call())
+                # APP-02: Display-side moderation
+                try:
+                    from moderation import check_content_fast
+                    _is_moderated = not check_content_fast(claim_text).allowed
+                except Exception:
+                    _is_moderated = False
                 db.execute(sql_text("""
                     INSERT INTO chain_claim_text (post_id, claim_text, indexed_at)
                     VALUES (:pid, :txt, now())
-                    ON CONFLICT (post_id) DO UPDATE SET claim_text = :txt, indexed_at = now()
-                """), {"pid": post_id, "txt": claim_text})
+                    ON CONFLICT (post_id) DO UPDATE SET claim_text = :txt, is_moderated = :mod, indexed_at = now()
+                """), {"pid": post_id, "txt": claim_text, "mod": _is_moderated})
             except Exception as e:
                 logger.debug("Could not index claim text for post %d: %s", post_id, e)
 
@@ -157,8 +175,7 @@ def _index_user_stake(db: Session, se, user_address: str, post_id: int):
             amount = lot_info[0] / 1e18
             weighted_pos = lot_info[1] / 1e18
             entry_epoch = lot_info[2]
-            tranche = lot_info[4]
-            pos_weight = lot_info[5] / 1e18
+            pos_weight = lot_info[4] / 1e18
 
             if amount > 0:
                 db.execute(sql_text("""
@@ -172,7 +189,7 @@ def _index_user_stake(db: Session, se, user_address: str, post_id: int):
                 """), {
                     "addr": user_address.lower(), "pid": post_id, "side": side,
                     "amt": amount, "wp": weighted_pos, "ee": entry_epoch,
-                    "tr": tranche, "pw": pos_weight,
+                    "tr": 0, "pw": pos_weight,
                 })
             else:
                 db.execute(sql_text("""
@@ -390,6 +407,27 @@ def poll_events(db: Session):
                 pid = event.args.postId
                 creator = event.args.creator.lower()
                 index_post(db, pid, user_addresses=[creator])
+                # APP-10: Auto-detect topic for new claims
+                try:
+                    _ct = db.execute(sql_text(
+                        "SELECT claim_text FROM chain_claim_text WHERE post_id = :pid"
+                    ), {"pid": pid}).fetchone()
+                    if _ct and _ct[0]:
+                        _has_topic = db.execute(sql_text(
+                            "SELECT 1 FROM claim WHERE post_id = :pid AND topic IS NOT NULL"
+                        ), {"pid": pid}).fetchone()
+                        if not _has_topic:
+                            from articles.topic_detect import detect_topic, ensure_article_for_claim
+                            _topic = detect_topic(_ct[0])
+                            if _topic:
+                                db.execute(sql_text(
+                                    "UPDATE claim SET topic = :t WHERE post_id = :pid AND topic IS NULL"
+                                ), {"t": _topic, "pid": pid})
+                                db.commit()
+                                ensure_article_for_claim(db, _ct[0], pid, _topic)
+                                logger.info("Auto-topic (indexer): post_id=%d → '%s'", pid, _topic)
+                except Exception as _te:
+                    logger.debug("Auto-topic (indexer) post %d: %s", pid, _te)
         except Exception as e:
             logger.warning("Error polling PostRegistry events: %s", e)
         _set_last_block(db, "PostRegistry", to_block)

@@ -110,7 +110,6 @@ STAKE_ENGINE_ABI = _load_abi("StakeEngine") or [
             {"name": "weightedPosition", "type": "uint256"},
             {"name": "entryEpoch", "type": "uint256"},
             {"name": "sideTotal", "type": "uint256"},
-            {"name": "tranche", "type": "uint256"},
             {"name": "positionWeight", "type": "uint256"},
         ],
         "stateMutability": "view",
@@ -373,7 +372,7 @@ def get_apr_breakdown(post_id, side="support"):
 
 
 def get_user_lot_info(user_address, post_id, side):
-    """Returns lot info: (amount, weightedPosition, entryEpoch, sideTotal, tranche, positionWeight).
+    """Returns lot info: (amount, weightedPosition, entryEpoch, sideTotal, positionWeight).
     positionWeight is RAY-scaled (1e18 = 1.0 = best position)."""
     try:
         se = _get_stake_engine()
@@ -384,8 +383,7 @@ def get_user_lot_info(user_address, post_id, side):
             "weighted_position": result[1] / 1e18,
             "entry_epoch": result[2],
             "side_total": result[3] / 1e18,
-            "tranche": result[4],
-            "position_weight": result[5] / 1e18,  # 1.0 = best, 0.1 = worst
+            "position_weight": result[4] / 1e18,  # 1.0 = best, 0.1 = worst
         }
     except Exception as e:
         logger.warning("Failed to get lot info for %s post %d side %d: %s",

@@ -228,33 +228,33 @@ def claim_status(claim_text: str, user: str = None, db: Session = Depends(get_db
 
     if post_id is not None:
         try:
-            from chain.chain_reader import get_stake_totals, get_user_stake, get_verity_score
-            support, challenge = get_stake_totals(post_id)
+            from chain.chain_db import get_stake_totals as db_stakes, get_verity_score as db_vs, get_user_stake as db_user
+            support, challenge = db_stakes(db, post_id)
             result["stake_support"] = support
             result["stake_challenge"] = challenge
-            result["verity_score"] = get_verity_score(post_id)
+            result["verity_score"] = db_vs(db, post_id)
 
             if user:
-                result["user_support"] = get_user_stake(user, post_id, 0)
-                result["user_challenge"] = get_user_stake(user, post_id, 1)
+                result["user_support"] = db_user(db, user, post_id, 0)
+                result["user_challenge"] = db_user(db, user, post_id, 1)
         except Exception as e:
             import traceback
-            print(f"Failed to read on-chain state for post_id={post_id}: {e}")
+            print(f"Failed to read state for post_id={post_id}: {e}")
             print(traceback.format_exc())
 
     return result
 
 
 @app.get("/api/claims/{post_id}/user-stake")
-def get_user_stake_endpoint(post_id: int, user: str = None):
+def get_user_stake_endpoint(post_id: int, user: str = None, db: Session = Depends(get_db)):
     """Get user's stake on a specific post by post_id."""
     result = {"user_support": 0, "user_challenge": 0}
     if not user:
         return result
     try:
-        from chain.chain_reader import get_user_stake
-        result["user_support"] = get_user_stake(user, post_id, 0)
-        result["user_challenge"] = get_user_stake(user, post_id, 1)
+        from chain.chain_db import get_user_stake as db_user
+        result["user_support"] = db_user(db, user, post_id, 0)
+        result["user_challenge"] = db_user(db, user, post_id, 1)
     except Exception as e:
         print(f"Failed to read user stake for post_id={post_id}, user={user}: {e}")
     return result
@@ -262,7 +262,7 @@ def get_user_stake_endpoint(post_id: int, user: str = None):
 
 
 @app.post("/api/user-stakes")
-def get_user_stakes_batch(body: dict):
+def get_user_stakes_batch(body: dict, db: Session = Depends(get_db)):
     """Get user's stake on multiple posts in a single request.
     
     Body: {"user": "0x...", "post_ids": [1, 2, 3, ...]}
@@ -274,12 +274,12 @@ def get_user_stakes_batch(body: dict):
     if not user or not post_ids:
         return {"stakes": stakes}
     try:
-        from chain.chain_reader import get_user_stake
+        from chain.chain_db import get_user_stake as db_user
         for pid in post_ids:
             try:
                 stakes[str(pid)] = {
-                    "user_support": get_user_stake(user, pid, 0),
-                    "user_challenge": get_user_stake(user, pid, 1),
+                    "user_support": db_user(db, user, pid, 0),
+                    "user_challenge": db_user(db, user, pid, 1),
                 }
             except Exception:
                 stakes[str(pid)] = {"user_support": 0, "user_challenge": 0}

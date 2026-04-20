@@ -443,18 +443,18 @@ def build_and_cache_response(db_or_factory, topic_key: str):
 
         # 2. SKIPPED: index_existing_claims_into_article is slow; runs at generation time instead
 
-        # 3. Enrich with live VS/stake data from chain (RPC calls)
+        # 3. Enrich with VS/stake data from indexed DB
         try:
-            from chain.chain_reader import get_stake_totals, get_verity_score
+            from chain.chain_db import get_stake_totals, get_verity_score
             for section in article.get("sections", []):
                 for sent in section.get("sentences", []):
                     pid = sent.get("post_id")
                     if pid is not None:
                         try:
-                            s, ch = get_stake_totals(pid)
+                            s, ch = get_stake_totals(db, pid)
                             sent["stake_support"] = s
                             sent["stake_challenge"] = ch
-                            sent["verity_score"] = get_verity_score(pid)
+                            sent["verity_score"] = get_verity_score(db, pid)
                         except Exception:
                             sent["stake_support"] = 0
                             sent["stake_challenge"] = 0

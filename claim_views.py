@@ -81,115 +81,63 @@ def all_claims(limit: int = 100, offset: int = 0, db: Session = Depends(get_db))
 
 
 @router.get("/{post_id}/summary")
-def claim_summary(post_id: int):
-    """Full claim summary from ProtocolViews.getClaimSummary()."""
-    try:
-        views = _views()
-        s = views.functions.getClaimSummary(post_id).call()
-        return {
-            "post_id": post_id,
-            "text": _moderate_text(str(s[0])),
-            "stake_support": _wei_to_vsp(int(s[1])),
-            "stake_challenge": _wei_to_vsp(int(s[2])),
-            "total_stake": _wei_to_vsp(int(s[3])),
-            "posting_fee": _wei_to_vsp(int(s[4])),
-            "is_active": bool(s[5]),
-            "base_vs": _ray_to_pct(int(s[6])),
-            "verity_score": _ray_to_pct(int(s[7])),
-            "incoming_count": int(s[8]),
-            "outgoing_count": int(s[9]),
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"claim_summary({post_id}) failed: {e}")
-        raise HTTPException(500, f"Failed to fetch claim summary: {e}")
+def claim_summary(post_id: int, db: Session = Depends(get_db)):
+    """Claim summary from indexed DB."""
+    from chain.chain_db import get_post_info, get_claim_text, get_edges
+    info = get_post_info(db, post_id)
+    if not info:
+        raise HTTPException(404, f"Post {post_id} not found")
+    text = get_claim_text(db, post_id) or ""
+    incoming = get_edges(db, post_id, "incoming")
+    outgoing = get_edges(db, post_id, "outgoing")
+    total = info["support_total"] + info["challenge_total"]
+    return {
+        "post_id": post_id,
+        "text": _moderate_text(text),
+        "stake_support": round(info["support_total"], 4),
+        "stake_challenge": round(info["challenge_total"], 4),
+        "total_stake": round(total, 4),
+        "posting_fee": 1.0,
+        "is_active": info["is_active"],
+        "base_vs": round(info["base_vs"], 2),
+        "verity_score": round(info["effective_vs"], 2),
+        "incoming_count": len(incoming),
+        "outgoing_count": len(outgoing),
+    }
 
 
 @router.get("/{post_id}/edges")
-def claim_edges(post_id: int):
-    """Fetch incoming and outgoing evidence edges for a claim."""
-    try:
-        views = _views()
-        stake_engine = _stake()
-        score_engine = _score()
+def claim_edges(post_id: int, db: Session = Depends(get_db)):
+    """Evidence edges with contribution computed from indexed DB."""
+    from chain.chain_db import get_edges, get_post_info, get_claim_text, compute_edge_contribution
 
-        raw_incoming = views.functions.getIncomingEdges(post_id).call()
-        raw_outgoing = views.functions.getOutgoingEdges(post_id).call()
+    raw_incoming = get_edges(db, post_id, "incoming")
+    raw_outgoing = get_edges(db, post_id, "outgoing")
 
-        def enrich_edge(
-            claim_post_id: int,
-            link_post_id: int,
-            is_challenge: bool,
-            target_post_id: int,
-        ) -> Dict[str, Any]:
-            result: Dict[str, Any] = {
-                "claim_post_id": claim_post_id,
-                "link_post_id": link_post_id,
-                "is_challenge": is_challenge,
-            }
-            # Edge contribution to target's effective VS, in VSP-equivalent units
-            try:
-                contrib_ray = score_engine.functions.getEdgeContribution(
-                    target_post_id, link_post_id
-                ).call()
-                # Contract returns (parentVS_RAY * parentTotal_wei * linkStake_wei * linkVS_RAY)
-                # / (sumOutgoing_wei * RAY * RAY) — net unit is wei (VSP * 1e18)
-                result["edge_contribution"] = contrib_ray / 1e18
-            except Exception:
-                result["edge_contribution"] = 0
-            try:
-                cs = views.functions.getClaimSummary(claim_post_id).call()
-                result["claim_text"] = _moderate_text(str(cs[0]))
-                result["claim_vs"] = _ray_to_pct(int(cs[7]))
-                result["claim_support"] = _wei_to_vsp(int(cs[1]))
-                result["claim_challenge"] = _wei_to_vsp(int(cs[2]))
-            except Exception:
-                result["claim_text"] = None
-                result["claim_vs"] = 0
-                result["claim_support"] = 0
-                result["claim_challenge"] = 0
-            try:
-                ls, lc = stake_engine.functions.getPostTotals(link_post_id).call()
-                result["link_support"] = _wei_to_vsp(int(ls))
-                result["link_challenge"] = _wei_to_vsp(int(lc))
-            except Exception:
-                result["link_support"] = 0
-                result["link_challenge"] = 0
-            try:
-                vs_ray = score_engine.functions.effectiveVSRay(link_post_id).call()
-                result["link_vs"] = (vs_ray / 1e18) * 100
-            except Exception:
-                result["link_vs"] = 0
-            return result
-
-        incoming: List[Dict[str, Any]] = []
-        for edge in raw_incoming:
-            incoming.append(enrich_edge(
-                claim_post_id=int(edge[0]),
-                link_post_id=int(edge[1]),
-                is_challenge=bool(edge[2]),
-                target_post_id=post_id,
-            ))
-
-        outgoing: List[Dict[str, Any]] = []
-        for edge in raw_outgoing:
-            outgoing.append(enrich_edge(
-                claim_post_id=int(edge[0]),
-                link_post_id=int(edge[1]),
-                is_challenge=bool(edge[2]),
-                target_post_id=int(edge[0]),
-            ))
-
+    def enrich(edge: dict, target_post_id: int) -> dict:
+        claim_pid = edge["claim_post_id"]
+        link_pid = edge["link_post_id"]
+        link_info = get_post_info(db, link_pid)
+        link_total = (link_info["support_total"] + link_info["challenge_total"]) if link_info else 0
+        link_vs = link_info["effective_vs"] if link_info else 0
         return {
-            "incoming": incoming,
-            "outgoing": outgoing,
+            "claim_post_id": claim_pid,
+            "link_post_id": link_pid,
+            "is_challenge": edge["is_challenge"],
+            "edge_contribution": compute_edge_contribution(db, target_post_id, link_pid),
+            "claim_text": _moderate_text(edge.get("claim_text", "")),
+            "claim_vs": round(edge.get("claim_vs", 0), 2),
+            "claim_support": round(edge.get("claim_support", 0), 4),
+            "claim_challenge": round(edge.get("claim_challenge", 0), 4),
+            "link_support": round(link_info["support_total"], 4) if link_info else 0,
+            "link_challenge": round(link_info["challenge_total"], 4) if link_info else 0,
+            "link_vs": round(link_vs, 2),
         }
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"claim_edges({post_id}) failed: {e}")
-        raise HTTPException(500, f"Failed to fetch edges: {e}")
+
+    return {
+        "incoming": [enrich(e, post_id) for e in raw_incoming],
+        "outgoing": [enrich(e, e["claim_post_id"]) for e in raw_outgoing],
+    }
 
 
 

@@ -50,31 +50,40 @@ class RegisterRequest(BaseModel):
 
 # ── Helpers ─────────────────────────────────────────────
 
-def _enrich_sentences(article: dict) -> dict:
-    """Add VS, stake totals to each sentence that has a post_id.
-    Also filters blocked content on display."""
-    try:
-        from chain.chain_reader import get_stake_totals, get_verity_score
-    except ImportError:
-        return article
+def _enrich_sentences(article: dict, db=None) -> dict:
+    """Add VS, stake totals from indexed DB. Falls back to zeros if no DB."""
+    if db is None:
+        try:
+            from db import get_session_factory
+            db = get_session_factory()()
+            _owns = True
+        except Exception:
+            return article
+    else:
+        _owns = False
 
-    for section in article.get("sections", []):
-        for sent in section.get("sentences", []):
-            pid = sent.get("post_id")
-            if pid is not None:
-                try:
-                    s, c = get_stake_totals(pid)
-                    sent["stake_support"] = s
-                    sent["stake_challenge"] = c
-                    sent["verity_score"] = get_verity_score(pid)
-                except Exception:
+    try:
+        from chain.chain_db import get_stake_totals, get_verity_score
+        for section in article.get("sections", []):
+            for sent in section.get("sentences", []):
+                pid = sent.get("post_id")
+                if pid is not None:
+                    try:
+                        s, ch = get_stake_totals(db, pid)
+                        sent["stake_support"] = s
+                        sent["stake_challenge"] = ch
+                        sent["verity_score"] = get_verity_score(db, pid)
+                    except Exception:
+                        sent["stake_support"] = 0
+                        sent["stake_challenge"] = 0
+                        sent["verity_score"] = 0
+                else:
                     sent["stake_support"] = 0
                     sent["stake_challenge"] = 0
                     sent["verity_score"] = 0
-            else:
-                sent["stake_support"] = 0
-                sent["stake_challenge"] = 0
-                sent["verity_score"] = 0
+    finally:
+        if _owns:
+            db.close()
 
     # Display-time moderation filter
     for section in article.get("sections", []):
@@ -307,7 +316,7 @@ def get_article(topic: str, db: Session = Depends(get_db)):
         threading.Thread(target=_bg_cache, args=(topic,), daemon=True).start()
 
         _increment_view_count(db, article["article_id"])
-        return _enrich_sentences(article)
+        return _enrich_sentences(article, db)
 
     # No article at all — generate (only slow path: first visit ever)
     return _generate_and_store(topic, db, refresh=False)
@@ -381,7 +390,7 @@ def _generate_and_store(topic: str, db: Session, refresh: bool) -> dict:
             logger.debug("Post-generate dedup+cache build failed: %s", e)
     threading.Thread(target=_bg_cache, args=(topic, article_id_for_bg), daemon=True).start()
 
-    return _enrich_sentences(article)
+    return _enrich_sentences(article, db)
 
 
 @router.post("/article/sentence/insert")
@@ -582,22 +591,22 @@ def disambiguate_endpoint(q: str, db: Session = Depends(get_db)):
 
 
 @router.get("/claims/{post_id}/stakes")
-def get_user_stakes(post_id: int, user: str = None):
+def get_user_stakes(post_id: int, user: str = None, db: Session = Depends(get_db)):
     """Get stake totals and user-specific stakes for a post_id."""
     try:
-        from chain.chain_reader import get_stake_totals, get_user_stake, get_verity_score
-        support, challenge = get_stake_totals(post_id)
+        from chain.chain_db import get_stake_totals, get_verity_score, get_user_stake
+        support, challenge = get_stake_totals(db, post_id)
         result = {
             "post_id": post_id,
             "stake_support": support,
             "stake_challenge": challenge,
-            "verity_score": get_verity_score(post_id),
+            "verity_score": get_verity_score(db, post_id),
             "user_support": 0,
             "user_challenge": 0,
         }
         if user:
-            result["user_support"] = get_user_stake(user, post_id, 0)
-            result["user_challenge"] = get_user_stake(user, post_id, 1)
+            result["user_support"] = get_user_stake(db, user, post_id, 0)
+            result["user_challenge"] = get_user_stake(db, user, post_id, 1)
         return result
     except Exception as e:
         logger.warning("Failed to read stakes for post %d: %s", post_id, e)

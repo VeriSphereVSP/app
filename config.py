@@ -72,7 +72,8 @@ EMBEDDINGS_MODEL = os.getenv("EMBEDDINGS_MODEL", "text-embedding-3-small")
 DUPLICATE_THRESHOLD = float(os.getenv("DUPLICATE_THRESHOLD", "0.95"))
 NEAR_DUPLICATE_THRESHOLD = float(os.getenv("NEAR_DUPLICATE_THRESHOLD", "0.85"))
 
-# Print config
+# Print config (APP-08: password redacted)
+_db_url_safe = f"postgresql://{DB_USER}:***@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 print("Config loaded:")
 print(f"  CHAIN_ID: {CHAIN_ID}")
 print(f"  NETWORK: {NETWORK}")
@@ -80,6 +81,7 @@ print(f"  POST_REGISTRY: {POST_REGISTRY_ADDRESS}")
 print(f"  FORWARDER: {FORWARDER_ADDRESS}")
 print(f"  MM_ADDRESS: {MM_ADDRESS}")
 print(f"  RPC_URL: {RPC_URL[:50]}...")
+print(f"  DB: {_db_url_safe}")
 
 
 # Relay fee: small VSP fee deducted per meta-tx, sent to MM wallet

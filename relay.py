@@ -186,25 +186,29 @@ def _mark_claim_on_chain(db, claim_text, post_id):
 
 
 def _get_claim_state(post_id, user_address=None):
-    from chain.chain_reader import get_stake_totals, get_user_stake
-    support, challenge = get_stake_totals(post_id)
-    result = {
-        "post_id": post_id,
-        "text": "",
-        "creator": "",
-        "support_total": support,
-        "challenge_total": challenge,
-        "user_support": 0,
-        "user_challenge": 0,
-    }
-    if user_address:
-        try:
-            us, uc = get_user_stake(post_id, user_address)
-            result["user_support"] = us
-            result["user_challenge"] = uc
-        except Exception:
-            pass
-    return result
+    from db import get_session_factory
+    from chain.chain_db import get_stake_totals, get_user_stake
+    _db = get_session_factory()()
+    try:
+        support, challenge = get_stake_totals(_db, post_id)
+        result = {
+            "post_id": post_id,
+            "text": "",
+            "creator": "",
+            "support_total": support,
+            "challenge_total": challenge,
+            "user_support": 0,
+            "user_challenge": 0,
+        }
+        if user_address:
+            try:
+                result["user_support"] = get_user_stake(_db, user_address, post_id, 0)
+                result["user_challenge"] = get_user_stake(_db, user_address, post_id, 1)
+            except Exception:
+                pass
+        return result
+    finally:
+        _db.close()
 
 
 def _check_duplicate_claim(calldata_hex, req_from, db):
@@ -477,6 +481,14 @@ async def relay(body: RelayRequest, db: Session = Depends(get_db)):
                     claim_state["creator"] = req.from_
                     response["claim"] = claim_state
                     logger.info("Claim created: post_id=%d text=%s", post_id, claim_text[:50])
+                    # APP-07: Bust chain_reader cache
+                    try:
+                        from chain.chain_reader import _cache as _cr_cache
+                        for _ck in list(_cr_cache.keys()):
+                            if f":{post_id}" in _ck:
+                                del _cr_cache[_ck]
+                    except Exception:
+                        pass
 
                     # Immediate cross-index into all relevant articles
                     try:
@@ -486,6 +498,21 @@ async def relay(body: RelayRequest, db: Session = Depends(get_db)):
                         _queue_article_refresh(db, post_id)
                     except Exception as e:
                         logger.debug("Cross-index from relay failed (non-fatal): %s", e)
+
+                    # APP-10: Universal topic association
+                    try:
+                        from articles.topic_detect import detect_topic, ensure_article_for_claim
+                        _topic = detect_topic(claim_text)
+                        if _topic:
+                            from sqlalchemy import text as _sqlt
+                            db.execute(_sqlt(
+                                "UPDATE claim SET topic = :t WHERE post_id = :pid AND topic IS NULL"
+                            ), {"t": _topic, "pid": post_id})
+                            db.commit()
+                            ensure_article_for_claim(db, claim_text, post_id, _topic)
+                            logger.info("Auto-topic: post_id=%d → '%s'", post_id, _topic)
+                    except Exception as e:
+                        logger.debug("Auto-topic failed (non-fatal): %s", e)
                 else:
                     logger.warning("createClaim succeeded but no PostCreated event found")
             except Exception as e:
@@ -502,6 +529,14 @@ async def relay(body: RelayRequest, db: Session = Depends(get_db)):
                 claim_state = _get_claim_state(post_id, req.from_)
                 response["claim"] = claim_state
                 logger.info("Stake updated: post_id=%d", post_id)
+                # APP-07: Bust chain_reader cache for this post
+                try:
+                    from chain.chain_reader import _cache as _cr_cache
+                    for _ck in list(_cr_cache.keys()):
+                        if f":{post_id}" in _ck:
+                            del _cr_cache[_ck]
+                except Exception:
+                    pass
                 # Re-index this post and connected posts so VS/stakes are fresh
                 try:
                     from chain_indexer import index_post, _reindex_connected, _queue_article_refresh
