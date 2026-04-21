@@ -68,6 +68,7 @@ def get_article(db: Session, topic: str) -> Optional[Dict[str, Any]]:
             "sentences": sentences,
         })
 
+    sections = [s for s in sections if s.get("sentences")]
     return {"article_id": article_id, "title": title, "topic_key": key, "sections": sections}
 
 
@@ -500,85 +501,273 @@ def _reassign_sentences_to_best_sections(db, article_id: int):
 
 
 def build_and_cache_response(db_or_factory, topic_key: str):
-    """Build the full enriched article response and cache it as JSONB.
-    Called after generation, refresh, or chain event.
-    This is the ONLY place that does the expensive work (RPC, embedding, dedup).
-    The result is stored so GET /api/article/{topic} can serve it with zero processing."""
+    """Build the article response: overlay on-chain masters, dedup, enrich, cache.
+
+    Clean pipeline:
+      1. Load article skeleton (sections + all non-hidden sentences)
+      2. Find all on-chain claims for this topic, rolled up into dupe-group masters
+      3. For each master: hide similar off-chain sentences, ensure master is placed
+      4. Prune empty sections, enrich with VS/stake from DB
+      5. Cache as JSONB
+    """
     import hashlib, json, logging
     from sqlalchemy import text as sql_text
     logger = logging.getLogger(__name__)
 
-    # Get a session
     if hasattr(db_or_factory, 'execute'):
         db = db_or_factory
-        owns_session = False
+        owns = False
     else:
         db = db_or_factory()
-        owns_session = True
+        owns = True
 
     try:
-        article = get_article(db, topic_key)
-        if not article:
+        key = _norm(topic_key)
+        art_row = db.execute(sql_text(
+            "SELECT article_id, title FROM topic_article WHERE topic_key = :k"
+        ), {"k": key}).fetchone()
+        if not art_row:
             return
+        article_id, title = art_row
 
-        article_id = article["article_id"]
+        # ── Step 1: Load article skeleton ──
+        secs = db.execute(sql_text(
+            "SELECT section_id, heading, sort_order "
+            "FROM article_section WHERE article_id = :a ORDER BY sort_order"
+        ), {"a": article_id}).fetchall()
 
-        # ── Expensive enrichment (runs once, result is cached) ──
+        sections = {}  # section_id -> {heading, sentences: [...]}
+        for sec_id, heading, _ in secs:
+            sents = db.execute(sql_text(
+                "SELECT sentence_id, sort_order, text, post_id "
+                "FROM article_sentence "
+                "WHERE section_id = :s AND is_hidden = FALSE "
+                "ORDER BY sort_order"
+            ), {"s": sec_id}).fetchall()
+            sections[sec_id] = {
+                "section_id": sec_id,
+                "heading": heading,
+                "sentences": [{
+                    "sentence_id": r[0], "sort_order": r[1],
+                    "text": r[2], "post_id": r[3],
+                } for r in sents],
+            }
 
-        # 1. SKIPPED: semantic linking is O(sentences * claims), runs only at generation time
+        # ── Step 2: Find on-chain claims for this topic ──
+        # Claims associated via article_sentence.post_id OR via topic detection
+        onchain_pids = set()
+        for sec in sections.values():
+            for s in sec["sentences"]:
+                if s["post_id"] is not None:
+                    onchain_pids.add(s["post_id"])
 
-        # 2. SKIPPED: index_existing_claims_into_article is slow; runs at generation time instead
+        # Also find claims tagged with this topic but not yet in the article
+        topic_claims = db.execute(sql_text(
+            "SELECT ct.post_id, ct.claim_text, ct.dupe_group_id "
+            "FROM chain_claim_text ct "
+            "JOIN claim c ON c.post_id = ct.post_id "
+            "WHERE LOWER(c.topic) = :t AND ct.post_id IS NOT NULL"
+        ), {"t": key}).fetchall()
+        for r in topic_claims:
+            onchain_pids.add(r[0])
 
-        # 3. Enrich with VS/stake data from indexed DB
+        # Build master claims from dupe groups
+        # master_claims: [{post_id, text, group_id, member_pids, support, challenge, vs}]
+        master_claims = []
+        seen_groups = set()
+        seen_pids = set()
+
+        for pid in onchain_pids:
+            if pid in seen_pids:
+                continue
+            # Check dupe group
+            dg = db.execute(sql_text(
+                "SELECT ct.dupe_group_id, g.canonical_post_id, g.canonical_text, "
+                "       g.total_support, g.total_challenge, g.aggregate_vs, g.member_count "
+                "FROM chain_claim_text ct "
+                "LEFT JOIN claim_dupe_group g ON ct.dupe_group_id = g.group_id "
+                "WHERE ct.post_id = :pid"
+            ), {"pid": pid}).fetchone()
+
+            if dg and dg[0] and dg[0] not in seen_groups and dg[6] and dg[6] > 1:
+                # Multi-member group: use canonical as master
+                group_id = dg[0]
+                seen_groups.add(group_id)
+                # Get all member pids
+                members = db.execute(sql_text(
+                    "SELECT post_id FROM chain_claim_text WHERE dupe_group_id = :gid"
+                ), {"gid": group_id}).fetchall()
+                member_pids = [m[0] for m in members]
+                for mp in member_pids:
+                    seen_pids.add(mp)
+                master_claims.append({
+                    "post_id": dg[1],  # canonical
+                    "text": dg[2],
+                    "group_id": group_id,
+                    "member_pids": member_pids,
+                    "member_count": dg[6],
+                    "support": dg[3] or 0,
+                    "challenge": dg[4] or 0,
+                    "vs": dg[5] or 0,
+                })
+            else:
+                # Singleton or no group
+                seen_pids.add(pid)
+                info = db.execute(sql_text(
+                    "SELECT ct.claim_text, COALESCE(p.support_total,0), "
+                    "       COALESCE(p.challenge_total,0), COALESCE(p.effective_vs,0) "
+                    "FROM chain_claim_text ct "
+                    "LEFT JOIN chain_post p ON ct.post_id = p.post_id "
+                    "WHERE ct.post_id = :pid"
+                ), {"pid": pid}).fetchone()
+                if info:
+                    master_claims.append({
+                        "post_id": pid,
+                        "text": info[0],
+                        "group_id": dg[0] if dg else None,
+                        "member_pids": [pid],
+                        "member_count": 1,
+                        "support": info[1],
+                        "challenge": info[2],
+                        "vs": info[3],
+                    })
+
+        # ── Step 3: For each master, hide similar off-chain, ensure placed ──
         try:
-            from chain.chain_db import get_stake_totals, get_verity_score
-            for section in article.get("sections", []):
-                for sent in section.get("sentences", []):
-                    pid = sent.get("post_id")
-                    if pid is not None:
-                        try:
-                            s, ch = get_stake_totals(db, pid)
-                            sent["stake_support"] = s
-                            sent["stake_challenge"] = ch
-                            sent["verity_score"] = get_verity_score(db, pid)
-                        except Exception:
-                            sent["stake_support"] = 0
-                            sent["stake_challenge"] = 0
-                            sent["verity_score"] = 0
-                    else:
-                        sent["stake_support"] = 0
-                        sent["stake_challenge"] = 0
-                        sent["verity_score"] = 0
+            from embedding import embed
+            from similarity import cosine_similarity
         except ImportError:
-            pass
+            embed = None
+            cosine_similarity = None
 
-        # 4. Content moderation filter
-        try:
-            from moderation import check_content_fast
-            for section in article.get("sections", []):
-                for sent in section.get("sentences", []):
-                    mod = check_content_fast(sent.get("text", ""))
+        for master in master_claims:
+            mpid = master["post_id"]
+            mtext = master["text"]
+
+            # Check if master is already in the article
+            already_placed = False
+            for sec in sections.values():
+                for s in sec["sentences"]:
+                    if s["post_id"] == mpid:
+                        already_placed = True
+                        break
+                    # Also check if any group member is placed
+                    if s["post_id"] in master["member_pids"]:
+                        already_placed = True
+                        break
+                if already_placed:
+                    break
+
+            # Hide off-chain sentences similar to this master
+            if embed and cosine_similarity:
+                try:
+                    master_vec = embed(mtext)
+                    for sec in sections.values():
+                        for s in sec["sentences"]:
+                            if s["post_id"] is not None:
+                                continue  # Don't hide on-chain
+                            try:
+                                sent_vec = embed(s["text"])
+                                sim = cosine_similarity(master_vec, sent_vec)
+                                if sim >= 0.80:
+                                    db.execute(sql_text(
+                                        "UPDATE article_sentence SET is_hidden = TRUE "
+                                        "WHERE sentence_id = :sid"
+                                    ), {"sid": s["sentence_id"]})
+                                    s["_hidden"] = True
+                                    logger.debug("Hid off-chain sid=%d (sim=%.2f to master %d)",
+                                                 s["sentence_id"], sim, mpid)
+                            except Exception:
+                                pass
+                except Exception as e:
+                    logger.debug("Master embedding failed for pid=%d: %s", mpid, e)
+
+            # Insert master if not already placed
+            if not already_placed:
+                from articles.claim_indexer import find_best_section
+                sec_id = find_best_section(db, article_id, mtext)
+                if sec_id and sec_id in sections:
+                    max_so = max((s["sort_order"] for s in sections[sec_id]["sentences"]), default=0)
+                    new_sid = insert_sentence(db, sec_id, None, mtext)
+                    update_sentence_post_id(db, new_sid, mpid)
+                    sections[sec_id]["sentences"].append({
+                        "sentence_id": new_sid, "sort_order": max_so + 100,
+                        "text": mtext, "post_id": mpid,
+                    })
+                    logger.info("Placed master claim %d in section %d", mpid, sec_id)
+
+        db.commit()
+
+        # ── Step 4: Rebuild article dict with cleaned data ──
+        # Remove hidden sentences and empty sections
+        result_sections = []
+        for sec_id in [s[0] for s in secs]:  # preserve original order
+            if sec_id not in sections:
+                continue
+            sec = sections[sec_id]
+            clean_sents = [s for s in sec["sentences"] if not s.get("_hidden")]
+            if not clean_sents:
+                continue
+
+            # Enrich with VS/stake from DB
+            from chain.chain_db import get_stake_totals, get_verity_score
+            for s in clean_sents:
+                pid = s.get("post_id")
+                if pid is not None:
+                    try:
+                        sup, chal = get_stake_totals(db, pid)
+                        s["stake_support"] = sup
+                        s["stake_challenge"] = chal
+                        s["verity_score"] = get_verity_score(db, pid)
+                    except Exception:
+                        s["stake_support"] = 0
+                        s["stake_challenge"] = 0
+                        s["verity_score"] = 0
+                else:
+                    s["stake_support"] = 0
+                    s["stake_challenge"] = 0
+                    s["verity_score"] = 0
+
+                # Add dupe group info for frontend rollup
+                if pid and s.get("post_id"):
+                    dg_row = db.execute(sql_text(
+                        "SELECT ct.dupe_group_id, g.member_count "
+                        "FROM chain_claim_text ct "
+                        "LEFT JOIN claim_dupe_group g ON ct.dupe_group_id = g.group_id "
+                        "WHERE ct.post_id = :pid"
+                    ), {"pid": pid}).fetchone()
+                    if dg_row and dg_row[0]:
+                        s["dupe_group_id"] = dg_row[0]
+                        if dg_row[1] and dg_row[1] > 1:
+                            s["dupe_count"] = dg_row[1]
+
+            # Content moderation
+            try:
+                from moderation import check_content_fast
+                for s in clean_sents:
+                    mod = check_content_fast(s.get("text", ""))
                     if not mod.allowed:
-                        sent["text"] = "[Content hidden — policy violation]"
-                        sent["moderated"] = True
-        except Exception:
-            pass
+                        s["text"] = "[Content hidden — policy violation]"
+                        s["moderated"] = True
+            except Exception:
+                pass
 
-        # 5. Dedup: hide sentences that are semantically duplicated
-        try:
-            art_row = db.execute(sql_text(
-                "SELECT article_id FROM topic_article WHERE topic_key = :k"
-            ), {"k": _norm(topic_key)}).fetchone()
-            if art_row:
-                persist_dedup(db, art_row[0])
-        except Exception as _dedup_e:
-            import logging as _lg
-            _lg.getLogger(__name__).debug('persist_dedup in cache build failed: %s', _dedup_e)
+            result_sections.append({
+                "section_id": sec["section_id"],
+                "heading": sec["heading"],
+                "sentences": clean_sents,
+            })
 
-        # ── Cache the fully-built result ──
+        article = {
+            "article_id": article_id,
+            "title": title,
+            "topic_key": key,
+            "sections": result_sections,
+        }
+
+        # ── Step 5: Cache ──
         response_json = json.dumps(article, default=str)
         response_hash = hashlib.md5(response_json.encode()).hexdigest()[:16]
-
         db.execute(sql_text(
             "UPDATE topic_article SET "
             "cached_response = CAST(:resp AS jsonb), "
@@ -587,18 +776,23 @@ def build_and_cache_response(db_or_factory, topic_key: str):
             "WHERE article_id = :a"
         ), {"resp": response_json, "h": response_hash, "a": article_id})
         db.commit()
-
-        logger.info("Cached article response for '%s' (hash=%s)", topic_key, response_hash)
+        logger.info("Cached article '%s': %d sections, hash=%s",
+                     topic_key, len(result_sections), response_hash)
 
     except Exception as e:
         logger.warning("build_and_cache_response failed for '%s': %s", topic_key, e)
+        import traceback
+        traceback.print_exc()
         try:
             db.rollback()
         except Exception:
             pass
     finally:
-        if owns_session:
-            db.close()
+        if owns:
+            try:
+                db.close()
+            except Exception:
+                pass
 
 
 def apply_stake_delta(
@@ -841,7 +1035,9 @@ def persist_dedup(db, article_id: int):
             
             # Use pgvector's <=> operator to find nearest neighbor among
             # on-chain + already-kept off-chain sentences within this article.
-            comparison_ids = onchain_ids + kept_offchain_ids
+            # Only compare against other off-chain sentences.
+            # On-chain masters are handled by build_and_cache_response.
+            comparison_ids = kept_offchain_ids
             if not comparison_ids:
                 kept_offchain_ids.append(sid)
                 continue

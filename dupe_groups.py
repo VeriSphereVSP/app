@@ -22,7 +22,7 @@ from sqlalchemy import text as sql_text
 
 logger = logging.getLogger(__name__)
 
-DUPE_THRESHOLD = 0.90  # cosine similarity threshold for grouping
+DUPE_THRESHOLD = 0.85  # cosine similarity threshold for grouping
 
 
 def _fmt_vec(v: list) -> str:
@@ -143,106 +143,79 @@ def assign_to_group(db: Session, post_id: int) -> Optional[int]:
 
 
 def _refresh_group_stats(db: Session, group_id: int):
-    """Recompute group stats: canonical (highest effect), aggregates."""
-    # Get all members with their stake/VS data
+    """Recompute canonical, aggregate VS (base + link effects)."""
     members = db.execute(sql_text(
         "SELECT c.post_id, c.claim_text, "
-        "       COALESCE(p.support_total, 0) as support, "
-        "       COALESCE(p.challenge_total, 0) as challenge, "
-        "       COALESCE(p.effective_vs, 0) as vs "
+        "       COALESCE(p.support_total, 0), COALESCE(p.challenge_total, 0), "
+        "       COALESCE(p.effective_vs, 0) "
         "FROM chain_claim_text c "
         "LEFT JOIN chain_post p ON c.post_id = p.post_id "
         "WHERE c.dupe_group_id = :gid"
     ), {"gid": group_id}).fetchall()
-
     if not members:
         return
 
-    # Canonical = highest effect (stake × abs(VS))
-    best_pid = members[0][0]
-    best_text = members[0][1]
-    best_effect = 0.0
+    best_pid, best_text, best_effect = members[0][0], members[0][1], 0.0
+    total_sup = total_chal = 0.0
 
-    total_support = 0.0
-    total_challenge = 0.0
+    for pid, text, sup, chal, vs in members:
+        total_sup += sup; total_chal += chal
+        eff = (sup + chal) * abs(vs) / 100.0 if vs != 0 else 0
+        if eff > best_effect:
+            best_effect, best_pid, best_text = eff, pid, text
 
-    for m in members:
-        pid, text, support, challenge, vs = m
-        total_support += support
-        total_challenge += challenge
-        effect = (support + challenge) * abs(vs) / 100.0 if vs != 0 else 0
-        if effect > best_effect:
-            best_effect = effect
-            best_pid = pid
-            best_text = text
-
-    # If no one has effect, pick highest total stake
     if best_effect == 0:
-        best_stake = 0.0
         for m in members:
-            s = m[2] + m[3]
-            if s > best_stake:
-                best_stake = s
-                best_pid = m[0]
-                best_text = m[1]
+            if m[2] + m[3] > (best_effect or 0):
+                best_pid, best_text = m[0], m[1]
+                best_effect = m[2] + m[3]
 
-    # Compute aggregate VS (weighted by stake)
-    total_stake = total_support + total_challenge
-    if total_stake > 0:
-        if total_support > total_challenge:
-            agg_vs = (total_support / total_stake) * 100
-        elif total_challenge > total_support:
-            agg_vs = -(total_challenge / total_stake) * 100
-        else:
-            agg_vs = 0.0
-    else:
-        agg_vs = 0.0
+    total_stake = total_sup + total_chal
+    base_vs = ((total_sup - total_chal) / total_stake * 100) if total_stake > 0 else 0.0
+
+    # Sum incoming link effects across all members
+    link_eff = 0.0
+    try:
+        from chain.chain_db import compute_edge_contribution
+        for m in members:
+            links = db.execute(sql_text(
+                "SELECT link_post_id FROM chain_link WHERE to_post_id = :pid"
+            ), {"pid": m[0]}).fetchall()
+            for (lpid,) in links:
+                try:
+                    link_eff += compute_edge_contribution(db, m[0], lpid)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    agg_vs = max(-100.0, min(100.0, base_vs + link_eff))
 
     db.execute(sql_text(
         "UPDATE claim_dupe_group SET "
         "canonical_post_id = :cpid, canonical_text = :ctxt, "
         "member_count = :mc, total_support = :ts, total_challenge = :tc, "
-        "aggregate_vs = :avs, updated_at = NOW() "
-        "WHERE group_id = :gid"
-    ), {
-        "cpid": best_pid, "ctxt": best_text,
-        "mc": len(members), "ts": total_support, "tc": total_challenge,
-        "avs": round(agg_vs, 2), "gid": group_id,
-    })
+        "aggregate_vs = :avs, updated_at = NOW() WHERE group_id = :gid"
+    ), {"cpid": best_pid, "ctxt": best_text, "mc": len(members),
+        "ts": total_sup, "tc": total_chal, "avs": round(agg_vs, 2), "gid": group_id})
 
-    # Check if canonical changed — if so, eject members not similar to new canonical
-    old_canonical = db.execute(sql_text(
-        "SELECT canonical_post_id FROM claim_dupe_group WHERE group_id = :gid"
-    ), {"gid": group_id}).fetchone()
-
-    # Ejection check: verify all members are similar to canonical
-    canonical_emb = db.execute(sql_text(
-        "SELECT embedding FROM chain_claim_text WHERE post_id = :pid"
-    ), {"pid": best_pid}).fetchone()
-
-    if canonical_emb and canonical_emb[0] is not None:
-        max_dist = 1.0 - DUPE_THRESHOLD
-        to_eject = []
-        for m in members:
-            if m[0] == best_pid:
-                continue
-            dist_row = db.execute(sql_text(
-                "SELECT (c1.embedding <=> c2.embedding) as dist "
-                "FROM chain_claim_text c1, chain_claim_text c2 "
-                "WHERE c1.post_id = :pid1 AND c2.post_id = :pid2 "
-                "AND c1.embedding IS NOT NULL AND c2.embedding IS NOT NULL"
-            ), {"pid1": m[0], "pid2": best_pid}).fetchone()
-            if dist_row and dist_row[0] is not None and dist_row[0] > max_dist:
-                to_eject.append(m[0])
-
-        for ejected_pid in to_eject:
+    # Eject members not similar to canonical
+    max_dist = 1.0 - DUPE_THRESHOLD
+    for m in members:
+        if m[0] == best_pid:
+            continue
+        dist_row = db.execute(sql_text(
+            "SELECT (c1.embedding <=> c2.embedding) "
+            "FROM chain_claim_text c1, chain_claim_text c2 "
+            "WHERE c1.post_id = :p1 AND c2.post_id = :p2 "
+            "AND c1.embedding IS NOT NULL AND c2.embedding IS NOT NULL"
+        ), {"p1": m[0], "p2": best_pid}).fetchone()
+        if dist_row and dist_row[0] is not None and dist_row[0] > max_dist:
             db.execute(sql_text(
                 "UPDATE chain_claim_text SET dupe_group_id = NULL WHERE post_id = :pid"
-            ), {"pid": ejected_pid})
-            logger.info("Ejected post_id=%d from group %d (too different from new canonical)",
-                         ejected_pid, group_id)
-            # Create new singleton group for ejected claim
-            _create_singleton_group(db, ejected_pid)
+            ), {"pid": m[0]})
+            logger.info("Ejected %d from group %d", m[0], group_id)
+            _create_singleton_group(db, m[0])
 
 
 def _create_singleton_group(db: Session, post_id: int):
