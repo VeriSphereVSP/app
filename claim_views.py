@@ -238,6 +238,21 @@ def claims_fast(limit: int = 500, include_links: bool = True, db: Session = Depe
             topic_row = db.execute(sql_text(
                 "SELECT topic FROM claim WHERE post_id = :pid AND topic IS NOT NULL LIMIT 1"
             ), {"pid": p["post_id"]}).fetchone()
+        # APP-12: Links inherit topic from their target claim
+        if not topic_row and p.get("content_type", 0) == 1:
+            topic_row = db.execute(sql_text(
+                "SELECT ta.topic_key FROM chain_link l "
+                "JOIN article_sentence s ON s.post_id = l.to_post_id "
+                "JOIN article_section sec ON s.section_id = sec.section_id "
+                "JOIN topic_article ta ON sec.article_id = ta.article_id "
+                "WHERE l.link_post_id = :pid LIMIT 1"
+            ), {"pid": p["post_id"]}).fetchone()
+            if not topic_row:
+                topic_row = db.execute(sql_text(
+                    "SELECT c.topic FROM chain_link l "
+                    "JOIN claim c ON c.post_id = l.to_post_id "
+                    "WHERE l.link_post_id = :pid AND c.topic IS NOT NULL LIMIT 1"
+                ), {"pid": p["post_id"]}).fetchone()
         
         is_link = p.get("content_type", 0) == 1
         entry = {
@@ -258,6 +273,26 @@ def claims_fast(limit: int = 500, include_links: bool = True, db: Session = Depe
             "created_at": None,
             "created_epoch": p.get("created_epoch"),
         }
+        # PD-04: Dupe group info
+        try:
+            dg = db.execute(sql_text(
+                "SELECT c.dupe_group_id, g.canonical_post_id, g.member_count, "
+                "       g.total_support, g.total_challenge, g.aggregate_vs "
+                "FROM chain_claim_text c "
+                "LEFT JOIN claim_dupe_group g ON c.dupe_group_id = g.group_id "
+                "WHERE c.post_id = :pid"
+            ), {"pid": p["post_id"]}).fetchone()
+            if dg and dg[0]:
+                entry["dupe_group_id"] = dg[0]
+                entry["dupe_canonical_post_id"] = dg[1]
+                entry["dupe_member_count"] = dg[2]
+                if dg[2] > 1:
+                    # Use aggregate metrics for rollup display
+                    entry["dupe_total_support"] = dg[3]
+                    entry["dupe_total_challenge"] = dg[4]
+                    entry["dupe_aggregate_vs"] = dg[5]
+        except Exception:
+            pass
         
         # Enrich link entries
         if is_link and p["post_id"] in link_meta:
@@ -282,6 +317,16 @@ def claims_fast(limit: int = 500, include_links: bool = True, db: Session = Depe
         "avg_vs": round(avg_vs, 2),
     }
 
+
+
+@router.get("/{post_id}/dupe-group")
+def claim_dupe_group(post_id: int, db: Session = Depends(get_db)):
+    """Get the dupe group for a claim, with all members sorted by stake."""
+    from dupe_groups import get_dupe_group
+    group = get_dupe_group(db, post_id)
+    if not group:
+        return {"group_id": None, "members": [], "member_count": 1}
+    return group
 
 
 @router.get("/{post_id}/queue")

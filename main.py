@@ -8,6 +8,7 @@ from typing import Dict, Any, Optional
 from datetime import datetime
 from pathlib import Path
 import json
+import json
 
 from sqlalchemy.orm import Session
 from sqlalchemy import text
@@ -42,6 +43,24 @@ async def lifespan(app):
             await _aio.sleep(600)
             cleanup_rate_limiter()
     _aio.create_task(_rl_cleanup())
+
+    # PD-04: Periodic dupe group refresh (every 5 minutes)
+    async def _dupe_refresh():
+        import asyncio
+        await asyncio.sleep(180)  # Initial delay
+        while True:
+            try:
+                from db import get_session_factory
+                from dupe_groups import refresh_all_groups
+                sess = get_session_factory()()
+                try:
+                    refresh_all_groups(sess)
+                finally:
+                    sess.close()
+            except Exception as e:
+                print(f"Dupe group refresh error: {e}")
+            await asyncio.sleep(300)
+    _aio.create_task(_dupe_refresh())
 
     # Background article refresh — autotunes interval to spread load over 24h
     async def _daily_refresh():
@@ -134,17 +153,57 @@ ADDRESSES_PATH = Path("/app/broadcast/Deploy.s.sol/43113/addresses.json")
 
 
 
-# ── Admin auth ─────────────────────────────────────────────────────────────────
+# ── Admin auth (OPS-03: audit logging + IP allowlist) ──────────────────────────
 import os as _os
 ADMIN_API_KEY = _os.getenv("ADMIN_API_KEY", "")
+# Comma-separated list of allowed IPs. Empty = allow all (but still require key).
+ADMIN_IP_ALLOWLIST = [ip.strip() for ip in _os.getenv("ADMIN_IP_ALLOWLIST", "").split(",") if ip.strip()]
 
-def require_admin(request):
-    """Check X-Admin-Key header against ADMIN_API_KEY env var."""
+
+def _get_client_ip(request) -> str:
+    if not request:
+        return "unknown"
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    if request.client:
+        return request.client.host
+    return "unknown"
+
+
+def _log_admin_action(db, action: str, params: dict, request):
+    """Write to admin_audit_log table."""
+    try:
+        ip = _get_client_ip(request)
+        key = request.headers.get("X-Admin-Key", "")[:8] if request else ""
+        db.execute(sql_text(
+            "INSERT INTO admin_audit_log (action, params, ip_address, admin_key_prefix) "
+            "VALUES (:a, CAST(:p AS jsonb), :ip, :kp)"
+        ), {"a": action, "p": json.dumps(params), "ip": ip, "kp": key})
+        db.commit()
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning("Admin audit log failed: %s", e)
+
+
+def require_admin(request, db=None, action=None, params=None):
+    """Check X-Admin-Key header, enforce IP allowlist, log action."""
     if not ADMIN_API_KEY:
         raise HTTPException(403, "Admin API key not configured. Set ADMIN_API_KEY env var.")
+
+    # IP allowlist check
+    if ADMIN_IP_ALLOWLIST:
+        ip = _get_client_ip(request)
+        if ip not in ADMIN_IP_ALLOWLIST and ip != "127.0.0.1":
+            raise HTTPException(403, "Admin access denied from this IP.")
+
     key = request.headers.get("X-Admin-Key", "")
     if key != ADMIN_API_KEY:
         raise HTTPException(403, "Invalid admin key")
+
+    # Audit log
+    if db and action:
+        _log_admin_action(db, action, params or {}, request)
 
 @app.get("/healthz")
 def healthz():
@@ -166,7 +225,7 @@ def estimate_fee(tx_type: str, value_vsp: float = 1.0, db: Session = Depends(get
 
 @app.post("/api/fees/costs")
 def update_cost(cost_key: str, monthly_usd: float, request: Request = None, db: Session = Depends(get_db)):
-    require_admin(request)
+    require_admin(request, db=db, action="update_cost", params={"cost_key": cost_key, "monthly_usd": monthly_usd})
     """Update an operating cost (admin). Fee recalculates automatically."""
     from fee_calculator import invalidate_cache
     db.execute(sql_text(
@@ -178,7 +237,7 @@ def update_cost(cost_key: str, monthly_usd: float, request: Request = None, db: 
 
 @app.post("/api/fees/params")
 def update_fee_param(param_key: str, value: str, request: Request = None, db: Session = Depends(get_db)):
-    require_admin(request)
+    require_admin(request, db=db, action="update_fee_param", params={"param_key": param_key, "value": value})
     """Update a fee parameter (admin). Fee recalculates automatically."""
     from fee_calculator import invalidate_cache
     db.execute(sql_text(

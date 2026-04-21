@@ -301,6 +301,17 @@ def refresh_article(db: Session, topic: str) -> bool:
             if sent.get("post_id") is not None:
                 existing_post_ids.add(sent["post_id"])
 
+    # Pre-compute embeddings of existing sentences for semantic dedup during refresh
+    _refresh_embeddings = []
+    try:
+        from embedding import embed_batch
+        _existing_texts_list = [t for t in existing_texts if t.strip()]
+        if _existing_texts_list:
+            _refresh_embeddings = embed_batch(list(_existing_texts_list))
+    except Exception as _emb_err:
+        import logging as _lg
+        _lg.getLogger(__name__).debug("Refresh embedding precompute failed: %s", _emb_err)
+
     # Build index of existing sections (normalized heading -> section_id)
     existing_sections = {}
     for sec in article["sections"]:
@@ -319,12 +330,24 @@ def refresh_article(db: Session, topic: str) -> bool:
             if not text:
                 continue
             norm = text.lower().strip()
-            # Check for near-duplicates (exact match or containment)
+            # Check for near-duplicates: exact match, containment, or semantic similarity
             is_dup = False
             for existing in existing_texts:
                 if norm == existing or norm in existing or existing in norm:
                     is_dup = True
                     break
+            # Semantic check if not caught by exact match
+            if not is_dup and _refresh_embeddings:
+                try:
+                    from embedding import embed
+                    from similarity import cosine_similarity
+                    new_vec = embed(text)
+                    for evec in _refresh_embeddings:
+                        if cosine_similarity(new_vec, evec) >= 0.80:
+                            is_dup = True
+                            break
+                except Exception:
+                    pass
             if not is_dup:
                 new_sents.append(text)
 
@@ -413,6 +436,69 @@ def refresh_article(db: Session, topic: str) -> bool:
 
 
 
+def _reassign_sentences_to_best_sections(db, article_id: int):
+    """Move sentences to the section whose heading best matches their content.
+    Only moves if the match is significantly better than the current section."""
+    import logging
+    from sqlalchemy import text as sql_text
+    _logger = logging.getLogger(__name__)
+
+    sections = db.execute(sql_text(
+        "SELECT section_id, heading FROM article_section WHERE article_id = :a ORDER BY sort_order"
+    ), {"a": article_id}).fetchall()
+    if len(sections) < 2:
+        return
+
+    # Get all non-hidden sentences with their current section
+    sents = db.execute(sql_text(
+        "SELECT s.sentence_id, s.section_id, s.text "
+        "FROM article_sentence s "
+        "JOIN article_section sec ON s.section_id = sec.section_id "
+        "WHERE sec.article_id = :a AND s.is_hidden = FALSE"
+    ), {"a": article_id}).fetchall()
+
+    if not sents:
+        return
+
+    try:
+        from embedding import embed_batch, embed
+        from similarity import cosine_similarity
+
+        # Embed all section headings
+        heading_map = {sec[0]: sec[1] for sec in sections}
+        heading_vecs = {}
+        for sec_id, heading in sections:
+            heading_vecs[sec_id] = embed(heading)
+
+        moved = 0
+        for sent_id, current_sec, text in sents:
+            if not text or not text.strip():
+                continue
+            sent_vec = embed(text)
+            # Find best matching section
+            best_sec = current_sec
+            best_sim = 0.0
+            current_sim = 0.0
+            for sec_id, hvec in heading_vecs.items():
+                sim = cosine_similarity(sent_vec, hvec)
+                if sec_id == current_sec:
+                    current_sim = sim
+                if sim > best_sim:
+                    best_sim = sim
+                    best_sec = sec_id
+            # Only move if significantly better match (> 0.05 improvement)
+            if best_sec != current_sec and best_sim - current_sim > 0.05:
+                db.execute(sql_text(
+                    "UPDATE article_sentence SET section_id = :new_sec WHERE sentence_id = :sid"
+                ), {"new_sec": best_sec, "sid": sent_id})
+                moved += 1
+        if moved > 0:
+            db.commit()
+            _logger.info("Reassigned %d sentences to better sections in article %d", moved, article_id)
+    except Exception as e:
+        _logger.debug("Section reassignment embedding failed: %s", e)
+
+
 def build_and_cache_response(db_or_factory, topic_key: str):
     """Build the full enriched article response and cache it as JSONB.
     Called after generation, refresh, or chain event.
@@ -478,8 +564,16 @@ def build_and_cache_response(db_or_factory, topic_key: str):
         except Exception:
             pass
 
-        # 5. SKIPPED: _semantic_dedup makes N OpenAI embedding calls per rebuild.
-        # Runs at article generation time instead.
+        # 5. Dedup: hide sentences that are semantically duplicated
+        try:
+            art_row = db.execute(sql_text(
+                "SELECT article_id FROM topic_article WHERE topic_key = :k"
+            ), {"k": _norm(topic_key)}).fetchone()
+            if art_row:
+                persist_dedup(db, art_row[0])
+        except Exception as _dedup_e:
+            import logging as _lg
+            _lg.getLogger(__name__).debug('persist_dedup in cache build failed: %s', _dedup_e)
 
         # ── Cache the fully-built result ──
         response_json = json.dumps(article, default=str)
@@ -667,7 +761,7 @@ def apply_new_post(db_or_factory, post_id: int, claim_text: str):
 def persist_dedup(db, article_id: int):
     """Run dedup using batched embeddings and persist decisions via is_hidden.
     
-    Embeddings cached in article_sentence.embedding (pgvector vector(3072)).
+    Embeddings cached in article_sentence.embedding (pgvector vector(1536)).
     Each sentence is embedded at most once across all dedup runs."""
     import logging
     from sqlalchemy import text as sql_text

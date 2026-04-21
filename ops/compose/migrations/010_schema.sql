@@ -10,7 +10,7 @@ CREATE TABLE IF NOT EXISTS claim (
 CREATE TABLE IF NOT EXISTS claim_embedding (
   claim_id         BIGINT PRIMARY KEY REFERENCES claim(claim_id) ON DELETE CASCADE,
   embedding_model  TEXT NOT NULL,
-  embedding        vector(3072),
+  embedding        vector(1536),
   updated_tms      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 

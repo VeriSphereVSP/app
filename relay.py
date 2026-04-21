@@ -513,6 +513,24 @@ async def relay(body: RelayRequest, db: Session = Depends(get_db)):
                             logger.info("Auto-topic: post_id=%d → '%s'", post_id, _topic)
                     except Exception as e:
                         logger.debug("Auto-topic failed (non-fatal): %s", e)
+                    # APP-11: Synchronous cache rebuild so frontend sees update immediately
+                    try:
+                        from db import get_session_factory
+                        from articles.article_store import build_and_cache_response
+                        # Find which articles contain this post
+                        _art_rows = db.execute(__import__("sqlalchemy").text(
+                            "SELECT DISTINCT ta.topic_key FROM article_sentence s "
+                            "JOIN article_section sec ON s.section_id = sec.section_id "
+                            "JOIN topic_article ta ON sec.article_id = ta.article_id "
+                            "WHERE s.post_id = :pid"
+                        ), {"pid": post_id}).fetchall()
+                        for _ar in _art_rows:
+                            build_and_cache_response(get_session_factory(), _ar[0])
+                        if _art_rows:
+                            logger.info("Cache rebuilt for %d articles after claim create", len(_art_rows))
+                    except Exception as e:
+                        logger.debug("Sync cache rebuild failed (non-fatal): %s", e)
+
                 else:
                     logger.warning("createClaim succeeded but no PostCreated event found")
             except Exception as e:
@@ -545,6 +563,20 @@ async def relay(body: RelayRequest, db: Session = Depends(get_db)):
                     _queue_article_refresh(db, post_id)
                 except Exception as e2:
                     logger.debug("Post-stake reindex failed (non-fatal): %s", e2)
+                # APP-11: Rebuild article caches after stake change
+                try:
+                    from db import get_session_factory
+                    from articles.article_store import build_and_cache_response
+                    _art_rows = db.execute(__import__("sqlalchemy").text(
+                        "SELECT DISTINCT ta.topic_key FROM article_sentence s "
+                        "JOIN article_section sec ON s.section_id = sec.section_id "
+                        "JOIN topic_article ta ON sec.article_id = ta.article_id "
+                        "WHERE s.post_id = :pid"
+                    ), {"pid": post_id}).fetchall()
+                    for _ar in _art_rows:
+                        build_and_cache_response(get_session_factory(), _ar[0])
+                except Exception:
+                    pass
             except Exception as e:
                 logger.warning("Post-stake processing failed (non-fatal): %s", e)
 

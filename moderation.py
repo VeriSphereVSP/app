@@ -79,11 +79,61 @@ Respond with ONLY valid JSON:
 {"allowed": true} or {"allowed": false, "reason": "brief explanation"}"""
 
 
+# APP-05: Circuit breaker for LLM moderation
+# After CIRCUIT_BREAKER_THRESHOLD failures in CIRCUIT_BREAKER_WINDOW seconds,
+# falls back to keyword-only filtering until the window expires.
+import time as _time
+
+_CIRCUIT_BREAKER_THRESHOLD = 5   # failures before tripping
+_CIRCUIT_BREAKER_WINDOW = 300    # 5 minute window
+_circuit_failures: list[float] = []
+_circuit_open = False
+_circuit_open_until = 0.0
+
+
+def _circuit_breaker_check() -> bool:
+    """Returns True if LLM is available, False if circuit is open."""
+    global _circuit_open, _circuit_open_until
+    now = _time.time()
+
+    if _circuit_open:
+        if now > _circuit_open_until:
+            _circuit_open = False
+            _circuit_failures.clear()
+            logger.info("LLM moderation circuit breaker: CLOSED (recovered)")
+            return True
+        return False
+    return True
+
+
+def _circuit_breaker_record_failure():
+    """Record an LLM failure. Trip breaker if threshold exceeded."""
+    global _circuit_open, _circuit_open_until
+    now = _time.time()
+    cutoff = now - _CIRCUIT_BREAKER_WINDOW
+    _circuit_failures[:] = [t for t in _circuit_failures if t > cutoff]
+    _circuit_failures.append(now)
+
+    if len(_circuit_failures) >= _CIRCUIT_BREAKER_THRESHOLD:
+        _circuit_open = True
+        _circuit_open_until = now + _CIRCUIT_BREAKER_WINDOW
+        logger.warning(
+            "LLM moderation circuit breaker: OPEN — %d failures in %ds. "
+            "Falling back to keyword-only for %ds.",
+            len(_circuit_failures), _CIRCUIT_BREAKER_WINDOW, _CIRCUIT_BREAKER_WINDOW
+        )
+
+
 def _llm_check(text: str) -> Optional[str]:
     """
-    Tier 2: LLM-based policy check.
+    Tier 2: LLM-based policy check with circuit breaker.
     Returns rejection reason or None if clean.
+    Falls back to keyword-only if LLM is consistently failing.
     """
+    if not _circuit_breaker_check():
+        # Circuit open — skip LLM, rely on keyword filter only
+        return None
+
     try:
         from llm_provider import complete
         response = complete(
@@ -93,7 +143,6 @@ def _llm_check(text: str) -> Optional[str]:
             temperature=0.0,
         )
 
-        # Parse response
         clean = re.sub(r'^```json\s*|\s*```$', '', response.strip())
         result = json.loads(clean)
 
@@ -102,8 +151,8 @@ def _llm_check(text: str) -> Optional[str]:
         return result.get("reason", "Content violates community standards.")
 
     except Exception as e:
-        logger.warning(f"LLM moderation failed (allowing content): {e}")
-        # Fail open — if the LLM is down, don't block legitimate content
+        logger.warning(f"LLM moderation failed: {e}")
+        _circuit_breaker_record_failure()
         return None
 
 

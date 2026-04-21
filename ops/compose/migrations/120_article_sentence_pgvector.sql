@@ -17,4 +17,4 @@ CREATE EXTENSION IF NOT EXISTS vector;
 ALTER TABLE article_sentence DROP COLUMN IF EXISTS embedding;
 
 -- Create as pgvector type
-ALTER TABLE article_sentence ADD COLUMN embedding vector(3072);
+ALTER TABLE article_sentence ADD COLUMN embedding vector(1536);

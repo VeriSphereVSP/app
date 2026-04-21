@@ -154,6 +154,14 @@ def index_post(db: Session, post_id: int, user_addresses: list[str] | None = Non
             except Exception as e:
                 logger.debug("Could not index claim text for post %d: %s", post_id, e)
 
+            # PD-04: Embed claim and assign to dupe group (background-safe)
+            try:
+                from dupe_groups import embed_claim, assign_to_group
+                embed_claim(db, post_id, claim_text)
+                assign_to_group(db, post_id)
+            except Exception as e:
+                logger.debug("Dupe grouping failed for post %d: %s", post_id, e)
+
         # User positions
         if user_addresses:
             for addr in user_addresses:

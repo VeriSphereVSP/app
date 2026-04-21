@@ -16,6 +16,25 @@ from lang_detect import detect_language, lang_instruction
 
 logger = logging.getLogger(__name__)
 
+
+def _sanitize_topic(topic: str) -> str:
+    """APP-06: Sanitize user topic input before passing to LLM.
+    Strips control characters, XML/HTML tags, and enforces length limit.
+    Wraps in XML delimiters to prevent prompt injection."""
+    if not topic:
+        return ""
+    # Strip control characters (keep basic whitespace)
+    cleaned = "".join(ch for ch in topic if ch in "\n\t" or (ord(ch) >= 32 and ord(ch) < 127) or ord(ch) > 127)
+    # Strip XML/HTML-like tags
+    import re as _re
+    cleaned = _re.sub(r"<[^>]+>", "", cleaned)
+    # Strip common prompt injection prefixes
+    cleaned = _re.sub(r"^(ignore|forget|disregard|override|system:)\s+.*?[.!]\s*", "", cleaned, flags=_re.IGNORECASE)
+    # Enforce length
+    if len(cleaned) > 200:
+        cleaned = cleaned[:200]
+    return cleaned.strip()
+
 ARTICLE_SYSTEM = """You are an encyclopedia article writer. Given a topic, write a comprehensive factual article.
 
 Return ONLY valid JSON in this exact format:
@@ -101,21 +120,26 @@ def _build_prompt(topic: str) -> str:
             title, text = _fetch_url_text(topic)
             from lang_detect import detect_language, lang_instruction
             lang_extra = lang_instruction(detect_language(text[:500]))
+            safe_title = _sanitize_topic(title)
+            # Truncate page text to prevent prompt stuffing
+            safe_text = text[:8000] if len(text) > 8000 else text
             return (
                 f"Structure the following web page content into an encyclopedia-style article. "
-                f"The page title is: {title}\n\n"
-                f"Page content:\n{text}"
+                f"The page title is: <title>{safe_title}</title>\n\n"
+                f"<page_content>{safe_text}</page_content>"
                 f"{lang_extra}"
             )
         except Exception as e:
             logger.warning(f"URL fetch failed, treating as topic: {e}")
     from lang_detect import detect_language, lang_instruction
-    return f"Write an encyclopedia article about: {topic}" + lang_instruction(detect_language(topic))
+    safe = _sanitize_topic(topic)
+    return f"Write an encyclopedia article about the following topic:\n<topic>{safe}</topic>" + lang_instruction(detect_language(safe))
 
 def generate_article(topic: str) -> Dict[str, Any]:
     """Generate a full article for a topic. Returns {title, sections}."""
+    safe_topic = _sanitize_topic(topic)
     raw = complete(
-        prompt=_build_prompt(topic) + lang_instruction(detect_language(topic)),
+        prompt=_build_prompt(safe_topic) + lang_instruction(detect_language(safe_topic)),
         system=ARTICLE_SYSTEM,
         max_tokens=6144,
         temperature=0.4,

@@ -14,7 +14,7 @@ Embeddings are computed lazily: if a claim doesn't have an embedding yet,
 it's embedded on first comparison and stored for future use.
 
 Thresholds:
-  >= 0.95  "high"   — almost certainly the same claim, block creation
+  >= 0.98  "high"   — near-verbatim duplicate, warn strongly
   >= 0.85  "medium" — similar claim, warn user, require confirmation
   <  0.85           — distinct enough, allow silently
 """
@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/claims", tags=["claims"])
 
 # Thresholds
-HIGH_THRESHOLD = 0.95   # Block creation — almost certainly the same claim
+HIGH_THRESHOLD = 0.98   # Warn strongly — only exact text match should block
 MEDIUM_THRESHOLD = 0.85  # Warn — similar claim, user must confirm
 
 
@@ -103,7 +103,7 @@ def check_similar_claims(
 
     Returns matches sorted by similarity descending.
     Clients should:
-    - similarity >= 0.95: block creation ("this claim already exists")
+    - similarity >= 0.98: warn strongly (only exact match blocks) ("this claim already exists")
     - 0.85 <= similarity < 0.95: warn, show similar claims, require confirm
     - < 0.85: allow creation
 

@@ -456,9 +456,29 @@ def edit_sentence_endpoint(sentence_id: int, req: EditRequest,
 
     section_id, old_order, old_text, old_post_id = old
 
-    # Insert as a single sentence — claims are atomic
+    # PD-04: Block editing on-chain claims
+    if old_post_id is not None:
+        raise HTTPException(400,
+            "Cannot edit an on-chain claim. "
+            "Create a new claim and link it as evidence instead.")
+
     new_sentences = [req.new_text.strip()]
     created = []
+
+    # PD-04: Determine if this is a friendly edit (similar meaning) or hostile
+    is_friendly = True
+    try:
+        from embedding import embed
+        from similarity import cosine_similarity
+        old_vec = embed(old_text)
+        new_vec = embed(req.new_text.strip())
+        edit_sim = cosine_similarity(old_vec, new_vec)
+        is_friendly = edit_sim >= 0.80
+        if not is_friendly:
+            logger.info("Hostile edit detected (sim=%.3f): '%s' → '%s'",
+                        edit_sim, old_text[:40], req.new_text.strip()[:40])
+    except Exception:
+        pass  # Default to friendly if embedding fails
 
     # Re-evaluate section placement if text changed significantly
     target_section_id = section_id
@@ -509,14 +529,22 @@ def edit_sentence_endpoint(sentence_id: int, req: EditRequest,
         })
         after_id = new_sid
 
-    # Mark old as replaced by the first new sentence
+    # PD-04: Friendly edit = hide old sentence (user is improving the article)
+    # Hostile edit = keep old visible (user tried to change meaning)
     if created:
         mark_replaced(db, sentence_id, created[0]["sentence_id"])
+        if is_friendly:
+            db.execute(sql_text(
+                "UPDATE article_sentence SET is_hidden = TRUE WHERE sentence_id = :sid"
+            ), {"sid": sentence_id})
+            db.commit()
+            logger.info("Friendly edit: hid old sentence %d", sentence_id)
 
     return {
         "old_sentence_id": sentence_id,
         "old_post_id": old_post_id,
         "created": created,
+        "is_friendly": is_friendly,
     }
 
 
