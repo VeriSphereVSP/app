@@ -5,6 +5,7 @@ import json
 
 # Network configuration
 CHAIN_ID = int(os.getenv("CHAIN_ID", "43113"))
+RPC_URL_READ = os.getenv("RPC_URL_READ", os.getenv("RPC_URL", "https://api.avax-test.network/ext/bc/C/rpc"))
 RPC_URL = os.getenv("RPC_URL", "")
 
 # Determine network name

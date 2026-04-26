@@ -1,7 +1,8 @@
 -- PD-04: Claim embeddings (1536-dim) + dupe group table
--- pgvector index limit is 2000 dims; text-embedding-3-small with dimensions=1536
 
-ALTER TABLE chain_claim_text ADD COLUMN IF NOT EXISTS embedding vector(1536);
+-- Drop JSONB embedding column if it exists, replace with vector
+ALTER TABLE chain_claim_text DROP COLUMN IF EXISTS embedding;
+ALTER TABLE chain_claim_text ADD COLUMN embedding vector(1536);
 CREATE INDEX IF NOT EXISTS idx_claim_embedding ON chain_claim_text
     USING hnsw (embedding vector_cosine_ops);
 

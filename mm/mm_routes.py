@@ -119,7 +119,7 @@ def _execute_permit(token_address: str, owner: str, spender: str,
     r_bytes = bytes.fromhex(r.removeprefix("0x"))
     s_bytes = bytes.fromhex(s.removeprefix("0x"))
 
-    tx = contract.functions.permit(
+    permit_fn = contract.functions.permit(
         Web3.to_checksum_address(owner),
         Web3.to_checksum_address(spender),
         value,
@@ -127,15 +127,27 @@ def _execute_permit(token_address: str, owner: str, spender: str,
         v,
         r_bytes,
         s_bytes,
-    ).build_transaction({
-        "from": Web3.to_checksum_address(MM_ADDRESS),
-        "gas": 120_000,
+    )
+    # Static call first to catch revert reason
+    try:
+        permit_fn.call({'from': Web3.to_checksum_address(MM_ADDRESS)})
+    except Exception as e:
+        err_msg = str(e)
+        logger.warning('Permit static call failed: %s', err_msg)
+        try:
+            on_chain_nonce = contract.functions.nonces(Web3.to_checksum_address(owner)).call()
+            logger.warning('  Owner permit nonce on-chain: %d', on_chain_nonce)
+        except Exception:
+            pass
+        raise HTTPException(400, f'Permit would revert: {err_msg[:200]}')
+    tx = permit_fn.build_transaction({
+        'from': Web3.to_checksum_address(MM_ADDRESS),
+        'gas': 120_000,
     })
-
     tx_hash = sign_and_send(tx)
     receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=30)
     if receipt.status == 0:
-        raise HTTPException(400, "Permit transaction reverted on-chain")
+        raise HTTPException(400, 'Permit transaction reverted on-chain')
     logger.info("Permit executed: token=%s owner=%s value=%d tx=%s", token_address[:10], owner[:10], value, tx_hash)
     return tx_hash
 
@@ -166,8 +178,16 @@ def mm_floor(db: Session = Depends(get_db)):
 # Spot quote
 # ────────────────────────────────────────────────────────────
 
+
+# Quote cache: avoid hitting DB on every frontend poll
+_quote_cache = {"data": None, "ts": 0}
+_QUOTE_CACHE_TTL = 5  # seconds
+
 @router.get("/quote")
 def mm_quote(db: Session = Depends(get_db)):
+    import time as _t
+    if _quote_cache['data'] and _t.time() - _quote_cache['ts'] < _QUOTE_CACHE_TTL:
+        return _quote_cache['data']
     try:
         row = _load_mm_state(db)
         net_vsp, unit_au, half_spread, usdc_reserves, vsp_circulating = row
@@ -175,13 +195,16 @@ def mm_quote(db: Session = Depends(get_db)):
             net_vsp=net_vsp, usdc_reserves=usdc_reserves,
             vsp_circulating=vsp_circulating, unit_au=unit_au, half_spread=half_spread,
         )
-        return {
+        _result = {
             "mid_price_usd": round(q.mid_price_usd, 8),
             "buy_price_usd": round(q.buy_price_usd, 8),
             "sell_price_usd": round(q.sell_price_usd, 8),
             "floor_price_usd": round(q.floor_price_usd, 8),
             "ts": datetime.now(timezone.utc).isoformat(),
         }
+        _quote_cache['data'] = _result
+        _quote_cache['ts'] = _t.time()
+        return _result
     except HTTPException:
         raise
     except Exception as e:

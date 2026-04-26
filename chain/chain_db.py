@@ -193,14 +193,20 @@ def get_user_positions(db: Session, user_address: str) -> list[dict]:
         s_max = get_global(db, "s_max") or max(support + challenge, 1.0)
         num_tranches = int(get_global(db, "num_tranches") or 10)
         total = support + challenge
-        R_MIN, R_MAX = 0.01, 1.00
+        # Read rate policy from chain (indexed by chain_indexer)
+        R_MIN = get_global(db, 'rate_min_ray') or 0.0
+        R_MAX = get_global(db, 'rate_max_ray') or 1.387611  # fallback
 
         abs_vs = abs(vs)
         v = abs_vs / 100.0
         participation = min(total / s_max, 1.0) if s_max > 0 else 0
-        r_base = R_MIN + (R_MAX - R_MIN) * v * participation
-        r_eff = r_base * pos_weight if vs != 0 else 0
-        apr = r_eff * 100 if is_winner else -r_eff * 100
+        r_base_annual = R_MIN + (R_MAX - R_MIN) * v * participation
+        # Daily rate with midpoint position weight
+        r_daily = (r_base_annual / 365.24) * pos_weight if vs != 0 else 0
+        # Compound to get APR
+        apr = ((1 + r_daily) ** 365.24 - 1) * 100 if is_winner else -((1 + r_daily) ** 365.24 - 1) * 100
+        r_eff = r_daily * 365.24  # for breakdown display
+        r_base = r_base_annual  # for breakdown display
         if vs == 0:
             apr = 0
             r_eff = 0

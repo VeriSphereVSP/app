@@ -48,7 +48,7 @@ def _validate_claim_text(text: str) -> str:
         cleaned = cleaned[:MAX_CLAIM_DB_LENGTH]
     return cleaned
 
-POLL_INTERVAL = 3  # DB-first: reduced from 10s  # seconds
+POLL_INTERVAL = 15  # Balanced: fast enough for UX, low RPC cost
 BLOCK_BATCH = 2000  # blocks per poll
 
 # ── Web3 setup ────────────────────────────────────────
@@ -255,6 +255,28 @@ def index_global_stats(db: Session):
                 VALUES ('smax_decay_max_epochs', :val, now())
                 ON CONFLICT (key) DO UPDATE SET value_num = :val, updated_at = now()
             """), {"val": decay_max})
+        except Exception:
+            pass
+
+        # Rate policy parameters (read from StakeRatePolicy via StakeEngine)
+        try:
+            rp = se.functions.ratePolicy().call()
+            rp_contract = w3.eth.contract(address=rp, abi=[
+                {"inputs":[],"name":"stakeIntRateMinRay","outputs":[{"type":"uint256"}],"stateMutability":"view","type":"function"},
+                {"inputs":[],"name":"stakeIntRateMaxRay","outputs":[{"type":"uint256"}],"stateMutability":"view","type":"function"},
+            ])
+            r_min_ray = rp_contract.functions.stakeIntRateMinRay().call()
+            r_max_ray = rp_contract.functions.stakeIntRateMaxRay().call()
+            db.execute(sql_text("""
+                INSERT INTO chain_global (key, value_num, updated_at)
+                VALUES ('rate_min_ray', :val, now())
+                ON CONFLICT (key) DO UPDATE SET value_num = :val, updated_at = now()
+            """), {"val": r_min_ray / 1e18})
+            db.execute(sql_text("""
+                INSERT INTO chain_global (key, value_num, updated_at)
+                VALUES ('rate_max_ray', :val, now())
+                ON CONFLICT (key) DO UPDATE SET value_num = :val, updated_at = now()
+            """), {"val": r_max_ray / 1e18})
         except Exception:
             pass
 
