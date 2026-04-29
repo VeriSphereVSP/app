@@ -22,7 +22,7 @@ contract DeployForwarder is Script {
         address vspToken = vm.envAddress("VSP_TOKEN_ADDRESS");
         address treasury = vm.envAddress("TREASURY_ADDRESS");
         uint256 feeBps = vm.envOr("FEE_BPS", uint256(50));           // 0.5%
-        uint256 minFeeWei = vm.envOr("MIN_FEE_WEI", uint256(1e15));  // 0.001 VSP
+        uint256 minFeeWei = vm.envOr("MIN_FEE_WEI", uint256(1e17));  // 0.1 VSP
 
         uint256 pk = vm.envUint("PRIVATE_KEY");
         vm.startBroadcast(pk);

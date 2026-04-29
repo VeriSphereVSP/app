@@ -18,10 +18,61 @@ from web3.logs import DISCARD
 from config import FORWARDER_ADDRESS, POST_REGISTRY_ADDRESS
 from db import get_db
 from mm_wallet import w3, sign_and_send
+from fee_calculator import compute_relay_fee, is_fee_exempt
+from config import VSP_ADDRESS, MM_ADDRESS as FEE_WALLET
 from moderation import check_content
 from rate_limit import relay_rate_limit
 
 logger = logging.getLogger(__name__)
+
+# VSP token ABI for fee collection
+_VSP_FEE_ABI = [
+    {"inputs":[{"name":"from","type":"address"},{"name":"to","type":"address"},
+               {"name":"value","type":"uint256"}],
+     "name":"transferFrom","outputs":[{"type":"bool"}],
+     "stateMutability":"nonpayable","type":"function"},
+    {"inputs":[{"name":"owner","type":"address"},{"name":"spender","type":"address"}],
+     "name":"allowance","outputs":[{"type":"uint256"}],
+     "stateMutability":"view","type":"function"},
+    {"inputs":[{"name":"account","type":"address"}],
+     "name":"balanceOf","outputs":[{"type":"uint256"}],
+     "stateMutability":"view","type":"function"},
+]
+
+def _detect_tx_type(calldata_hex, to_addr):
+    """Detect transaction type and value from calldata."""
+    sel = calldata_hex[:8]
+    tx_type = "unknown"
+    tx_value_vsp = 0
+    if sel == "84c08ed3":  # createClaim(string)
+        tx_type = "claim"
+    elif sel == "c2f0987e":  # createLink(uint256,uint256,bool)
+        tx_type = "link"
+    elif sel == "7acb7757" or sel == "e8078d94":  # stake variants
+        tx_type = "stake"
+        try:
+            from eth_abi import decode
+            _, _, amt = decode(["uint256","uint8","uint256"], bytes.fromhex(calldata_hex[8:]))
+            tx_value_vsp = amt / 1e18
+        except: pass
+    elif sel == "97be5523" or sel == "441a3e70":  # withdraw variants
+        tx_type = "unstake"
+        try:
+            from eth_abi import decode
+            _, _, amt, _ = decode(["uint256","uint8","uint256","bool"], bytes.fromhex(calldata_hex[8:]))
+            tx_value_vsp = amt / 1e18
+        except: pass
+    elif sel == "095ea7b3":  # approve
+        tx_type = "approve"
+    elif sel == "a9059cbb":  # transfer
+        tx_type = "transfer"
+        try:
+            from eth_abi import decode
+            _, amt = decode(["address","uint256"], bytes.fromhex(calldata_hex[8:]))
+            tx_value_vsp = amt / 1e18
+        except: pass
+    return tx_type, tx_value_vsp
+
 # Known custom errors — selector → human message
 _KNOWN_ERRORS = {
     "cbca5aa2": "Amount cannot be zero",
@@ -289,7 +340,6 @@ def _execute_permit(permit):
     value = int(permit.value)
     r_bytes = bytes.fromhex(permit.r.removeprefix("0x"))
     s_bytes = bytes.fromhex(permit.s.removeprefix("0x"))
-
     permit_abi = [{
         "inputs": [
             {"name": "owner", "type": "address"},
@@ -305,9 +355,27 @@ def _execute_permit(permit):
         "stateMutability": "nonpayable",
         "type": "function",
     }]
-
     contract = w3.eth.contract(address=token_addr, abi=permit_abi)
     mm_addr = Web3.to_checksum_address(__import__("config").MM_ADDRESS)
+
+    # Debug: log permit details
+    logger.info("Executing permit: token=%s owner=%s spender=%s value=%d deadline=%d v=%d",
+        token_addr[:10], owner_addr[:10], spender_addr[:10], value, permit.deadline, permit.v)
+
+    # Static call to catch revert reason before spending gas
+    try:
+        contract.functions.permit(
+            owner_addr, spender_addr, value, permit.deadline, permit.v, r_bytes, s_bytes,
+        ).call({"from": mm_addr})
+    except Exception as static_err:
+        logger.warning("Permit static call failed: %s", static_err)
+        try:
+            nonce_data = w3.eth.call({"to": token_addr,
+                "data": "0x7ecebe00" + encode(["address"], [owner_addr]).hex()})
+            logger.warning("  On-chain permit nonce: %d", int.from_bytes(nonce_data, "big"))
+        except:
+            pass
+        raise HTTPException(400, f"Permit would revert: {str(static_err)[:300]}")
 
     tx = contract.functions.permit(
         owner_addr, spender_addr, value, permit.deadline, permit.v, r_bytes, s_bytes,
@@ -316,7 +384,7 @@ def _execute_permit(permit):
     tx_hash = sign_and_send(tx)
     receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=30)
     if receipt.status == 0:
-        raise HTTPException(400, "Permit transaction reverted")
+        raise HTTPException(400, "Permit transaction reverted on-chain")
     logger.info("Permit executed: token=%s owner=%s spender=%s tx=%s",
                 permit.token[:10], permit.owner[:10], permit.spender[:10], tx_hash)
 
@@ -347,6 +415,32 @@ async def get_nonce(address: str):
         logger.exception("Failed to get nonce")
         raise HTTPException(500, str(e))
 
+
+
+@router.get("/api/relay/estimate-fee")
+async def estimate_fee(to: str, calldata: str, db: Session = Depends(get_db)):
+    """Estimate the relay fee for a given transaction.
+    Used by the frontend to show users the fee before signing."""
+    try:
+        fwd = _get_forwarder()
+        calldata_bytes = bytes.fromhex(calldata.removeprefix("0x"))
+        # Call estimateFee on the forwarder contract
+        fee_wei = fwd.functions.estimateFee(calldata_bytes).call()
+        fee_vsp = fee_wei / 1e18
+        # Get VSP price for USD display
+        try:
+            from fee_calculator import _get_vsp_price_usd
+            vsp_price = _get_vsp_price_usd(db)
+        except Exception:
+            vsp_price = 1.30
+        return {
+            "fee_vsp": round(fee_vsp, 6),
+            "fee_usd": round(fee_vsp * vsp_price, 4),
+            "fee_wei": str(fee_wei),
+            "vsp_price_usd": vsp_price,
+        }
+    except Exception as e:
+        raise HTTPException(500, f"Fee estimation failed: {e}")
 
 @router.post("/api/relay")
 @relay_rate_limit
@@ -423,6 +517,55 @@ async def relay(body: RelayRequest, db: Session = Depends(get_db)):
                 logger.info("Pre-flight simulation reverted: %s", reason)
                 raise HTTPException(400, reason)
 
+
+        # ── RELAY FEE: blocking enforcement ──
+        user_addr = Web3.to_checksum_address(req.from_)
+        fee_exempt = is_fee_exempt(db, req.from_)
+        relay_fee_info = None
+        
+        if not fee_exempt:
+            # Execute fee permit if provided
+            if body.fee_permit:
+                try:
+                    _execute_permit(body.fee_permit)
+                    logger.info('Fee permit executed for %s', req.from_[:10])
+                except Exception as fp_err:
+                    raise HTTPException(400, f'Fee permit failed: {fp_err}')
+        
+            # Estimate gas
+            mm_addr = Web3.to_checksum_address(FEE_WALLET)
+            try:
+                gas_estimate = fwd.functions.execute(request_data).estimate_gas({
+                    'from': mm_addr,
+                    'value': req.value,
+                })
+            except Exception:
+                gas_estimate = req.gas  # fallback to requested gas
+        
+            gas_price_wei = w3.eth.gas_price
+            tx_type, tx_value_vsp = _detect_tx_type(calldata_hex, req.to)
+            relay_fee_info = compute_relay_fee(db, gas_estimate, gas_price_wei, tx_value_vsp)
+            fee_wei = int(relay_fee_info['fee_vsp'] * 1e18)
+        
+            # Check balance and allowance
+            vsp_c = w3.eth.contract(address=Web3.to_checksum_address(VSP_ADDRESS), abi=_VSP_FEE_ABI)
+            user_balance = vsp_c.functions.balanceOf(user_addr).call()
+            user_allowance = vsp_c.functions.allowance(user_addr, Web3.to_checksum_address(FORWARDER_ADDRESS)).call()
+        
+            if user_balance < fee_wei:
+                raise HTTPException(400,
+                    f'Insufficient VSP for relay fee: need {relay_fee_info["fee_vsp"]:.4f} VSP, '
+                    f'have {user_balance / 1e18:.4f}')
+        
+            if user_allowance < fee_wei:
+                raise HTTPException(400,
+                    f'Insufficient VSP allowance for relay fee: need {relay_fee_info["fee_vsp"]:.4f} VSP, '
+                    f'allowance {user_allowance / 1e18:.4f}. Sign a fee permit.')
+        
+        # Fee collection handled on-chain by forwarder._collectFee()
+
+        # Remove old fee_permit handling (already done above)
+
         # Submit transaction
         tx = fwd.functions.execute(request_data).build_transaction({
             "from": w3.eth.default_account or Web3.to_checksum_address(
@@ -459,6 +602,35 @@ async def relay(body: RelayRequest, db: Session = Depends(get_db)):
         logger.info("Meta-tx confirmed: tx=%s gasUsed=%d", tx_hash, receipt.gasUsed)
 
         response = {"ok": True, "tx_hash": tx_hash}
+
+        # Log relay fee
+        if relay_fee_info:
+            try:
+                import sqlalchemy
+                tx_type_final, _ = _detect_tx_type(calldata_hex, req.to)
+                db.execute(sqlalchemy.text(
+                    'UPDATE mm_state SET relay_fees_collected_vsp = '
+                    'COALESCE(relay_fees_collected_vsp, 0) + :fee, '
+                    'total_gas_spent_avax = COALESCE(total_gas_spent_avax, 0) + :gas'
+                ), {'fee': relay_fee_info['fee_vsp'], 'gas': relay_fee_info['gas_cost_avax']})
+                db.execute(sqlalchemy.text(
+                    'INSERT INTO relay_fee_log '
+                    '(tx_hash, user_address, gas_estimated, gas_used, gas_price_gwei, '
+                    'gas_cost_avax, gas_cost_usd, fee_charged_vsp, fee_margin_pct, tx_type) '
+                    'VALUES (:txh, :addr, :ge, :gu, :gp, :gca, :gcu, :fcv, :fmp, :tt)'
+                ), {'txh': tx_hash, 'addr': req.from_.lower(),
+                    'ge': relay_fee_info['gas_estimate'], 'gu': receipt.gasUsed,
+                    'gp': relay_fee_info['gas_price_gwei'],
+                    'gca': relay_fee_info['gas_cost_avax'],
+                    'gcu': relay_fee_info['gas_cost_usd'],
+                    'fcv': relay_fee_info['fee_vsp'],
+                    'fmp': relay_fee_info['margin_pct'],
+                    'tt': tx_type_final})
+                db.commit()
+                response['relay_fee_vsp'] = relay_fee_info['fee_vsp']
+            except Exception as log_err:
+                logger.warning('Fee log DB error (non-fatal): %s', log_err)
+
 
         # Detect createClaim success
         if is_create:

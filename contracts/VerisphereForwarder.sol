@@ -128,9 +128,8 @@ contract VerisphereForwarder is ERC2771Forwarder {
     }
 
     /// @dev Compute and collect the relay fee from the user.
-    ///      Non-reverting: if fee collection fails (insufficient balance/allowance),
-    ///      the meta-tx still proceeds. This ensures the forwarder remains usable
-    ///      even if the fee mechanism has issues.
+    ///      BLOCKING: reverts if user cannot pay. The forwarder is a paid
+    ///      convenience service. Users may call protocol contracts directly.
     function _collectFee(address user, bytes calldata innerData) internal {
         if (!feeEnabled || feeBps == 0) return;
 
@@ -138,13 +137,21 @@ contract VerisphereForwarder is ERC2771Forwarder {
         uint256 fee = (txValue * feeBps) / 10_000;
         if (fee < minFeeWei) fee = minFeeWei;
 
-        // Non-reverting transfer — fee failure should not block the user's tx
-        try vspToken.transferFrom(user, treasury, fee) {
-            emit FeeCollected(user, fee, txValue);
-        } catch {
-            // Fee collection failed — log but proceed.
-            // Common causes: insufficient allowance or balance.
-        }
+        require(
+            vspToken.transferFrom(user, treasury, fee),
+            "Relay fee: insufficient VSP balance or allowance"
+        );
+        emit FeeCollected(user, fee, txValue);
+    }
+
+    /// @notice Compute the fee that would be charged for given calldata.
+    ///         Used by the relay to show users the fee before signing.
+    function estimateFee(bytes calldata innerData) external view returns (uint256) {
+        if (!feeEnabled || feeBps == 0) return 0;
+        uint256 txValue = _extractTxValue(innerData);
+        uint256 fee = (txValue * feeBps) / 10_000;
+        if (fee < minFeeWei) fee = minFeeWei;
+        return fee;
     }
 
     // ── Execute override ─────────────────────────────────────

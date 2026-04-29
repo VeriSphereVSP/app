@@ -99,3 +99,94 @@ def get_fee_schedule(db: Session) -> dict:
         "create_claim": compute_fee(db, "create", 1),
     }
     return fp
+
+
+# ═══════════════════════════════════════════════════════════════
+# Relay fee: gas-based + percentage, with AVAX price oracle
+# ═══════════════════════════════════════════════════════════════
+
+_avax_cache = {"price": None, "ts": 0}
+
+def _get_avax_price_usd() -> float:
+    """Current AVAX price in USD. Cached 60s. Falls back to config."""
+    import time as _time
+    from config import AVAX_PRICE_USD
+    now = _time.time()
+    if _avax_cache["price"] and now - _avax_cache["ts"] < 60:
+        return _avax_cache["price"]
+    try:
+        import requests as _req
+        r = _req.get(
+            "https://api.coingecko.com/api/v3/simple/price"
+            "?ids=avalanche-2&vs_currencies=usd", timeout=3)
+        if r.ok:
+            price = r.json().get("avalanche-2", {}).get("usd")
+            if price and price > 0:
+                _avax_cache["price"] = price
+                _avax_cache["ts"] = now
+                return price
+    except Exception:
+        pass
+    return AVAX_PRICE_USD
+
+
+def _get_vsp_price_usd(db: Session) -> float:
+    """Current VSP price from MM reserves/circulating."""
+    try:
+        row = db.execute(sql_text(
+            "SELECT usdc_reserves, vsp_circulating FROM mm_state LIMIT 1"
+        )).fetchone()
+        if row and row[1] and row[1] > 0 and row[0]:
+            return row[0] / row[1]
+    except Exception:
+        pass
+    return 1.30
+
+
+def compute_relay_fee(db: Session, gas_estimate: int, gas_price_wei: int,
+                      tx_value_vsp: float = 0) -> dict:
+    """
+    Compute relay fee based on estimated gas + percentage of txn value.
+
+    fee = max(
+        gas_cost_in_vsp * (1 + margin),
+        min_fee_vsp,
+        tx_value_vsp * txn_pct
+    )
+    """
+    from config import RELAY_FEE_MARGIN_PCT, RELAY_FEE_MIN_VSP, RELAY_FEE_TXN_PCT
+
+    avax_price = _get_avax_price_usd()
+    vsp_price = _get_vsp_price_usd(db)
+
+    gas_cost_avax = (gas_estimate * gas_price_wei) / 1e18
+    gas_cost_usd = gas_cost_avax * avax_price
+    gas_cost_vsp = gas_cost_usd / max(vsp_price, 0.01)
+
+    gas_fee = gas_cost_vsp * (1 + RELAY_FEE_MARGIN_PCT)
+    pct_fee = tx_value_vsp * RELAY_FEE_TXN_PCT
+    fee_vsp = max(gas_fee, RELAY_FEE_MIN_VSP, pct_fee)
+    fee_usd = fee_vsp * vsp_price
+
+    return {
+        "fee_vsp": round(fee_vsp, 6),
+        "fee_usd": round(fee_usd, 4),
+        "gas_estimate": gas_estimate,
+        "gas_price_gwei": round(gas_price_wei / 1e9, 2),
+        "gas_cost_avax": round(gas_cost_avax, 8),
+        "gas_cost_usd": round(gas_cost_usd, 4),
+        "avax_price_usd": avax_price,
+        "vsp_price_usd": vsp_price,
+        "margin_pct": RELAY_FEE_MARGIN_PCT,
+    }
+
+
+def is_fee_exempt(db: Session, address: str) -> bool:
+    """Check if address is on the fee-exempt allow-list."""
+    try:
+        row = db.execute(sql_text(
+            "SELECT 1 FROM fee_exempt_addresses WHERE address = :addr"
+        ), {"addr": address.lower()}).fetchone()
+        return row is not None
+    except Exception:
+        return False

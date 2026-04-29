@@ -49,9 +49,12 @@ if not FORWARDER_ADDRESS:
 USDC_ADDRESS = os.getenv("USDC_ADDRESS", "0x5425890298aed601595a70ab815c96711a31bc65")
 VSP_ADDRESS = VSP_TOKEN_ADDRESS
 
-# Market maker wallet
+# Market maker wallet (reserves — backs outstanding VSP)
 MM_ADDRESS = os.getenv("MM_ADDRESS", "0x744a16c4Fe6B618E29D5Cb05C5a9cBa72175e60a")
 MM_PRIVATE_KEY = os.getenv("MM_PRIVATE_KEY", "")
+
+# Treasury wallet (revenue — receives trade fees + relay fees)
+TREASURY_ADDRESS = os.getenv("TREASURY_ADDRESS", MM_ADDRESS)  # fallback to MM if not set
 
 # Database
 DB_USER = os.getenv("DB_USER", "verisphere")
@@ -85,5 +88,8 @@ print(f"  RPC_URL: {RPC_URL[:50]}...")
 print(f"  DB: {_db_url_safe}")
 
 
-# Relay fee: small VSP fee deducted per meta-tx, sent to MM wallet
-RELAY_FEE_PCT = float(os.getenv("RELAY_FEE_PCT", "0.001"))  # 0.1% of transaction value
+# Relay fee configuration
+RELAY_FEE_MARGIN_PCT = float(os.getenv("RELAY_FEE_MARGIN_PCT", "0.30"))  # 30% margin on gas cost
+RELAY_FEE_MIN_VSP = float(os.getenv("RELAY_FEE_MIN_VSP", "0.1"))  # Minimum relay fee
+RELAY_FEE_TXN_PCT = float(os.getenv("RELAY_FEE_TXN_PCT", "0.01"))  # 1% of txn value
+AVAX_PRICE_USD = float(os.getenv("AVAX_PRICE_USD", "20.0"))  # Fallback AVAX price

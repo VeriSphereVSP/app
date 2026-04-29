@@ -16,7 +16,7 @@ from sqlalchemy import text
 from db import get_db
 from fee_calculator import compute_fee as calc_fee
 from mm.erc20 import allowance, transfer, transfer_from
-from config import USDC_ADDRESS, VSP_ADDRESS, MM_ADDRESS
+from config import USDC_ADDRESS, VSP_ADDRESS, MM_ADDRESS, TREASURY_ADDRESS
 from mm.mm_pricing import (
     get_spot_quote,
     compute_buy_fill,
@@ -309,12 +309,12 @@ def preview_buy(qty_vsp: float = None, usdc_amount: float = None, db: Session = 
         fill1 = compute_buy_fill(net_vsp, 1.0, usdc_reserves, vsp_circulating, unit_au, half_spread)
         price = fill1.avg_price_usd
         qty_est = usdc_amount / price
-        for _ in range(5):
+        for _ in range(10):
             fill = compute_buy_fill(net_vsp, qty_est, usdc_reserves, vsp_circulating, unit_au, half_spread)
             fee = calc_fee(db, "buy", qty_est)
             fee_usdc = fee["fee_vsp"] * fill.avg_price_usd
             total = fill.total_usd + fee_usdc
-            if abs(total - usdc_amount) < 0.01:
+            if abs(total - usdc_amount) < 0.001:
                 break
             qty_est *= usdc_amount / total
             qty_est = max(qty_est, 0.001)
@@ -389,10 +389,16 @@ def mm_buy(req: MMTradeRequest, db: Session = Depends(get_db)):
             fee_info = calc_fee(db, "buy", req.qty_vsp)
             fee_usdc = fee_info["fee_vsp"] * fill.avg_price_usd
             total_usdc_with_fee = fill.total_usd + fee_usdc
-            usdc_micro = int(total_usdc_with_fee * 1_000_000)
+            # Split: reserves to MM, fee to treasury
+            reserves_micro = int(fill.total_usd * 1_000_000)
+            fee_micro = int(fee_usdc * 1_000_000)
 
             # Execute on-chain transfers
-            transfer_from(USDC_ADDRESS, req.user_address, MM_ADDRESS, usdc_micro)
+            transfer_from(USDC_ADDRESS, req.user_address, MM_ADDRESS, reserves_micro)
+            if fee_micro > 0 and TREASURY_ADDRESS.lower() != MM_ADDRESS.lower():
+                transfer_from(USDC_ADDRESS, req.user_address, TREASURY_ADDRESS, fee_micro)
+            elif fee_micro > 0:
+                transfer_from(USDC_ADDRESS, req.user_address, MM_ADDRESS, fee_micro)
             transfer(VSP_ADDRESS, req.user_address, int(req.qty_vsp * 10**18))
 
             new_net = fill.new_net_vsp
@@ -405,6 +411,23 @@ def mm_buy(req: MMTradeRequest, db: Session = Depends(get_db)):
                        avg_price_usd=fill.avg_price_usd, net_vsp_before=net_vsp,
                        net_vsp_after=new_net, usdc_reserves_after=new_reserves,
                        vsp_circulating_after=new_circ)
+
+            # Track trade fee separately from reserves
+            try:
+                db.execute(sql_text(
+                    "UPDATE mm_state SET fees_collected_usdc = "
+                    "COALESCE(fees_collected_usdc, 0) + :fee"
+                ), {"fee": fee_usdc})
+            except Exception:
+                pass
+
+            try:
+                db.execute(sql_text(
+                    "UPDATE mm_state SET fees_collected_usdc = "
+                    "COALESCE(fees_collected_usdc, 0) + :fee"
+                ), {"fee": fee_usdc})
+            except Exception:
+                pass
 
         return {"ok": True, "qty_vsp": req.qty_vsp,
                 "fee_vsp": fee_info["fee_vsp"],
@@ -469,12 +492,33 @@ def mm_sell(req: MMTradeRequest, db: Session = Depends(get_db)):
             transfer_from(VSP_ADDRESS, req.user_address, MM_ADDRESS, vsp_wei)
             usdc_micro = int(net_usdc * 1_000_000)
             transfer(USDC_ADDRESS, req.user_address, usdc_micro)
+            # Send fee to treasury
+            fee_micro = int(fee_usdc * 1_000_000)
+            if fee_micro > 0 and TREASURY_ADDRESS.lower() != MM_ADDRESS.lower():
+                transfer(USDC_ADDRESS, TREASURY_ADDRESS, fee_micro)
 
             new_net = fill.new_net_vsp
             new_reserves = usdc_reserves - fill.total_usd
             new_circ = vsp_circulating - req.qty_vsp
 
             _update_mm_state(db, new_net, new_reserves, new_circ)
+            # Track trade fee separately
+            try:
+                db.execute(sql_text(
+                    "UPDATE mm_state SET fees_collected_usdc = "
+                    "COALESCE(fees_collected_usdc, 0) + :fee"
+                ), {"fee": fee_usdc})
+            except Exception:
+                pass
+
+            try:
+                db.execute(sql_text(
+                    "UPDATE mm_state SET fees_collected_usdc = "
+                    "COALESCE(fees_collected_usdc, 0) + :fee"
+                ), {"fee": fee_usdc})
+            except Exception:
+                pass
+
             _log_trade(db, side="sell", user_address=req.user_address,
                        qty_vsp=req.qty_vsp, total_usdc=fill.total_usd,
                        avg_price_usd=fill.avg_price_usd, net_vsp_before=net_vsp,
@@ -494,3 +538,66 @@ def mm_sell(req: MMTradeRequest, db: Session = Depends(get_db)):
         print(f"MM sell error: {e}")
         print(traceback.format_exc())
         raise HTTPException(500, f"Failed to sell VSP: {e}")
+
+
+
+class TransferRequest(BaseModel):
+    from_address: str
+    to_address: str
+    amount_vsp: float
+    permit: PermitFields
+
+@router.post("/transfer")
+def mm_transfer(req: TransferRequest, db: Session = Depends(get_db)):
+    """Transfer VSP between wallets. MM executes the transfer using a permit.
+    This avoids routing through the forwarder (VSPToken doesn't trust it)."""
+    from web3 import Web3
+    from_addr = Web3.to_checksum_address(req.from_address)
+    to_addr = Web3.to_checksum_address(req.to_address)
+    amount_wei = int(req.amount_vsp * 10**18)
+
+    # Execute the permit (grants MM allowance to transferFrom)
+    if req.permit:
+        _execute_permit(
+            VSP_ADDRESS, from_addr, MM_ADDRESS,
+            req.permit.value, req.permit.deadline,
+            req.permit.v, req.permit.r, req.permit.s,
+        )
+
+    # Check allowance
+    if allowance(VSP_ADDRESS, from_addr, MM_ADDRESS) < amount_wei:
+        raise HTTPException(400, "VSP allowance too low for transfer")
+
+    # MM does transferFrom(sender, MM) then transfer(MM, recipient)
+    transfer_from(VSP_ADDRESS, from_addr, MM_ADDRESS, amount_wei)
+    transfer(VSP_ADDRESS, to_addr, amount_wei)
+
+    return {"ok": True, "from": from_addr, "to": to_addr, "amount_vsp": req.amount_vsp}
+
+@router.get("/fee-summary")
+def fee_summary(db: Session = Depends(get_db)):
+    """All collected fees, gas costs, and 24h activity."""
+    row = db.execute(sql_text(
+        "SELECT fees_collected_usdc, fees_collected_vsp, "
+        "relay_fees_collected_vsp, total_gas_spent_avax "
+        "FROM mm_state LIMIT 1"
+    )).fetchone()
+
+    recent = db.execute(sql_text(
+        "SELECT COUNT(*), COALESCE(SUM(fee_charged_vsp), 0), "
+        "COALESCE(SUM(gas_cost_avax), 0), COALESCE(AVG(gas_cost_usd), 0) "
+        "FROM relay_fee_log WHERE created_at > NOW() - INTERVAL '24 hours'"
+    )).fetchone()
+
+    return {
+        "trade_fees_usdc": round((row[0] or 0) if row else 0, 4),
+        "trade_fees_vsp": round((row[1] or 0) if row else 0, 4),
+        "relay_fees_vsp": round((row[2] or 0) if row else 0, 4),
+        "total_gas_avax": round((row[3] or 0) if row else 0, 6),
+        "last_24h": {
+            "relay_count": recent[0] if recent else 0,
+            "relay_fees_vsp": round(recent[1], 4) if recent else 0,
+            "gas_spent_avax": round(recent[2], 6) if recent else 0,
+            "avg_gas_usd": round(recent[3], 4) if recent else 0,
+        }
+    }
