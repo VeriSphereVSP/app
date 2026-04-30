@@ -161,7 +161,7 @@ def mm_floor(db: Session = Depends(get_db)):
     try:
         row = _load_mm_state(db)
         net_vsp, unit_au, half_spread, usdc_reserves, vsp_circulating = row
-        floor = get_floor_price(usdc_reserves, vsp_circulating)
+        floor = get_floor_price(usdc_reserves, vsp_circulating, unit_au=unit_au, net_vsp=net_vsp, half_spread=half_spread)
         return {
             "floor_price_usd": round(floor, 8),
             "usdc_reserves": round(usdc_reserves, 2),
@@ -540,6 +540,34 @@ def mm_sell(req: MMTradeRequest, db: Session = Depends(get_db)):
         raise HTTPException(500, f"Failed to sell VSP: {e}")
 
 
+
+
+class ExecutePermitRequest(BaseModel):
+    token: str
+    owner: str
+    spender: str
+    value: str  # String to handle large ints
+    deadline: int
+    v: int
+    r: str
+    s: str
+
+@router.post("/execute-permit")
+def mm_execute_permit(req: ExecutePermitRequest, db: Session = Depends(get_db)):
+    """Execute an ERC-2612 permit. MM wallet pays gas.
+    Used by batch tool to set VSPToken allowances without going through the relay."""
+    from web3 import Web3
+    _execute_permit(
+        req.token,
+        Web3.to_checksum_address(req.owner),
+        Web3.to_checksum_address(req.spender),
+        int(req.value),
+        req.deadline,
+        req.v,
+        req.r,
+        req.s,
+    )
+    return {"ok": True, "owner": req.owner, "spender": req.spender}
 
 class TransferRequest(BaseModel):
     from_address: str

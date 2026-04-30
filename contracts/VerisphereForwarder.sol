@@ -4,11 +4,6 @@
 // This contract is a COMMERCIAL SERVICE COMPONENT operated by Verisphere Ltd.
 // It is NOT part of the VeriSphere open-source protocol (verisphere/core).
 //
-// The VeriSphere protocol is permissionless. Users may interact with protocol
-// contracts (PostRegistry, StakeEngine, etc.) directly without this forwarder.
-// This forwarder provides gasless meta-transactions as a convenience service
-// and charges a percentage-based VSP fee for that service.
-//
 // License: Business Source License 1.1 (BUSL-1.1)
 // Change Date: 2028-01-01
 // Change License: MIT
@@ -17,32 +12,25 @@ pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/metatx/ERC2771Forwarder.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/proxy/utils/UUPSUpgradeable.sol";
 
-/// @title VerisphereForwarder
+/// @title VerisphereForwarder (Upgradeable)
 /// @notice Trusted forwarder for gasless meta-transactions (ERC-2771) with
-///         a percentage-based VSP relay fee.
+///         a percentage-based VSP relay fee. Deployed behind an ERC1967 proxy.
 ///
-///         Fee model:
-///           - The relay inspects the forwarded calldata to determine the
-///             economic value of the transaction (stake amount, posting fee, etc.)
-///           - A percentage (feeBps, in basis points) is charged in VSP
-///           - Fee is transferred from the user to the treasury address
-///           - Fee collection requires the user to have approved this forwarder
-///             for VSP spending (done via EIP-2612 permit in the relay flow)
-///
-///         This contract is operated by Verisphere Ltd. The protocol does not
-///         require it. Users may call protocol contracts directly with their
-///         own wallet and pay zero relay fee.
-contract VerisphereForwarder is ERC2771Forwarder {
+///         The protocol does not require this forwarder. Users may call
+///         protocol contracts directly with their own wallet and gas.
+contract VerisphereForwarder is ERC2771Forwarder, UUPSUpgradeable {
 
-    // ── State ────────────────────────────────────────────────
+    // ── State (stored in proxy) ──────────────────────────────
 
-    IERC20 public immutable vspToken;
+    IERC20 public vspToken;
     address public treasury;
     address public owner;
-    uint256 public feeBps;          // Fee in basis points (50 = 0.5%)
-    uint256 public minFeeWei;       // Minimum fee per tx (e.g. 0.001 VSP)
+    uint256 public feeBps;
+    uint256 public minFeeWei;
     bool public feeEnabled;
+    bool private _initialized;
 
     // Known function selectors for value extraction
     bytes4 private constant SEL_CREATE_CLAIM = bytes4(keccak256("createClaim(string)"));
@@ -61,27 +49,43 @@ contract VerisphereForwarder is ERC2771Forwarder {
 
     error NotOwner();
     error ZeroAddress();
+    error AlreadyInitialized();
 
-    // ── Constructor ──────────────────────────────────────────
+    // ── Constructor (implementation only) ────────────────────
 
-    /// @param vspToken_   The VSP token contract address.
-    /// @param treasury_   Address that receives relay fees.
-    /// @param feeBps_     Fee in basis points (e.g. 50 = 0.5%).
-    /// @param minFeeWei_  Minimum fee in VSP wei (e.g. 1e15 = 0.001 VSP).
-    constructor(
+    /// @dev Constructor sets up EIP-712 domain for the implementation.
+    ///      When called via proxy, EIP712._domainSeparatorV4() detects the
+    ///      address mismatch and recomputes using the proxy address.
+    constructor() ERC2771Forwarder("VerisphereForwarder") {}
+
+    // ── Initializer (called once on proxy) ───────────────────
+
+    /// @notice Initialize the proxy with forwarder configuration.
+    ///         Called once during proxy deployment via ERC1967Proxy constructor.
+    function initialize(
         address vspToken_,
         address treasury_,
+        address owner_,
         uint256 feeBps_,
         uint256 minFeeWei_
-    ) ERC2771Forwarder("VerisphereForwarder") {
+    ) external {
+        if (_initialized) revert AlreadyInitialized();
         if (vspToken_ == address(0)) revert ZeroAddress();
         if (treasury_ == address(0)) revert ZeroAddress();
+        if (owner_ == address(0)) revert ZeroAddress();
+        _initialized = true;
         vspToken = IERC20(vspToken_);
         treasury = treasury_;
-        owner = msg.sender;
+        owner = owner_;
         feeBps = feeBps_;
         minFeeWei = minFeeWei_;
         feeEnabled = true;
+    }
+
+    // ── UUPS authorization ───────────────────────────────────
+
+    function _authorizeUpgrade(address) internal view override {
+        if (msg.sender != owner) revert NotOwner();
     }
 
     // ── Modifiers ────────────────────────────────────────────
@@ -93,43 +97,28 @@ contract VerisphereForwarder is ERC2771Forwarder {
 
     // ── Fee extraction ───────────────────────────────────────
 
-    /// @dev Extract the economic value (in VSP wei) from the forwarded calldata.
-    ///      Returns 0 if the operation type is unknown (fee will be minFeeWei).
     function _extractTxValue(bytes calldata data) internal pure returns (uint256) {
         if (data.length < 4) return 0;
         bytes4 sel = bytes4(data[:4]);
 
         if (sel == SEL_CREATE_CLAIM || sel == SEL_CREATE_LINK) {
-            // Posting fee is 1 VSP (1e18). The actual fee is set by the
-            // PostingFeePolicy contract, but 1e18 is the deployed default.
-            // If the policy changes, update this or read it on-chain.
             return 1e18;
         }
-
         if (sel == SEL_STAKE) {
-            // stake(uint256 postId, uint8 side, uint256 amount)
-            // amount is the 3rd parameter, starting at byte 4 + 64 = 68
             if (data.length >= 100) {
                 return uint256(bytes32(data[68:100]));
             }
             return 0;
         }
-
         if (sel == SEL_WITHDRAW) {
-            // withdraw(uint256 postId, uint8 side, uint256 amount, bool lifo)
-            // amount is the 3rd parameter, same offset
             if (data.length >= 100) {
                 return uint256(bytes32(data[68:100]));
             }
             return 0;
         }
-
         return 0;
     }
 
-    /// @dev Compute and collect the relay fee from the user.
-    ///      BLOCKING: reverts if user cannot pay. The forwarder is a paid
-    ///      convenience service. Users may call protocol contracts directly.
     function _collectFee(address user, bytes calldata innerData) internal {
         if (!feeEnabled || feeBps == 0) return;
 
@@ -144,8 +133,6 @@ contract VerisphereForwarder is ERC2771Forwarder {
         emit FeeCollected(user, fee, txValue);
     }
 
-    /// @notice Compute the fee that would be charged for given calldata.
-    ///         Used by the relay to show users the fee before signing.
     function estimateFee(bytes calldata innerData) external view returns (uint256) {
         if (!feeEnabled || feeBps == 0) return 0;
         uint256 txValue = _extractTxValue(innerData);
@@ -156,17 +143,10 @@ contract VerisphereForwarder is ERC2771Forwarder {
 
     // ── Execute override ─────────────────────────────────────
 
-    /// @notice Execute a meta-transaction, collecting a relay fee first.
-    /// @dev Overrides OZ ERC2771Forwarder.execute. The ForwardRequestData struct
-    ///      is defined in ERC2771Forwarder and contains:
-    ///        from, to, value, gas, deadline, data, signature
     function execute(
         ForwardRequestData calldata request
     ) public payable override {
-        // Collect fee from the user before forwarding
         _collectFee(request.from, request.data);
-
-        // Delegate to OZ implementation (signature verification + forwarding)
         super.execute(request);
     }
 

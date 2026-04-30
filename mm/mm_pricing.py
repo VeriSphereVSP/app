@@ -237,7 +237,10 @@ def get_spot_quote(
     buy = mid * (1 + half_spread)
     sell_p = mid * (1 - half_spread)
 
-    floor = usdc_reserves / vsp_circulating if vsp_circulating > 0 else 0.0
+    # Floor: bonding curve price at n=0
+    # Floor: min(reserves/outstanding, sell_price)
+    reserve_floor = usdc_reserves / vsp_circulating if vsp_circulating > 0 else 0.0
+    floor = min(reserve_floor, sell_p)
 
     return MMQuote(
         mid_price_usd=mid,
@@ -316,11 +319,22 @@ def compute_sell_fill(
 def get_floor_price(
     usdc_reserves: float,
     vsp_circulating: float,
+    unit_au: float = None,
+    gold_usd: float = None,
+    net_vsp: float = 0,
+    half_spread: float = None,
 ) -> float:
     """
-    Public liquidation floor: reserves / circulating supply.
-    This is the ONLY pricing information that is publicly documented.
+    Liquidation floor: min(reserves/outstanding, current_sell_price).
+    The worst-case price a holder can expect.
     """
-    if vsp_circulating <= 0:
-        return 0.0
-    return usdc_reserves / vsp_circulating
+    if unit_au is None:
+        unit_au = DEFAULT_UNIT_AU
+    if half_spread is None:
+        half_spread = DEFAULT_HALF_SPREAD
+    if gold_usd is None:
+        from mm.oracle import get_gold_price_usd_per_oz
+        gold_usd = get_gold_price_usd_per_oz()
+    reserve_floor = usdc_reserves / vsp_circulating if vsp_circulating > 0 else 0.0
+    sell_price = _base_price(net_vsp, gold_usd, unit_au) * (1 - half_spread)
+    return min(reserve_floor, sell_price)
