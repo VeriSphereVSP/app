@@ -454,8 +454,18 @@ def poll_events(db: Session):
                                     "UPDATE claim SET topic = :t WHERE post_id = :pid AND topic IS NULL"
                                 ), {"t": _topic, "pid": pid})
                                 db.commit()
-                                ensure_article_for_claim(db, _ct[0], pid, _topic)
-                                logger.info("Auto-topic (indexer): post_id=%d → '%s'", pid, _topic)
+                                # Run article generation in background thread
+                                import threading
+                                def _bg_article(claim_text, post_id, topic):
+                                    try:
+                                        from db import SessionLocal
+                                        with SessionLocal() as bg_db:
+                                            ensure_article_for_claim(bg_db, claim_text, post_id, topic)
+                                            logger.info("Auto-topic (bg): post_id=%d → '%s'", post_id, topic)
+                                    except Exception as e:
+                                        logger.debug("BG article gen failed: %s", e)
+                                threading.Thread(target=_bg_article, args=(_ct[0], pid, _topic), daemon=True).start()
+                                logger.info("Auto-topic (indexer): post_id=%d → '%s' (article gen in background)", pid, _topic)
                 except Exception as _te:
                     logger.debug("Auto-topic (indexer) post %d: %s", pid, _te)
         except Exception as e:

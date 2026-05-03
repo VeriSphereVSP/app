@@ -31,11 +31,9 @@ from rate_limit import RateLimitMiddleware, cleanup_rate_limiter
 
 @asynccontextmanager
 async def lifespan(app):
-    from chain.indexer import run_indexer
-    from chain_indexer import start_indexer
-    indexer_task = asyncio.create_task(run_indexer())
-    start_indexer()
-    print("Blockchain event indexer started")
+    # Background tasks (indexer, article refresh, dupe groups) run in
+    # the separate worker service — see worker.py and docker-compose.yml.
+    print("API server started (background tasks run in worker service)")
     # Periodic rate limiter cleanup
     import asyncio as _aio
     async def _rl_cleanup():
@@ -44,23 +42,7 @@ async def lifespan(app):
             cleanup_rate_limiter()
     _aio.create_task(_rl_cleanup())
 
-    # PD-04: Periodic dupe group refresh (every 5 minutes)
-    async def _dupe_refresh():
-        import asyncio
-        await asyncio.sleep(180)  # Initial delay
-        while True:
-            try:
-                from db import get_session_factory
-                from dupe_groups import refresh_all_groups
-                sess = get_session_factory()()
-                try:
-                    refresh_all_groups(sess)
-                finally:
-                    sess.close()
-            except Exception as e:
-                print(f"Dupe group refresh error: {e}")
-            await asyncio.sleep(300)
-    _aio.create_task(_dupe_refresh())
+    # Dupe refresh runs in worker service
 
     # Background article refresh — autotunes interval to spread load over 24h
     async def _daily_refresh():
@@ -126,12 +108,7 @@ async def lifespan(app):
     _aio.create_task(_daily_refresh())
 
     yield
-    indexer_task.cancel()
-    try:
-        await indexer_task
-    except asyncio.CancelledError:
-        pass
-    print("Blockchain event indexer stopped")
+    print("API server stopped")
 
 
 from chain_indexer import start_indexer

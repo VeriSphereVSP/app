@@ -445,10 +445,17 @@ async def estimate_fee(to: str, calldata: str, db: Session = Depends(get_db)):
 @router.post("/api/relay")
 @relay_rate_limit
 async def relay(body: RelayRequest, db: Session = Depends(get_db)):
+    """Relay meta-transaction. Runs blocking RPC/chain calls in a thread pool."""
+    import asyncio
+    return await asyncio.to_thread(_relay_sync, body, db)
+
+def _relay_sync(body: RelayRequest, db: Session):
     try:
         fwd = _get_forwarder()
         req = body.request
         print(f"RELAY DEBUG: req.gas={req.gas} req.to={req.to[:10]}")
+        import time as _t; _relay_t0 = _t.time()
+        print(f"TIMING: relay start", flush=True)
         sig_bytes = bytes.fromhex(body.signature.removeprefix("0x"))
         calldata_hex = req.data.removeprefix("0x")
 
@@ -479,7 +486,9 @@ async def relay(body: RelayRequest, db: Session = Depends(get_db)):
 
         # Verify signature
         try:
+            print(f"TIMING: verify start {_t.time()-_relay_t0:.1f}s", flush=True)
             is_valid = fwd.functions.verify(request_data).call()
+            print(f"TIMING: verify done {_t.time()-_relay_t0:.1f}s valid={is_valid}", flush=True)
             if not is_valid:
                 raise HTTPException(400, "Invalid signature")
         except HTTPException:
@@ -535,6 +544,7 @@ async def relay(body: RelayRequest, db: Session = Depends(get_db)):
             # Estimate gas
             mm_addr = Web3.to_checksum_address(FEE_WALLET)
             try:
+                print(f"TIMING: estimate_gas start {_t.time()-_relay_t0:.1f}s", flush=True)
                 gas_estimate = fwd.functions.execute(request_data).estimate_gas({
                     'from': mm_addr,
                     'value': req.value,
@@ -549,6 +559,7 @@ async def relay(body: RelayRequest, db: Session = Depends(get_db)):
         
             # Check balance and allowance
             vsp_c = w3.eth.contract(address=Web3.to_checksum_address(VSP_ADDRESS), abi=_VSP_FEE_ABI)
+            print(f"TIMING: balance check start {_t.time()-_relay_t0:.1f}s", flush=True)
             user_balance = vsp_c.functions.balanceOf(user_addr).call()
             user_allowance = vsp_c.functions.allowance(user_addr, Web3.to_checksum_address(FORWARDER_ADDRESS)).call()
         
@@ -567,18 +578,19 @@ async def relay(body: RelayRequest, db: Session = Depends(get_db)):
         # Remove old fee_permit handling (already done above)
 
         # Submit transaction
+        print(f"TIMING: build_tx start {_t.time()-_relay_t0:.1f}s", flush=True)
         tx = fwd.functions.execute(request_data).build_transaction({
             "from": w3.eth.default_account or Web3.to_checksum_address(
                 __import__("config").MM_ADDRESS),
             "value": req.value,
             "gas": req.gas + 800_000,
         })
-        tx_hash = sign_and_send(tx)
+        print(f"TIMING: sign_and_send start {_t.time()-_relay_t0:.1f}s", flush=True); tx_hash = sign_and_send(tx); print(f"TIMING: sign_and_send done {_t.time()-_relay_t0:.1f}s", flush=True)
         logger.info("Submitted meta-tx: from=%s to=%s tx=%s", req.from_, req.to, tx_hash)
 
         # Wait for receipt
         try:
-            receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=RECEIPT_TIMEOUT)
+            print(f"TIMING: wait_receipt start {_t.time()-_relay_t0:.1f}s", flush=True); receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=RECEIPT_TIMEOUT); print(f"TIMING: wait_receipt done {_t.time()-_relay_t0:.1f}s", flush=True)
         except Exception as e:
             logger.warning("Receipt timeout: %s", e)
             raise HTTPException(500,
@@ -714,6 +726,7 @@ async def relay(body: RelayRequest, db: Session = Depends(get_db)):
 
         if is_stake:
             try:
+                print(f"TIMING: stake post-processing start {_t.time()-_relay_t0:.1f}s", flush=True)
                 data = bytes.fromhex(calldata_hex)
                 post_id = int.from_bytes(data[4:36], "big")
                 claim_state = _get_claim_state(post_id, req.from_)
@@ -729,24 +742,37 @@ async def relay(body: RelayRequest, db: Session = Depends(get_db)):
                     pass
                 # Re-index this post and connected posts so VS/stakes are fresh
                 try:
+                    print(f"TIMING: reindex start {_t.time()-_relay_t0:.1f}s", flush=True)
                     from chain_indexer import index_post, _reindex_connected, _queue_article_refresh
                     index_post(db, post_id)
                     _reindex_connected(db, post_id)
                     _queue_article_refresh(db, post_id)
                 except Exception as e2:
                     logger.debug("Post-stake reindex failed (non-fatal): %s", e2)
-                # APP-11: Rebuild article caches after stake change
+                print(f"TIMING: reindex done {_t.time()-_relay_t0:.1f}s", flush=True)
+                # APP-11: Rebuild article caches in background (don't block response)
                 try:
-                    from db import get_session_factory
-                    from articles.article_store import build_and_cache_response
                     _art_rows = db.execute(__import__("sqlalchemy").text(
                         "SELECT DISTINCT ta.topic_key FROM article_sentence s "
                         "JOIN article_section sec ON s.section_id = sec.section_id "
                         "JOIN topic_article ta ON sec.article_id = ta.article_id "
                         "WHERE s.post_id = :pid"
                     ), {"pid": post_id}).fetchall()
-                    for _ar in _art_rows:
-                        build_and_cache_response(get_session_factory(), _ar[0])
+                    topics_to_rebuild = [r[0] for r in _art_rows]
+                    if topics_to_rebuild:
+                        import threading
+                        def _bg_cache_rebuild(topics):
+                            try:
+                                from db import get_session_factory
+                                from articles.article_store import build_and_cache_response
+                                for t in topics:
+                                    try:
+                                        build_and_cache_response(get_session_factory(), t)
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                pass
+                        threading.Thread(target=_bg_cache_rebuild, args=(topics_to_rebuild,), daemon=True).start()
                 except Exception:
                     pass
             except Exception as e:
