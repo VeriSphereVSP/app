@@ -319,14 +319,68 @@ def refresh_article(db: Session, topic: str) -> bool:
         h = sec["heading"].lower().strip()
         existing_sections[h] = sec["section_id"]
 
+    # ── Batch-precompute existing-heading embeddings ONCE (patch06).
+    # The fuzzy-heading match below used to call embed(existing_h)
+    # inside a nested loop, re-embedding the same headings on every
+    # fresh section. Compute them once upfront.
+    _existing_heading_vecs = {}  # normalized heading -> vec
+    try:
+        from embedding import embed_batch as _eb
+        _heading_keys = list(existing_sections.keys())
+        if _heading_keys:
+            _heading_vec_list = _eb(_heading_keys)
+            _existing_heading_vecs = dict(zip(_heading_keys, _heading_vec_list))
+    except Exception as _he:
+        import logging as _lg
+        _lg.getLogger(__name__).debug("Existing-heading embed precompute failed: %s", _he)
+
+    # ── Batch-precompute fresh-sentence embeddings ONCE (patch06).
+    # Was: per-fresh-sentence embed() inside the nested loop. Now one
+    # batched call. Indexed by (fresh_sec_idx, fresh_sent_idx).
+    _fresh_sentence_vecs = {}  # (fs_idx, ss_idx) -> vec
+    try:
+        from embedding import embed_batch as _eb2
+        _fresh_keys = []
+        _fresh_texts = []
+        for _fs_idx, _fs in enumerate(fresh.get("sections", [])):
+            for _ss_idx, _stext in enumerate(_fs.get("sentences", [])):
+                _t = str(_stext).strip()
+                if _t:
+                    _fresh_keys.append((_fs_idx, _ss_idx))
+                    _fresh_texts.append(_t)
+        if _fresh_texts:
+            _fresh_vec_list = _eb2(_fresh_texts)
+            _fresh_sentence_vecs = dict(zip(_fresh_keys, _fresh_vec_list))
+    except Exception as _fe:
+        import logging as _lg
+        _lg.getLogger(__name__).debug("Fresh-sentence embed precompute failed: %s", _fe)
+
+    # ── Batch-precompute fresh-heading embeddings ONCE (patch06) ──
+    _fresh_heading_vecs = {}  # heading_key -> vec
+    try:
+        from embedding import embed_batch as _eb3
+        _fhk = []
+        _fht = []
+        for _fs in fresh.get("sections", []):
+            _hk = (_fs.get("heading") or "").lower().strip()
+            if _hk and _hk not in _fresh_heading_vecs and _hk not in _fhk:
+                _fhk.append(_hk)
+                _fht.append(_hk)
+        if _fht:
+            _fhv = _eb3(_fht)
+            _fresh_heading_vecs = dict(zip(_fhk, _fhv))
+    except Exception as _the:
+        import logging as _lg
+        _lg.getLogger(__name__).debug("Fresh-heading embed precompute failed: %s", _the)
+
     added = 0
 
-    for fresh_sec in fresh.get("sections", []):
+    for _fs_idx, fresh_sec in enumerate(fresh.get("sections", [])):
         heading = fresh_sec.get("heading", "")
         heading_key = heading.lower().strip()
         new_sents = []
 
-        for sent_text in fresh_sec.get("sentences", []):
+        for _ss_idx, sent_text in enumerate(fresh_sec.get("sentences", [])):
             text = str(sent_text).strip()
             if not text:
                 continue
@@ -337,12 +391,15 @@ def refresh_article(db: Session, topic: str) -> bool:
                 if norm == existing or norm in existing or existing in norm:
                     is_dup = True
                     break
-            # Semantic check if not caught by exact match
+            # Semantic check using precomputed vectors (patch06).
             if not is_dup and _refresh_embeddings:
                 try:
-                    from embedding import embed
                     from similarity import cosine_similarity
-                    new_vec = embed(text)
+                    new_vec = _fresh_sentence_vecs.get((_fs_idx, _ss_idx))
+                    if new_vec is None:
+                        # Fallback if precompute missed this entry.
+                        from embedding import embed
+                        new_vec = embed(text)
                     for evec in _refresh_embeddings:
                         if cosine_similarity(new_vec, evec) >= 0.80:
                             is_dup = True
@@ -360,14 +417,19 @@ def refresh_article(db: Session, topic: str) -> bool:
         if heading_key in existing_sections:
             matched_section = existing_sections[heading_key]
         else:
-            # Try fuzzy heading match before creating a new section
+            # Try fuzzy heading match using precomputed vectors (patch06).
             try:
-                from embedding import embed
                 from similarity import cosine_similarity
-                h_vec = embed(heading_key)
+                h_vec = _fresh_heading_vecs.get(heading_key)
+                if h_vec is None:
+                    from embedding import embed
+                    h_vec = embed(heading_key)
                 best_sim = 0.0
                 for existing_h, sec_id in existing_sections.items():
-                    e_vec = embed(existing_h)
+                    e_vec = _existing_heading_vecs.get(existing_h)
+                    if e_vec is None:
+                        from embedding import embed
+                        e_vec = embed(existing_h)
                     sim = cosine_similarity(h_vec, e_vec)
                     if sim > best_sim:
                         best_sim = sim
@@ -465,18 +527,98 @@ def _reassign_sentences_to_best_sections(db, article_id: int):
         from embedding import embed_batch, embed
         from similarity import cosine_similarity
 
-        # Embed all section headings
+        # ── Batch-embed all section headings in one call ──
         heading_map = {sec[0]: sec[1] for sec in sections}
-        heading_vecs = {}
-        for sec_id, heading in sections:
-            heading_vecs[sec_id] = embed(heading)
+        heading_ids = [sec[0] for sec in sections]
+        heading_texts = [sec[1] for sec in sections]
+        try:
+            heading_vec_list = embed_batch(heading_texts)
+            heading_vecs = {sid: v for sid, v in zip(heading_ids, heading_vec_list)}
+        except Exception as he:
+            _logger.warning(
+                "_reassign_sentences_to_best_sections: heading embed_batch failed (%s); "
+                "falling back to per-heading embed()", he,
+            )
+            heading_vecs = {sid: embed(h) for sid, h in zip(heading_ids, heading_texts)}
 
+        # ── Batch-embed all candidate sentences using the
+        #    article_sentence.embedding pgvector cache ──
+        # Helpers (duplicated for module-local scope; same as in
+        # build_and_cache_response and persist_dedup).
+        def _parse_pgvec(s):
+            if s is None:
+                return None
+            s = s.strip()
+            if not s.startswith("[") or not s.endswith("]"):
+                return None
+            try:
+                return [float(x) for x in s[1:-1].split(",")]
+            except (ValueError, TypeError):
+                return None
+
+        def _fmt_pgvec(v):
+            return "[" + ",".join(repr(float(x)) for x in v) + "]"
+
+        # Re-fetch including cached embeddings.
+        sent_rows = db.execute(sql_text(
+            "SELECT s.sentence_id, s.section_id, s.text, s.embedding::text "
+            "FROM article_sentence s "
+            "JOIN article_section sec ON s.section_id = sec.section_id "
+            "WHERE sec.article_id = :a AND s.is_hidden = FALSE"
+        ), {"a": article_id}).fetchall()
+
+        sent_vec_by_id = {}
+        missing = []
+        for sid, _csec, txt, emb_text in sent_rows:
+            if not txt or not str(txt).strip():
+                continue
+            parsed = _parse_pgvec(emb_text)
+            if parsed is not None:
+                sent_vec_by_id[int(sid)] = parsed
+            else:
+                missing.append((int(sid), str(txt)))
+
+        if missing:
+            try:
+                new_vecs = embed_batch([t for _, t in missing])
+                for (sid, _t), vec in zip(missing, new_vecs):
+                    sent_vec_by_id[sid] = vec
+                    try:
+                        db.execute(sql_text(
+                            "UPDATE article_sentence "
+                            "SET embedding = (:v)::vector "
+                            "WHERE sentence_id = :sid"
+                        ), {"v": _fmt_pgvec(vec), "sid": sid})
+                    except Exception as ue:
+                        _logger.warning(
+                            "_reassign_sentences_to_best_sections: failed to persist sentence embedding sid=%d: %s",
+                            sid, ue,
+                        )
+                        db.rollback()
+                try:
+                    db.commit()
+                except Exception:
+                    db.rollback()
+            except Exception as be:
+                _logger.warning(
+                    "_reassign_sentences_to_best_sections: sentence embed_batch failed (%s); "
+                    "falling back to per-sentence embed()", be,
+                )
+                for sid, t in missing:
+                    try:
+                        sent_vec_by_id[sid] = embed(t)
+                    except Exception:
+                        pass
+
+        # ── Compute reassignments ──
         moved = 0
+        moves = []  # list of (sentence_id, new_section_id)
         for sent_id, current_sec, text in sents:
             if not text or not text.strip():
                 continue
-            sent_vec = embed(text)
-            # Find best matching section
+            sent_vec = sent_vec_by_id.get(int(sent_id))
+            if sent_vec is None:
+                continue
             best_sec = current_sec
             best_sim = 0.0
             current_sim = 0.0
@@ -487,15 +629,34 @@ def _reassign_sentences_to_best_sections(db, article_id: int):
                 if sim > best_sim:
                     best_sim = sim
                     best_sec = sec_id
-            # Only move if significantly better match (> 0.05 improvement)
             if best_sec != current_sec and best_sim - current_sim > 0.05:
-                db.execute(sql_text(
-                    "UPDATE article_sentence SET section_id = :new_sec WHERE sentence_id = :sid"
-                ), {"new_sec": best_sec, "sid": sent_id})
+                moves.append((sent_id, best_sec))
                 moved += 1
-        if moved > 0:
-            db.commit()
-            _logger.info("Reassigned %d sentences to better sections in article %d", moved, article_id)
+
+        # ── Apply moves in batches grouped by destination section ──
+        if moves:
+            from collections import defaultdict
+            by_dest = defaultdict(list)
+            for sid, new_sec in moves:
+                by_dest[new_sec].append(sid)
+            for new_sec, sids in by_dest.items():
+                try:
+                    db.execute(sql_text(
+                        "UPDATE article_sentence "
+                        "SET section_id = :new_sec "
+                        "WHERE sentence_id = ANY(:ids)"
+                    ), {"new_sec": new_sec, "ids": sids})
+                except Exception as ue:
+                    _logger.warning(
+                        "_reassign_sentences_to_best_sections: batched move to section %d failed: %s",
+                        new_sec, ue,
+                    )
+                    db.rollback()
+            try:
+                db.commit()
+                _logger.info("Reassigned %d sentences to better sections in article %d", moved, article_id)
+            except Exception:
+                db.rollback()
     except Exception as e:
         _logger.debug("Section reassignment embedding failed: %s", e)
 
@@ -633,12 +794,148 @@ def build_and_cache_response(db_or_factory, topic_key: str):
                     })
 
         # ── Step 3: For each master, hide similar off-chain, ensure placed ──
+        #
+        # Performance: master_vec and sent_vec are computed ONCE in batched
+        # embed_batch() calls and reused across the master loop. Off-chain
+        # sentence embeddings are cached in article_sentence.embedding so
+        # subsequent rebuilds usually need zero embedding network calls.
+        # Mirrors the persist_dedup() caching pattern. See patch06.
         try:
-            from embedding import embed
+            from embedding import embed, embed_batch
             from similarity import cosine_similarity
         except ImportError:
             embed = None
+            embed_batch = None
             cosine_similarity = None
+
+        SIMILARITY_THRESHOLD = 0.80
+
+        # Helpers shared with persist_dedup() — pgvector text-format I/O.
+        def _parse_pgvec(s):
+            if s is None:
+                return None
+            s = s.strip()
+            if not s.startswith("[") or not s.endswith("]"):
+                return None
+            try:
+                return [float(x) for x in s[1:-1].split(",")]
+            except (ValueError, TypeError):
+                return None
+
+        def _fmt_pgvec(v):
+            return "[" + ",".join(repr(float(x)) for x in v) + "]"
+
+        # Build sentence_vec_by_id: { sentence_id: list[float] } for every
+        # off-chain sentence in this article. Reads cached embeddings;
+        # batches a single embed_batch() call for any that are missing.
+        sentence_vec_by_id = {}
+        if embed_batch and cosine_similarity:
+            try:
+                rows = db.execute(sql_text(
+                    "SELECT s.sentence_id, s.text, s.embedding::text "
+                    "FROM article_sentence s "
+                    "JOIN article_section sec ON s.section_id = sec.section_id "
+                    "WHERE sec.article_id = :a "
+                    "  AND s.post_id IS NULL "
+                    "  AND s.is_hidden = FALSE"
+                ), {"a": article_id}).fetchall()
+
+                cached = []
+                missing = []
+                for sid, txt, emb_text in rows:
+                    parsed = _parse_pgvec(emb_text)
+                    if parsed is not None:
+                        sentence_vec_by_id[int(sid)] = parsed
+                        cached.append(int(sid))
+                    else:
+                        missing.append((int(sid), str(txt)))
+
+                if missing:
+                    logger.info(
+                        "build_and_cache_response: embedding %d new off-chain sentence(s) for article %d (%d cached)",
+                        len(missing), article_id, len(cached),
+                    )
+                    try:
+                        new_vecs = embed_batch([t for _, t in missing])
+                        for (sid, _t), vec in zip(missing, new_vecs):
+                            sentence_vec_by_id[sid] = vec
+                            try:
+                                db.execute(sql_text(
+                                    "UPDATE article_sentence "
+                                    "SET embedding = (:v)::vector "
+                                    "WHERE sentence_id = :sid"
+                                ), {"v": _fmt_pgvec(vec), "sid": sid})
+                            except Exception as ue:
+                                logger.warning(
+                                    "build_and_cache_response: failed to persist sentence embedding sid=%d: %s",
+                                    sid, ue,
+                                )
+                                db.rollback()
+                        try:
+                            db.commit()
+                        except Exception as ce:
+                            logger.warning(
+                                "build_and_cache_response: commit of cached embeddings failed: %s", ce,
+                            )
+                            db.rollback()
+                    except Exception as be:
+                        # Fallback: per-sentence embed() if batched call failed.
+                        logger.warning(
+                            "build_and_cache_response: embed_batch failed (%s); falling back to per-sentence embed()",
+                            be,
+                        )
+                        if embed:
+                            for sid, t in missing:
+                                try:
+                                    sentence_vec_by_id[sid] = embed(t)
+                                except Exception:
+                                    pass
+            except Exception as e:
+                logger.debug(
+                    "build_and_cache_response: sentence-vec preload failed (%s); per-master embed() fallback active",
+                    e,
+                )
+
+        # Batch-embed all master texts. master_vec_by_pid is in-memory only
+        # (masters are derived from current on-chain state, not cached).
+        master_vec_by_pid = {}
+        if embed_batch and master_claims:
+            try:
+                texts = [m["text"] for m in master_claims]
+                vecs = embed_batch(texts)
+                for m, v in zip(master_claims, vecs):
+                    master_vec_by_pid[int(m["post_id"])] = v
+            except Exception as e:
+                logger.warning(
+                    "build_and_cache_response: batched master embedding failed (%s); falling back to per-master embed()",
+                    e,
+                )
+
+        # Precompute section vectors ONCE for find_best_section reuse
+        # across all unplaced masters in this rebuild. Section content
+        # doesn't change between iterations.
+        section_vec_by_id = {}
+        if embed_batch and sections:
+            try:
+                section_texts_in_order = []
+                section_ids_in_order = []
+                for sec_id, sec_data in sections.items():
+                    sec_text = sec_data["heading"] + ". " + " ".join(
+                        s["text"] for s in sec_data["sentences"][:8]
+                    )
+                    section_ids_in_order.append(sec_id)
+                    section_texts_in_order.append(sec_text)
+                if section_texts_in_order:
+                    sec_vecs = embed_batch(section_texts_in_order)
+                    for sid, v in zip(section_ids_in_order, sec_vecs):
+                        section_vec_by_id[sid] = v
+            except Exception as e:
+                logger.debug(
+                    "build_and_cache_response: section-vec preload failed (%s); find_best_section will self-embed",
+                    e,
+                )
+
+        to_hide_ids = []  # batched UPDATE at the end
 
         for master in master_claims:
             mpid = master["post_id"]
@@ -658,34 +955,57 @@ def build_and_cache_response(db_or_factory, topic_key: str):
                 if already_placed:
                     break
 
-            # Hide off-chain sentences similar to this master
-            if embed and cosine_similarity:
-                try:
-                    master_vec = embed(mtext)
+            # Hide off-chain sentences similar to this master.
+            if cosine_similarity:
+                master_vec = master_vec_by_pid.get(int(mpid))
+                # Per-master fallback if the batched call failed or this
+                # master wasn't included for some reason.
+                if master_vec is None and embed:
+                    try:
+                        master_vec = embed(mtext)
+                    except Exception as e:
+                        logger.debug("Master embedding failed for pid=%d: %s", mpid, e)
+                        master_vec = None
+
+                if master_vec is not None:
                     for sec in sections.values():
                         for s in sec["sentences"]:
                             if s["post_id"] is not None:
                                 continue  # Don't hide on-chain
+                            if s.get("_hidden"):
+                                continue  # Already marked hidden by an earlier master
+                            sid = int(s["sentence_id"])
+                            sent_vec = sentence_vec_by_id.get(sid)
+                            # Per-sentence fallback if the preload missed
+                            # this sentence (e.g. preload was disabled).
+                            if sent_vec is None and embed:
+                                try:
+                                    sent_vec = embed(s["text"])
+                                    sentence_vec_by_id[sid] = sent_vec
+                                except Exception:
+                                    continue
+                            if sent_vec is None:
+                                continue
                             try:
-                                sent_vec = embed(s["text"])
                                 sim = cosine_similarity(master_vec, sent_vec)
-                                if sim >= 0.80:
-                                    db.execute(sql_text(
-                                        "UPDATE article_sentence SET is_hidden = TRUE "
-                                        "WHERE sentence_id = :sid"
-                                    ), {"sid": s["sentence_id"]})
-                                    s["_hidden"] = True
-                                    logger.debug("Hid off-chain sid=%d (sim=%.2f to master %d)",
-                                                 s["sentence_id"], sim, mpid)
                             except Exception:
-                                pass
-                except Exception as e:
-                    logger.debug("Master embedding failed for pid=%d: %s", mpid, e)
+                                continue
+                            if sim >= SIMILARITY_THRESHOLD:
+                                to_hide_ids.append(sid)
+                                s["_hidden"] = True
+                                logger.debug(
+                                    "Hid off-chain sid=%d (sim=%.2f to master %d)",
+                                    sid, sim, mpid,
+                                )
 
-            # Insert master if not already placed
+            # Insert master if not already placed.
             if not already_placed:
                 from articles.claim_indexer import find_best_section
-                sec_id = find_best_section(db, article_id, mtext)
+                sec_id = find_best_section(
+                    db, article_id, mtext,
+                    section_vec_by_id=section_vec_by_id or None,
+                    claim_vec=master_vec_by_pid.get(int(mpid)),
+                )
                 if sec_id and sec_id in sections:
                     max_so = max((s["sort_order"] for s in sections[sec_id]["sentences"]), default=0)
                     new_sid = insert_sentence(db, sec_id, None, mtext)
@@ -695,6 +1015,27 @@ def build_and_cache_response(db_or_factory, topic_key: str):
                         "text": mtext, "post_id": mpid,
                     })
                     logger.info("Placed master claim %d in section %d", mpid, sec_id)
+
+        # Single batched UPDATE for hidden sentences (one short write
+        # transaction instead of one per hidden sentence inside the loop).
+        if to_hide_ids:
+            try:
+                # De-duplicate in case multiple masters flagged the same sentence.
+                unique_ids = sorted(set(to_hide_ids))
+                db.execute(sql_text(
+                    "UPDATE article_sentence "
+                    "SET is_hidden = TRUE "
+                    "WHERE sentence_id = ANY(:ids)"
+                ), {"ids": unique_ids})
+                logger.info(
+                    "build_and_cache_response: hid %d off-chain sentence(s) in article %d",
+                    len(unique_ids), article_id,
+                )
+            except Exception as e:
+                logger.warning(
+                    "build_and_cache_response: batched is_hidden UPDATE failed: %s", e,
+                )
+                db.rollback()
 
         db.commit()
 

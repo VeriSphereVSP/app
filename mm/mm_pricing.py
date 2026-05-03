@@ -1,4 +1,4 @@
-# app/mm_pricing.py
+# app/mm/mm_pricing.py
 # ============================================================
 # PROPRIETARY — Do not reference in whitepaper or public docs.
 # ============================================================

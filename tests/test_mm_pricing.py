@@ -16,12 +16,12 @@ MOCK_AVAX = 35.0
 
 @pytest.fixture(autouse=True)
 def _mock_oracle():
-    with patch("mm_pricing.get_gold_price_usd_per_oz", return_value=MOCK_GOLD), \
-         patch("mm_pricing.get_avax_price_usd", return_value=MOCK_AVAX):
+    with patch("mm.mm_pricing.get_gold_price_usd_per_oz", return_value=MOCK_GOLD), \
+         patch("mm.mm_pricing.get_avax_price_usd", return_value=MOCK_AVAX):
         yield
 
 
-from mm_pricing import (
+from mm.mm_pricing import (
     _base_price,
     _reserve_price,
     get_spot_quote,

@@ -111,69 +111,107 @@ def _semantic_dedup(article: dict):
       - On-chain sentences (post_id != null): ALWAYS kept, even if near-dupes of each other
       - Off-chain near-duplicate of an on-chain sentence: REMOVED
       - Off-chain near-duplicate of an earlier off-chain sentence: REMOVED (keep first)
+
+    Performance: every sentence in the article is embedded in ONE
+    batched embed_batch() call upfront, then the dedup logic is pure
+    in-memory cosine similarity. Replaces O(N) sequential network
+    calls per API render with a single batched call.
     """
-    from embedding import embed
+    from embedding import embed_batch
     from similarity import cosine_similarity
 
     DEDUP_THRESHOLD = 0.70  # Cosine similarity above this = near-duplicate
 
-    # First pass: collect and embed all on-chain sentences (across entire article)
-    onchain_embeddings = []
-    for section in article.get("sections", []):
-        for sent in section.get("sentences", []):
-            if sent.get("post_id") is not None:
-                try:
-                    vec = embed(sent["text"])
-                    onchain_embeddings.append(vec)
-                except Exception:
-                    pass
-
-    # Second pass: filter each section
-    # Track kept off-chain embeddings globally (across sections) to dedup across sections too
-    kept_offchain_embeddings = []
-
-    for section in article.get("sections", []):
-        filtered = []
-        for sent in section.get("sentences", []):
-            # Always keep on-chain sentences
-            if sent.get("post_id") is not None:
-                filtered.append(sent)
+    # ── Pass 1: collect every sentence (on-chain + off-chain) and
+    #            assign it a stable index for the batched embed call ──
+    sentence_records = []  # list of (section_index, sent_index_in_section, sent_dict, is_onchain, text)
+    texts_to_embed = []
+    for sec_idx, section in enumerate(article.get("sections", [])):
+        for s_idx, sent in enumerate(section.get("sentences", [])):
+            text = (sent.get("text") or "").strip()
+            is_onchain = sent.get("post_id") is not None
+            if not text and not is_onchain:
+                # Empty off-chain sentence: drop entirely (parity with old code).
+                sentence_records.append((sec_idx, s_idx, sent, is_onchain, "", -1))
                 continue
-
-            text = sent.get("text", "").strip()
             if not text:
-                continue  # Drop empty sentences
-
-            try:
-                vec = embed(text)
-            except Exception:
-                filtered.append(sent)
+                # Empty on-chain (rare): skip embedding but keep.
+                sentence_records.append((sec_idx, s_idx, sent, is_onchain, "", -1))
                 continue
+            sentence_records.append((sec_idx, s_idx, sent, is_onchain, text, len(texts_to_embed)))
+            texts_to_embed.append(text)
 
-            # Check against on-chain sentences
-            is_dupe = False
-            for oc_vec in onchain_embeddings:
-                if cosine_similarity(vec, oc_vec) >= DEDUP_THRESHOLD:
-                    is_dupe = True
-                    break
+    # ── Pass 2: one batched embed call for every sentence in the article ──
+    vecs = []
+    if texts_to_embed:
+        try:
+            vecs = embed_batch(texts_to_embed)
+        except Exception:
+            vecs = []  # signals fallback below
 
-            if is_dupe:
-                continue  # Drop: near-dupe of on-chain sentence
+    # If batched embedding failed entirely, drop the dedup step (fail
+    # open). The original code's per-sentence except-pass meant that
+    # on embed errors, the sentence was kept as-is; preserve that.
+    if not vecs or len(vecs) != len(texts_to_embed):
+        # Just clean up empty-text off-chain sentences and return.
+        for section in article.get("sections", []):
+            section["sentences"] = [
+                s for s in section.get("sentences", [])
+                if (s.get("text") or "").strip() or s.get("post_id") is not None
+            ]
+        return
 
-            # Check against already-kept off-chain sentences
-            for kept_vec in kept_offchain_embeddings:
-                if cosine_similarity(vec, kept_vec) >= DEDUP_THRESHOLD:
-                    is_dupe = True
-                    break
+    # ── Pass 3: collect on-chain embeddings ──
+    onchain_embeddings = [
+        vecs[idx]
+        for (_, _, _, is_onchain, _, idx) in sentence_records
+        if is_onchain and idx >= 0
+    ]
 
-            if is_dupe:
-                continue  # Drop: near-dupe of earlier off-chain sentence
+    # ── Pass 4: filter each section using cached vecs ──
+    kept_offchain_embeddings = []
+    # Build a lookup: (sec_idx, s_idx) -> filter decision
+    new_sections_sentences = {sec_idx: [] for sec_idx in range(len(article.get("sections", [])))}
 
-            # Keep this sentence
-            filtered.append(sent)
-            kept_offchain_embeddings.append(vec)
+    # Walk sentence_records in document order so off-chain dedup
+    # preserves "keep first" semantics across sections.
+    for sec_idx, s_idx, sent, is_onchain, text, vec_idx in sentence_records:
+        if is_onchain:
+            # Keep on-chain unconditionally (skip empty-text on-chain
+            # too — that matches the old behavior of falling through).
+            if text or sent.get("post_id") is not None:
+                new_sections_sentences[sec_idx].append(sent)
+            continue
 
-        section["sentences"] = filtered
+        # Off-chain: drop if empty text.
+        if not text or vec_idx < 0:
+            continue
+
+        vec = vecs[vec_idx]
+
+        # Check against on-chain sentences
+        is_dupe = False
+        for oc_vec in onchain_embeddings:
+            if cosine_similarity(vec, oc_vec) >= DEDUP_THRESHOLD:
+                is_dupe = True
+                break
+        if is_dupe:
+            continue  # near-dupe of on-chain sentence
+
+        # Check against already-kept off-chain sentences
+        for kept_vec in kept_offchain_embeddings:
+            if cosine_similarity(vec, kept_vec) >= DEDUP_THRESHOLD:
+                is_dupe = True
+                break
+        if is_dupe:
+            continue  # near-dupe of earlier off-chain sentence
+
+        new_sections_sentences[sec_idx].append(sent)
+        kept_offchain_embeddings.append(vec)
+
+    # ── Apply filtered sentences back into the article ──
+    for sec_idx, section in enumerate(article.get("sections", [])):
+        section["sentences"] = new_sections_sentences.get(sec_idx, [])
 
 def _ensure_sentence_in_claim_db(db: Session, text: str) -> int:
     """Ensure a sentence exists in the claim table, return claim_id."""
@@ -465,41 +503,50 @@ def edit_sentence_endpoint(sentence_id: int, req: EditRequest,
     new_sentences = [req.new_text.strip()]
     created = []
 
-    # PD-04: Determine if this is a friendly edit (similar meaning) or hostile
+    # PD-04: Determine if this is a friendly edit (similar meaning) or hostile.
+    # Embed old_text and new_text ONCE, share the vectors and similarity
+    # score across both the friendly-check and the section re-eval below.
     is_friendly = True
+    _edit_old_vec = None
+    _edit_new_vec = None
+    _edit_sim = None
     try:
-        from embedding import embed
+        from embedding import embed_batch
         from similarity import cosine_similarity
-        old_vec = embed(old_text)
-        new_vec = embed(req.new_text.strip())
-        edit_sim = cosine_similarity(old_vec, new_vec)
-        is_friendly = edit_sim >= 0.80
+        new_text_stripped = req.new_text.strip()
+        try:
+            _vecs = embed_batch([old_text, new_text_stripped])
+            _edit_old_vec, _edit_new_vec = _vecs[0], _vecs[1]
+        except Exception:
+            from embedding import embed
+            _edit_old_vec = embed(old_text)
+            _edit_new_vec = embed(new_text_stripped)
+        _edit_sim = cosine_similarity(_edit_old_vec, _edit_new_vec)
+        is_friendly = _edit_sim >= 0.80
         if not is_friendly:
             logger.info("Hostile edit detected (sim=%.3f): '%s' → '%s'",
-                        edit_sim, old_text[:40], req.new_text.strip()[:40])
+                        _edit_sim, old_text[:40], new_text_stripped[:40])
     except Exception:
         pass  # Default to friendly if embedding fails
 
-    # Re-evaluate section placement if text changed significantly
+    # Re-evaluate section placement if text changed significantly.
+    # Reuses _edit_sim computed above — no second embedding pass.
     target_section_id = section_id
     try:
-        from embedding import embed
-        from similarity import cosine_similarity
-        old_vec = embed(old_text)
-        new_vec = embed(req.new_text.strip())
-        sim = cosine_similarity(old_vec, new_vec)
-        if sim < 0.85:  # Text changed significantly
+        if _edit_sim is not None and _edit_sim < 0.85:
             from articles.claim_indexer import find_best_section
-            # Get article_id from section
             art_row = db.execute(sql_text(
                 "SELECT article_id FROM article_section WHERE section_id = :s"
             ), {"s": section_id}).fetchone()
             if art_row:
-                better_section = find_best_section(db, art_row[0], req.new_text.strip())
+                better_section = find_best_section(
+                    db, art_row[0], req.new_text.strip(),
+                    claim_vec=_edit_new_vec,
+                )
                 if better_section and better_section != section_id:
                     target_section_id = better_section
                     logger.info("Edit moved to different section: %d -> %d (sim=%.3f)",
-                                section_id, better_section, sim)
+                                section_id, better_section, _edit_sim)
     except Exception as e:
         logger.debug("Section re-evaluation failed (keeping original): %s", e)
 
