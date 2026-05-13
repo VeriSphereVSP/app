@@ -189,28 +189,59 @@ def get_user_positions(db: Session, user_address: str) -> list[dict]:
         else:
             status = "losing"
 
-        # APR calculation (inline, no RPC)
-        s_max = get_global(db, "s_max") or max(support + challenge, 1.0)
-        num_tranches = int(get_global(db, "num_tranches") or 10)
+        # APR calculation (inline, no RPC).
+        #
+        # IMPORTANT: sMax is the global participation reference. Only
+        # the largest active post (sMax post) gets participation=1.0;
+        # smaller posts get participation = T/sMax < 1.0. We MUST NOT
+        # fall back to the current post's own total — that would force
+        # participation=1 for every post and pin every winning ±100%-VS
+        # post to the rMax APR ceiling. (See git log: this was the bug
+        # fixed by fix-apr-display.)
         total = support + challenge
-        # Read rate policy from chain (indexed by chain_indexer)
-        R_MIN = get_global(db, 'rate_min_ray') or 0.0
-        R_MAX = get_global(db, 'rate_max_ray') or 1.387611  # fallback
+        s_max_indexed = get_global(db, "s_max")
+        if s_max_indexed and s_max_indexed > 0:
+            s_max = s_max_indexed
+        else:
+            # Fallback: chain-wide max from chain_post. NOT this post's
+            # own total. Use 1.0 as a numerical floor so we never divide
+            # by zero, but log so we notice if the indexer is broken.
+            row = db.execute(sql_text(
+                "SELECT MAX(support_total + challenge_total) FROM chain_post"
+            )).fetchone()
+            s_max = max(float(row[0] or 0.0), 1.0)
+            logger.warning(
+                "chain_global.s_max missing or zero; falling back to "
+                "chain-wide MAX(support+challenge)=%s. Indexer may be stale.",
+                s_max,
+            )
+
+        # Rate policy from chain (indexed by chain_indexer). Defaults
+        # match the deployed ProtocolPolicy: rMin=0, rMax=1.387611
+        # (= 200% APR target compounded daily, i.e. ~100% to a sole
+        # staker after the 0.5 midpoint position weight).
+        R_MIN = get_global(db, 'rate_min_ray')
+        R_MAX = get_global(db, 'rate_max_ray')
+        if R_MIN is None: R_MIN = 0.0
+        if R_MAX is None: R_MAX = 1.387611
 
         abs_vs = abs(vs)
         v = abs_vs / 100.0
-        participation = min(total / s_max, 1.0) if s_max > 0 else 0
+        participation = min(total / s_max, 1.0) if s_max > 0 else 0.0
         r_base_annual = R_MIN + (R_MAX - R_MIN) * v * participation
-        # Daily rate with midpoint position weight
-        r_daily = (r_base_annual / 365.24) * pos_weight if vs != 0 else 0
-        # Compound to get APR
-        apr = ((1 + r_daily) ** 365.24 - 1) * 100 if is_winner else -((1 + r_daily) ** 365.24 - 1) * 100
+        # Per-lot effective rate folds in the lot's positionWeight,
+        # which the StakeEngine applies independently per lot. Sole
+        # staker on a side has positionWeight=0.5; first of many
+        # earlier stakers approaches positionWeight=1.
+        r_daily = (r_base_annual / 365.24) * pos_weight if vs != 0 else 0.0
+        compounded = ((1 + r_daily) ** 365.24 - 1) * 100 if r_daily > 0 else 0.0
+        apr = compounded if is_winner else -compounded
         r_eff = r_daily * 365.24  # for breakdown display
-        r_base = r_base_annual  # for breakdown display
+        r_base = r_base_annual    # for breakdown display
         if vs == 0:
-            apr = 0
-            r_eff = 0
-            r_base = 0
+            apr = 0.0
+            r_eff = 0.0
+            r_base = 0.0
 
         positions.append({
             "post_id": post_id,
@@ -237,14 +268,19 @@ def get_user_positions(db: Session, user_address: str) -> list[dict]:
             "estimated_apr": round(apr, 1),
             "apr_breakdown": {
                 "apr": round(apr, 1),
-                "r_min": R_MIN * 100, "r_max": R_MAX * 100,
-                "vs": round(vs, 2), "abs_vs": round(abs_vs, 2), "v": round(v, 4),
-                "total_stake": round(total, 4), "s_max": round(s_max, 4),
+                "r_min": round(R_MIN * 100, 2),
+                "r_max": round(R_MAX * 100, 2),
+                "vs": round(vs, 2),
+                "abs_vs": round(abs_vs, 2),
+                "v": round(v, 4),
+                "total_stake": round(total, 4),
+                "s_max": round(s_max, 4),
                 "participation": round(participation, 4),
-                "r_base": round(r_base * 100, 2), "r_eff": round(r_eff * 100, 2),
-                "is_winner": is_winner,
-                "num_tranches": num_tranches, "tranche": tranche,
+                "r_base": round(r_base * 100, 2),
+                "r_eff": round(r_eff * 100, 2),
                 "position_weight": round(pos_weight, 3),
+                "is_winner": is_winner,
+                "is_smax_post": (total >= s_max - 1e-9),
             },
         })
 

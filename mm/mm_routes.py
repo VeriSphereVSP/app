@@ -30,6 +30,13 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# patch12a: chain-state helpers for vsp_circulating and usdc_reserves.
+from chain.chain_reader import (
+    read_vsp_circulating,
+    read_usdc_reserves,
+    invalidate_mm_chain_state_cache,
+)
+
 router = APIRouter(prefix="/api/mm", tags=["market-maker"])
 
 
@@ -38,16 +45,38 @@ router = APIRouter(prefix="/api/mm", tags=["market-maker"])
 # ────────────────────────────────────────────────────────────
 
 def _load_mm_state(db: Session, *, for_update: bool = False):
+    """
+    Returns (net_vsp, unit_au, half_spread, usdc_reserves, vsp_circulating).
+
+    net_vsp, unit_au, half_spread come from the DB (mm_state row).
+    usdc_reserves and vsp_circulating are derived from chain state
+    (patch12a). The DB columns for usdc_reserves and vsp_circulating
+    are still updated by trade paths but ignored here — kept as a
+    forensic record only.
+
+    Raises HTTP 503 if MM state row is missing OR if the chain RPC
+    is unreachable. We fail closed rather than serve mispriced
+    quotes from stale tracked values.
+    """
     suffix = " FOR UPDATE" if for_update else ""
     row = db.execute(
         text(
-            "SELECT net_vsp, unit_au, half_spread, usdc_reserves, vsp_circulating "
+            "SELECT net_vsp, unit_au, half_spread "
             f"FROM mm_state WHERE id = TRUE{suffix}"
         )
     ).fetchone()
     if not row:
         raise HTTPException(503, "MM state not initialized")
-    return row
+    net_vsp, unit_au, half_spread = row
+
+    try:
+        usdc_reserves = read_usdc_reserves()
+        vsp_circulating = read_vsp_circulating()
+    except Exception as e:
+        logger.error("MM chain-state read failed: %s", e)
+        raise HTTPException(503, f"MM chain state unavailable: {e}")
+
+    return (net_vsp, unit_au, half_spread, usdc_reserves, vsp_circulating)
 
 
 def _update_mm_state(db, net_vsp, usdc_reserves, vsp_circulating):
@@ -405,7 +434,10 @@ def mm_buy(req: MMTradeRequest, db: Session = Depends(get_db)):
             new_reserves = usdc_reserves + fill.total_usd
             new_circ = vsp_circulating + req.qty_vsp
 
+            # patch12a: forensic-only DB update; callers read from chain.
             _update_mm_state(db, new_net, new_reserves, new_circ)
+            # Force next quote to re-read chain state (post-transfer).
+            invalidate_mm_chain_state_cache()
             _log_trade(db, side="buy", user_address=req.user_address,
                        qty_vsp=req.qty_vsp, total_usdc=fill.total_usd,
                        avg_price_usd=fill.avg_price_usd, net_vsp_before=net_vsp,
@@ -501,7 +533,10 @@ def mm_sell(req: MMTradeRequest, db: Session = Depends(get_db)):
             new_reserves = usdc_reserves - fill.total_usd
             new_circ = vsp_circulating - req.qty_vsp
 
+            # patch12a: forensic-only DB update; callers read from chain.
             _update_mm_state(db, new_net, new_reserves, new_circ)
+            # Force next quote to re-read chain state (post-transfer).
+            invalidate_mm_chain_state_cache()
             # Track trade fee separately
             try:
                 db.execute(sql_text(

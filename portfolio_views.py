@@ -110,16 +110,32 @@ def portfolio_fast(address: str, db: Session = Depends(get_db)):
             weighted_apr += apr * stake
             total_for_apr += stake
     
-    # Look up topics for each position
+    # Look up topics for each position.
+    #
+    # Claims get a topic via article_sentence rows; links don't have
+    # article_sentence rows (only claims do), so for a link post we
+    # fall back to the topic of either endpoint (from_post_id or
+    # to_post_id). A link inherits the topic of the claim it connects.
+    _topic_sql = sql_text(
+        "SELECT ta.topic_key FROM article_sentence s "
+        "JOIN article_section sec ON s.section_id = sec.section_id "
+        "JOIN topic_article ta ON sec.article_id = ta.article_id "
+        "WHERE s.post_id = :pid LIMIT 1"
+    )
     for p in positions:
         try:
-            topic_row = db.execute(sql_text(
-                "SELECT ta.topic_key FROM article_sentence s "
-                "JOIN article_section sec ON s.section_id = sec.section_id "
-                "JOIN topic_article ta ON sec.article_id = ta.article_id "
-                "WHERE s.post_id = :pid LIMIT 1"
-            ), {"pid": p["post_id"]}).fetchone()
-            p["topic"] = topic_row[0] if topic_row else None
+            topic_row = db.execute(_topic_sql, {"pid": p["post_id"]}).fetchone()
+            topic = topic_row[0] if topic_row else None
+            # Fallback for links: use either endpoint's topic.
+            if topic is None and p.get("is_link"):
+                for endpoint in (p.get("from_post_id"), p.get("to_post_id")):
+                    if endpoint is None:
+                        continue
+                    ep_row = db.execute(_topic_sql, {"pid": endpoint}).fetchone()
+                    if ep_row and ep_row[0]:
+                        topic = ep_row[0]
+                        break
+            p["topic"] = topic
         except Exception:
             p["topic"] = None
     

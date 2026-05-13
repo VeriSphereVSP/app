@@ -51,6 +51,13 @@ def _validate_claim_text(text: str) -> str:
 POLL_INTERVAL = 15  # Balanced: fast enough for UX, low RPC cost
 BLOCK_BATCH = 2000  # blocks per poll
 
+# Cold-start lookback: when the indexer state is empty (e.g., after a
+# fresh deploy that wiped the DB), how many blocks back from chain head
+# to begin polling. Must comfortably exceed the worst-case gap between
+# (chain head when first user activity happens) and (chain head when
+# indexer first polls after restart). 100k blocks ≈ 2.3 days on Fuji.
+COLD_START_LOOKBACK = 100_000
+
 # ── Web3 setup ────────────────────────────────────────
 
 _w3 = None
@@ -162,6 +169,48 @@ def index_post(db: Session, post_id: int, user_addresses: list[str] | None = Non
             except Exception as e:
                 logger.debug("Dupe grouping failed for post %d: %s", post_id, e)
 
+            # patch04: topic detection in index_post (canonical path)
+            # Runs for every indexed post, in both full_sync and
+            # poll_events. Idempotent: skips if claim.topic is
+            # already set. ensure_claim() guarantees the claim row
+            # exists before we try to UPDATE it.
+            try:
+                from semantic import ensure_claim
+                from articles.topic_detect import detect_topic, ensure_article_for_claim
+                cid = ensure_claim(db, claim_text)
+                existing_topic = db.execute(sql_text(
+                    "SELECT topic FROM claim WHERE claim_id = :cid"
+                ), {"cid": cid}).fetchone()
+                if not existing_topic or not existing_topic[0]:
+                    _topic = detect_topic(claim_text)
+                    if _topic:
+                        db.execute(sql_text(
+                            "UPDATE claim SET topic = :t "
+                            "WHERE claim_id = :cid AND (topic IS NULL OR topic = '')"
+                        ), {"t": _topic, "cid": cid})
+                        db.commit()
+                        logger.info(
+                            "patch04 topic-detect: post_id=%d cid=%d → %r",
+                            post_id, cid, _topic)
+                        # Article generation runs in background thread
+                        # inside ensure_article_for_claim (non-blocking).
+                        import threading
+                        def _bg_article(ct, pid, topic):
+                            try:
+                                from db import get_session_factory
+                                bg = get_session_factory()()
+                                try:
+                                    ensure_article_for_claim(bg, ct, pid, topic)
+                                finally:
+                                    bg.close()
+                            except Exception as ex:
+                                logger.debug("BG article gen failed for post %d: %s", pid, ex)
+                        threading.Thread(
+                            target=_bg_article, args=(claim_text, post_id, _topic),
+                            daemon=True, name=f"art-gen-{post_id}").start()
+            except Exception as e:
+                logger.warning("patch04 topic-detect failed for post %d: %s", post_id, e)
+
         # User positions
         if user_addresses:
             for addr in user_addresses:
@@ -258,9 +307,9 @@ def index_global_stats(db: Session):
         except Exception:
             pass
 
-        # Rate policy parameters (read from StakeRatePolicy via StakeEngine)
+        # Rate policy parameters (read from ProtocolPolicy via StakeEngine)
         try:
-            rp = se.functions.ratePolicy().call()
+            rp = se.functions.protocolPolicy().call()
             rp_contract = w3.eth.contract(address=rp, abi=[
                 {"inputs":[],"name":"stakeIntRateMinRay","outputs":[{"type":"uint256"}],"stateMutability":"view","type":"function"},
                 {"inputs":[],"name":"stakeIntRateMaxRay","outputs":[{"type":"uint256"}],"stateMutability":"view","type":"function"},
@@ -368,12 +417,15 @@ def poll_events(db: Session):
     se = w3.eth.contract(address=Web3.to_checksum_address(STAKE_ENGINE_ADDRESS), abi=se_abi)
     last_block = _get_last_block(db, "StakeEngine")
     if last_block == 0:
-        last_block = max(current_block - 10000, 0)
+        last_block = max(current_block - COLD_START_LOOKBACK, 0)
+        logger.info("StakeEngine cold-start: first poll from block %d (current head: %d)",
+                    last_block, current_block)
 
     from_block = last_block + 1
     to_block = min(from_block + BLOCK_BATCH, current_block)
 
     if from_block <= to_block:
+        logger.debug("StakeEngine: polling blocks %d..%d", from_block, to_block)
         affected_posts = set()
         affected_users = {}  # post_id -> set of addresses
 
@@ -382,6 +434,8 @@ def poll_events(db: Session):
             for event in se.events.StakeAdded.get_logs(from_block=from_block, to_block=to_block):
                 pid = event.args.postId
                 staker = event.args.staker.lower()
+                logger.info("StakeEngine: indexed StakeAdded post_id=%d staker=%s (block %d)",
+                            pid, staker[:10], event.blockNumber)
                 affected_posts.add(pid)
                 affected_users.setdefault(pid, set()).add(staker)
 
@@ -426,48 +480,25 @@ def poll_events(db: Session):
     reg = w3.eth.contract(address=Web3.to_checksum_address(POST_REGISTRY_ADDRESS), abi=reg_abi)
     last_block = _get_last_block(db, "PostRegistry")
     if last_block == 0:
-        last_block = max(current_block - 10000, 0)
+        last_block = max(current_block - COLD_START_LOOKBACK, 0)
+        logger.info("PostRegistry cold-start: first poll from block %d (current head: %d)",
+                    last_block, current_block)
 
     from_block = last_block + 1
     to_block = min(from_block + BLOCK_BATCH, current_block)
 
     if from_block <= to_block:
+        logger.debug("PostRegistry: polling blocks %d..%d", from_block, to_block)
         try:
             for event in reg.events.PostCreated.get_logs(from_block=from_block, to_block=to_block):
                 pid = event.args.postId
                 creator = event.args.creator.lower()
+                logger.info("PostRegistry: indexed PostCreated post_id=%d creator=%s (block %d)",
+                            pid, creator[:10], event.blockNumber)
+                # patch04: topic detection now lives inside index_post(),
+                # so it runs in BOTH full_sync and poll_events paths
+                # automatically. No additional code needed here.
                 index_post(db, pid, user_addresses=[creator])
-                # APP-10: Auto-detect topic for new claims
-                try:
-                    _ct = db.execute(sql_text(
-                        "SELECT claim_text FROM chain_claim_text WHERE post_id = :pid"
-                    ), {"pid": pid}).fetchone()
-                    if _ct and _ct[0]:
-                        _has_topic = db.execute(sql_text(
-                            "SELECT 1 FROM claim WHERE post_id = :pid AND topic IS NOT NULL"
-                        ), {"pid": pid}).fetchone()
-                        if not _has_topic:
-                            from articles.topic_detect import detect_topic, ensure_article_for_claim
-                            _topic = detect_topic(_ct[0])
-                            if _topic:
-                                db.execute(sql_text(
-                                    "UPDATE claim SET topic = :t WHERE post_id = :pid AND topic IS NULL"
-                                ), {"t": _topic, "pid": pid})
-                                db.commit()
-                                # Run article generation in background thread
-                                import threading
-                                def _bg_article(claim_text, post_id, topic):
-                                    try:
-                                        from db import SessionLocal
-                                        with SessionLocal() as bg_db:
-                                            ensure_article_for_claim(bg_db, claim_text, post_id, topic)
-                                            logger.info("Auto-topic (bg): post_id=%d → '%s'", post_id, topic)
-                                    except Exception as e:
-                                        logger.debug("BG article gen failed: %s", e)
-                                threading.Thread(target=_bg_article, args=(_ct[0], pid, _topic), daemon=True).start()
-                                logger.info("Auto-topic (indexer): post_id=%d → '%s' (article gen in background)", pid, _topic)
-                except Exception as _te:
-                    logger.debug("Auto-topic (indexer) post %d: %s", pid, _te)
         except Exception as e:
             logger.warning("Error polling PostRegistry events: %s", e)
         _set_last_block(db, "PostRegistry", to_block)
@@ -477,18 +508,23 @@ def poll_events(db: Session):
     lg = w3.eth.contract(address=Web3.to_checksum_address(LINK_GRAPH_ADDRESS), abi=lg_abi)
     last_block = _get_last_block(db, "LinkGraph")
     if last_block == 0:
-        last_block = max(current_block - 10000, 0)
+        last_block = max(current_block - COLD_START_LOOKBACK, 0)
+        logger.info("LinkGraph cold-start: first poll from block %d (current head: %d)",
+                    last_block, current_block)
 
     from_block = last_block + 1
     to_block = min(from_block + BLOCK_BATCH, current_block)
 
     if from_block <= to_block:
+        logger.debug("LinkGraph: polling blocks %d..%d", from_block, to_block)
         try:
             for event in lg.events.EdgeAdded.get_logs(from_block=from_block, to_block=to_block):
                 from_pid = event.args["from"]
                 to_pid = event.args["to"]
                 link_pid = event.args.linkPostId
                 is_challenge = event.args.isChallenge
+                logger.info("LinkGraph: indexed EdgeAdded link_post=%d from=%d to=%d challenge=%s (block %d)",
+                            link_pid, from_pid, to_pid, is_challenge, event.blockNumber)
                 index_link(db, link_pid, from_pid, to_pid, is_challenge)
                 # Re-index all connected posts (link affects VS of targets)
                 index_post(db, to_pid)

@@ -24,10 +24,15 @@ broadcast/
 cache/
 contracts/lib/
 contracts/out/
-deployments/fuji-addresses.json
-deployments/fuji.json
-deployments/mainnet.json
 env/
 node_modules/
 out/
 venv/
+# Patch system local-only artifacts
+patches/backups/
+# Environment files
+.env.*
+# Python
+# Patch system local-only artifacts
+# Environment files
+# Python

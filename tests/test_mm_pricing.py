@@ -48,8 +48,11 @@ class TestBasePriceCurve:
         p10000 = _base_price(10000, MOCK_GOLD, DEFAULT_UNIT_AU)
         assert p0 < p100 < p10000
 
-    def test_log_squared_deceleration(self):
-        """Price increase from 100→200 should be larger than 10000→10100."""
+    def test_log_curve_deceleration(self):
+        """Price increase from 100→200 should be larger than 10000→10100.
+
+        Holds for any exponent >= 1 since log10(...)**k is concave-up.
+        """
         p100 = _base_price(100, MOCK_GOLD, DEFAULT_UNIT_AU)
         p200 = _base_price(200, MOCK_GOLD, DEFAULT_UNIT_AU)
         p10000 = _base_price(10000, MOCK_GOLD, DEFAULT_UNIT_AU)
@@ -60,6 +63,30 @@ class TestBasePriceCurve:
         p_normal = _base_price(100, MOCK_GOLD, DEFAULT_UNIT_AU)
         p_double_gold = _base_price(100, MOCK_GOLD * 2, DEFAULT_UNIT_AU)
         assert abs(p_double_gold / p_normal - 2.0) < 0.001
+
+
+    @pytest.mark.parametrize("exp", [2.0, 2.4, 3.0])
+    def test_curve_shape_holds_for_any_exponent(self, exp, monkeypatch):
+        """The curve must be strictly increasing, gold-anchored, and
+        decelerating for any positive rational exponent.
+
+        This guards the 12c toggle's promise that the env var works
+        for any reasonable value, not just the integer cases.
+        """
+        monkeypatch.setattr("mm.mm_pricing._PRICE_EXPONENT", exp)
+        # 1. Strictly increasing in n
+        p0 = _base_price(0, MOCK_GOLD, DEFAULT_UNIT_AU)
+        p100 = _base_price(100, MOCK_GOLD, DEFAULT_UNIT_AU)
+        p10000 = _base_price(10000, MOCK_GOLD, DEFAULT_UNIT_AU)
+        assert p0 < p100 < p10000, f"non-monotonic at exp={exp}"
+        # 2. Linear in gold
+        p_2x = _base_price(100, MOCK_GOLD * 2, DEFAULT_UNIT_AU)
+        assert abs(p_2x / p100 - 2.0) < 0.001, f"non-linear in gold at exp={exp}"
+        # 3. Decelerates (incremental price grows slower at higher n)
+        p200 = _base_price(200, MOCK_GOLD, DEFAULT_UNIT_AU)
+        p10100 = _base_price(10100, MOCK_GOLD, DEFAULT_UNIT_AU)
+        assert (p200 - p100) > (p10100 - p10000), f"non-decelerating at exp={exp}"
+
 
 
 # ────────────────────────────────────────────────────────────
@@ -180,7 +207,12 @@ class TestCrossZeroSell:
 
 class TestFloorPrice:
     def test_basic_floor(self):
-        assert abs(get_floor_price(10000, 5000) - 2.0) < 0.001
+        # floor = min(reserve_floor, sell_price). With default exp=3,
+        # gold=2900, unit=0.0001, half=0.0025, n=0:
+        #   sell = log10(10)**3 * 0.0001 * 2900 * 0.9975 = 0.289275
+        # reserve_floor = 10000/5000 = 2.0; min picks the curve price.
+        # log10(10) = 1, so this expectation is exponent-invariant at n=0.
+        assert abs(get_floor_price(10000, 5000) - 0.289275) < 0.001
 
     def test_zero_supply(self):
         assert get_floor_price(10000, 0) == 0.0

@@ -46,14 +46,22 @@ def _detect_tx_type(calldata_hex, to_addr):
     tx_value_vsp = 0
     if sel == "84c08ed3":  # createClaim(string)
         tx_type = "claim"
-    elif sel == "c2f0987e":  # createLink(uint256,uint256,bool)
+    elif sel == "b6f0b787":  # createLink(uint256,uint256,bool)
         tx_type = "link"
-    elif sel == "7acb7757" or sel == "e8078d94":  # stake variants
+    elif sel == "f99b7d75":  # stake(uint256,uint8,uint256) — legacy
         tx_type = "stake"
         try:
             from eth_abi import decode
             _, _, amt = decode(["uint256","uint8","uint256"], bytes.fromhex(calldata_hex[8:]))
             tx_value_vsp = amt / 1e18
+        except: pass
+    elif sel == "b1cf8aac":  # setStake(uint256,int256) — current
+        tx_type = "stake"
+        try:
+            from eth_abi import decode
+            _, target = decode(["uint256","int256"], bytes.fromhex(calldata_hex[8:]))
+            # target is signed; absolute value for telemetry
+            tx_value_vsp = abs(target) / 1e18
         except: pass
     elif sel == "97be5523" or sel == "441a3e70":  # withdraw variants
         tx_type = "unstake"
@@ -144,6 +152,8 @@ FORWARDER_ABI = _load_abi("VerisphereForwarder") or [
     ],"name":"request","type":"tuple"}],
     "name":"verify","outputs":[{"name":"","type":"bool"}],"stateMutability":"view","type":"function"},
     {"inputs":[{"name":"owner","type":"address"}],"name":"nonces",
+     "outputs":[{"name":"","type":"uint256"}],"stateMutability":"view","type":"function"},
+    {"inputs":[{"name":"innerData","type":"bytes"}],"name":"estimateFee",
      "outputs":[{"name":"","type":"uint256"}],"stateMutability":"view","type":"function"},
 ]
 
@@ -528,54 +538,51 @@ def _relay_sync(body: RelayRequest, db: Session):
 
 
         # ── RELAY FEE: blocking enforcement ──
+        # patch02: on-chain fee only
+        # The single fee is collected by VerisphereForwarder._collectFee()
+        # on-chain (feeBps * txValue, floored at minFeeWei). We pre-flight
+        # validate against the same amount via forwarder.estimateFee() so
+        # users don't pay gas for txs that will revert in _collectFee.
         user_addr = Web3.to_checksum_address(req.from_)
-        fee_exempt = is_fee_exempt(db, req.from_)
-        relay_fee_info = None
-        
-        if not fee_exempt:
-            # Execute fee permit if provided
-            if body.fee_permit:
-                try:
-                    _execute_permit(body.fee_permit)
-                    logger.info('Fee permit executed for %s', req.from_[:10])
-                except Exception as fp_err:
-                    raise HTTPException(400, f'Fee permit failed: {fp_err}')
-        
-            # Estimate gas
-            mm_addr = Web3.to_checksum_address(FEE_WALLET)
-            try:
-                print(f"TIMING: estimate_gas start {_t.time()-_relay_t0:.1f}s", flush=True)
-                gas_estimate = fwd.functions.execute(request_data).estimate_gas({
-                    'from': mm_addr,
-                    'value': req.value,
-                })
-            except Exception:
-                gas_estimate = req.gas  # fallback to requested gas
-        
-            gas_price_wei = w3.eth.gas_price
-            tx_type, tx_value_vsp = _detect_tx_type(calldata_hex, req.to)
-            relay_fee_info = compute_relay_fee(db, gas_estimate, gas_price_wei, tx_value_vsp)
-            fee_wei = int(relay_fee_info['fee_vsp'] * 1e18)
-        
-            # Check balance and allowance
-            vsp_c = w3.eth.contract(address=Web3.to_checksum_address(VSP_ADDRESS), abi=_VSP_FEE_ABI)
-            print(f"TIMING: balance check start {_t.time()-_relay_t0:.1f}s", flush=True)
-            user_balance = vsp_c.functions.balanceOf(user_addr).call()
-            user_allowance = vsp_c.functions.allowance(user_addr, Web3.to_checksum_address(FORWARDER_ADDRESS)).call()
-        
-            if user_balance < fee_wei:
-                raise HTTPException(400,
-                    f'Insufficient VSP for relay fee: need {relay_fee_info["fee_vsp"]:.4f} VSP, '
-                    f'have {user_balance / 1e18:.4f}')
-        
-            if user_allowance < fee_wei:
-                raise HTTPException(400,
-                    f'Insufficient VSP allowance for relay fee: need {relay_fee_info["fee_vsp"]:.4f} VSP, '
-                    f'allowance {user_allowance / 1e18:.4f}. Sign a fee permit.')
-        
-        # Fee collection handled on-chain by forwarder._collectFee()
+        relay_fee_info = None  # dead-code guard for legacy log inserts below
 
-        # Remove old fee_permit handling (already done above)
+        # Execute fee permit if provided (grants forwarder VSP allowance
+        # for the on-chain fee). Still supported for client convenience.
+        if body.fee_permit:
+            try:
+                _execute_permit(body.fee_permit)
+                logger.info('Fee permit executed for %s', req.from_[:10])
+            except Exception as fp_err:
+                raise HTTPException(400, f'Fee permit failed: {fp_err}')
+
+        # Read the exact fee the on-chain forwarder will charge.
+        # Reverts on unknown selectors (acts as a relay-side allow-list check).
+        try:
+            print(f"TIMING: estimateFee start {_t.time()-_relay_t0:.1f}s", flush=True)
+            calldata_bytes = bytes.fromhex(calldata_hex)
+            fee_wei = fwd.functions.estimateFee(calldata_bytes).call()
+        except Exception as e:
+            # Unknown selector or revert in _extractTxValue. The forwarder
+            # refuses this op; we refuse it here too rather than burning gas.
+            raise HTTPException(400, f'Forwarder rejects this call: {e}')
+
+        # Check balance and allowance against the on-chain fee amount.
+        vsp_c = w3.eth.contract(address=Web3.to_checksum_address(VSP_ADDRESS), abi=_VSP_FEE_ABI)
+        print(f"TIMING: balance check start {_t.time()-_relay_t0:.1f}s", flush=True)
+        user_balance = vsp_c.functions.balanceOf(user_addr).call()
+        user_allowance = vsp_c.functions.allowance(
+            user_addr, Web3.to_checksum_address(FORWARDER_ADDRESS)).call()
+
+        if user_balance < fee_wei:
+            raise HTTPException(400,
+                f'Insufficient VSP for relay fee: need {fee_wei / 1e18:.4f} VSP, '
+                f'have {user_balance / 1e18:.4f}')
+
+        if user_allowance < fee_wei:
+            raise HTTPException(400,
+                f'Insufficient VSP allowance for relay fee: need {fee_wei / 1e18:.4f} VSP, '
+                f'allowance {user_allowance / 1e18:.4f}. Sign a fee permit.')
+
 
         # Submit transaction
         print(f"TIMING: build_tx start {_t.time()-_relay_t0:.1f}s", flush=True)
@@ -683,20 +690,10 @@ def _relay_sync(body: RelayRequest, db: Session):
                     except Exception as e:
                         logger.debug("Cross-index from relay failed (non-fatal): %s", e)
 
-                    # APP-10: Universal topic association
-                    try:
-                        from articles.topic_detect import detect_topic, ensure_article_for_claim
-                        _topic = detect_topic(claim_text)
-                        if _topic:
-                            from sqlalchemy import text as _sqlt
-                            db.execute(_sqlt(
-                                "UPDATE claim SET topic = :t WHERE post_id = :pid AND topic IS NULL"
-                            ), {"t": _topic, "pid": post_id})
-                            db.commit()
-                            ensure_article_for_claim(db, claim_text, post_id, _topic)
-                            logger.info("Auto-topic: post_id=%d → '%s'", post_id, _topic)
-                    except Exception as e:
-                        logger.debug("Auto-topic failed (non-fatal): %s", e)
+                    # patch04: APP-10 removed; topic detection happens
+                    # in chain_indexer.index_post() instead. The frontend's
+                    # /api/claims/detect-topic endpoint still provides
+                    # immediate UX feedback for UI-driven creation.
                     # APP-11: Synchronous cache rebuild so frontend sees update immediately
                     try:
                         from db import get_session_factory
@@ -744,7 +741,12 @@ def _relay_sync(body: RelayRequest, db: Session):
                 try:
                     print(f"TIMING: reindex start {_t.time()-_relay_t0:.1f}s", flush=True)
                     from chain_indexer import index_post, _reindex_connected, _queue_article_refresh
-                    index_post(db, post_id)
+                    # Pass user_addresses=[req.from_] so chain_user_stake is
+                    # refreshed for the user who just acted. Without this, the
+                    # row stays stale until the background indexer's event
+                    # handler eventually catches the StakeAdded/StakeWithdrawn
+                    # event, which can be delayed or missed.
+                    index_post(db, post_id, user_addresses=[req.from_.lower()])
                     _reindex_connected(db, post_id)
                     _queue_article_refresh(db, post_id)
                 except Exception as e2:

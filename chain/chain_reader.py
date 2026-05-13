@@ -85,7 +85,7 @@ STAKE_ENGINE_ABI = _load_abi("StakeEngine") or [
     },
     {
         "type": "function",
-        "name": "ratePolicy",
+        "name": "protocolPolicy",
         "inputs": [],
         "outputs": [{"name": "", "type": "address"}],
         "stateMutability": "view",
@@ -222,12 +222,12 @@ def get_verity_score(post_id):
 
 
 def _get_rate_bounds():
-    """Read rMin and rMax from StakeRatePolicy on-chain. Returns (rMin, rMax) as fractions (0-1)."""
+    """Read rMin and rMax from ProtocolPolicy on-chain. Returns (rMin, rMax) as fractions (0-1)."""
     def _read():
         try:
             se = _get_stake_engine()
-            # StakeEngine has a ratePolicy() getter
-            rate_policy_addr = se.functions.ratePolicy().call()
+            # StakeEngine has a protocolPolicy() getter (Patch 17+)
+            rate_policy_addr = se.functions.protocolPolicy().call()
             rate_abi = [
                 {"type": "function", "name": "stakeIntRateMinRay",
                  "inputs": [], "outputs": [{"type": "uint256"}], "stateMutability": "view"},
@@ -245,56 +245,74 @@ def _get_rate_bounds():
             return (0.01, 1.00)  # fallback
     return _cached("rate_bounds", _read, ttl=300)  # cache 5 min
 
-def get_estimated_apr(post_id, side="support"):
+def get_estimated_apr(post_id, side="support", user_address=None):
     """Estimate annualized rate for a position on this post.
-    
-    Formula from whitepaper:
-      rEff = rMin + (rMax - rMin) * v * participation
+
+    Formula (from whitepaper §3.2 + StakeEngine.sol):
+      r_base   = rMin + (rMax - rMin) * v * participation
+      r_lot    = r_base * positionWeight     (per-lot, independent)
     where:
-      v = abs(VS) / 100  (truth pressure, 0-1)
-      participation = T / sMax  (post size factor, 0-1)
-      rMin = 1% APR, rMax = 100% APR (from StakeRatePolicy)
-    
-    Winners (side matches VS sign): earn at +rEff APR (newly minted VSP)
-    Losers (side opposes VS sign): lose at -rEff APR (stake burned)
+      v             = abs(VS) / 100             (truth pressure, 0-1)
+      participation = T / sMax                  (post size factor, 0-1)
+      positionWeight∈ [0, 1], lot midpoint weight (sole staker: 0.5)
+      rMin, rMax    annualized rates from ProtocolPolicy
+                    (deployed: rMin=0, rMax≈1.388 → ~200% APR target)
+
+    Winners (side matches VS sign): earn at +r_lot APR (newly minted)
+    Losers  (side opposes VS sign): lose at -r_lot APR (stake burned)
+
+    If user_address is provided, the lot's actual positionWeight is
+    used. Otherwise the function returns a side-level estimate
+    (positionWeight=0.5, the sole-staker default).
     """
     R_MIN, R_MAX = _get_rate_bounds()
-    
+
     try:
         support, challenge = get_stake_totals(post_id)
         total = support + challenge
         if total < 0.001:
             return 0.0
-        
+
         vs = get_verity_score(post_id)
+        if vs == 0:
+            return 0.0  # no pressure at VS=0
         abs_vs = abs(vs)
         v = abs_vs / 100.0  # normalized truth pressure (0-1)
-        
-        # Get sMax from contract
+
+        # Get sMax from contract. If we cannot read it, return 0.0
+        # rather than silently overstating — there is no honest
+        # default for this value.
         try:
             se = _get_stake_engine()
             s_max_wei = se.functions.sMax().call()
             s_max = s_max_wei / 1e18
-        except Exception:
-            s_max = total  # fallback: assume this post IS the max
-        
+        except Exception as e:
+            logger.warning("sMax read failed for APR estimate post %d: %s", post_id, e)
+            return 0.0
         if s_max < 0.001:
-            s_max = total
-        
-        participation = min(total / s_max, 1.0)  # post size factor (0-1)
-        
-        # Effective annual rate
-        r_eff = R_MIN + (R_MAX - R_MIN) * v * participation
-        
-        # Determine if this side wins or loses
+            return 0.0
+
+        participation = min(total / s_max, 1.0)
+        r_base = R_MIN + (R_MAX - R_MIN) * v * participation
+
+        # Per-lot positionWeight if a user is given, else 0.5 default.
+        pos_weight = 0.5
+        if user_address is not None:
+            try:
+                side_idx = 0 if side == "support" else 1
+                lot = get_user_lot_info(user_address, post_id, side_idx)
+                if lot is not None and lot.get("position_weight") is not None:
+                    pos_weight = float(lot["position_weight"])
+            except Exception:
+                pass  # fall through to default
+
+        r_lot = r_base * pos_weight
+
         support_wins = vs > 0
         is_winner = (side == "support" and support_wins) or (side == "challenge" and not support_wins)
-        
-        if vs == 0:
-            return 0.0  # no pressure at VS=0
-        
-        return r_eff * 100 if is_winner else -r_eff * 100  # return as percentage
-        
+
+        return r_lot * 100 if is_winner else -r_lot * 100
+
     except Exception as e:
         logger.warning("Failed to estimate APR for post %d: %s", post_id, e)
         return 0.0
@@ -343,13 +361,13 @@ def get_apr_breakdown(post_id, side="support"):
             se = _get_stake_engine()
             s_max_wei = se.functions.sMax().call()
             s_max = s_max_wei / 1e18
-        except Exception:
-            s_max = total
-        
+        except Exception as e:
+            logger.warning("sMax read failed for APR breakdown post %d: %s", post_id, e)
+            return result  # leave participation/r_eff/apr at zero
         if s_max < 0.001:
-            s_max = total
+            return result
         result["s_max"] = round(s_max, 4)
-        
+
         participation = min(total / s_max, 1.0)
         result["participation"] = round(participation, 4)
         
@@ -389,3 +407,135 @@ def get_user_lot_info(user_address, post_id, side):
         logger.warning("Failed to get lot info for %s post %d side %d: %s",
                        user_address, post_id, side, e)
         return None
+
+
+# ============================================================
+# MM chain-state helpers (patch12a)
+# ============================================================
+#
+# These functions derive vsp_circulating and usdc_reserves from
+# chain state, replacing the tracked counters in mm_state. The
+# tracked counters drift when VSP enters circulation through paths
+# other than MM trades (yield mints, bounty mints) or when USDC
+# enters reserves through donations.
+#
+# Caching: same 30s TTL as the rest of chain_reader.
+# Failure mode: explicit exception. Callers must decide whether to
+# fall back to a degraded mode or surface the error to the user.
+
+# Standard ERC20 view ABI subset.
+_ERC20_VIEW_ABI = [
+    {
+        "inputs": [],
+        "name": "totalSupply",
+        "outputs": [{"name": "", "type": "uint256"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    {
+        "inputs": [{"name": "account", "type": "address"}],
+        "name": "balanceOf",
+        "outputs": [{"name": "", "type": "uint256"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    {
+        "inputs": [],
+        "name": "decimals",
+        "outputs": [{"name": "", "type": "uint8"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+]
+
+_vsp_token_contract = None
+_usdc_token_contract = None
+
+
+def _get_vsp_token():
+    global _vsp_token_contract
+    if _vsp_token_contract is None:
+        from config import VSP_TOKEN_ADDRESS
+        if not VSP_TOKEN_ADDRESS:
+            raise RuntimeError("VSP_TOKEN_ADDRESS not configured")
+        w3 = _get_w3()
+        _vsp_token_contract = w3.eth.contract(
+            address=Web3.to_checksum_address(VSP_TOKEN_ADDRESS),
+            abi=_ERC20_VIEW_ABI,
+        )
+    return _vsp_token_contract
+
+
+def _get_usdc_token():
+    global _usdc_token_contract
+    if _usdc_token_contract is None:
+        from config import USDC_ADDRESS
+        if not USDC_ADDRESS:
+            raise RuntimeError("USDC_ADDRESS not configured")
+        w3 = _get_w3()
+        _usdc_token_contract = w3.eth.contract(
+            address=Web3.to_checksum_address(USDC_ADDRESS),
+            abi=_ERC20_VIEW_ABI,
+        )
+    return _usdc_token_contract
+
+
+def read_vsp_circulating() -> float:
+    """
+    Returns the total VSP held outside the MM treasury, in VSP units
+    (not wei). This is the size of the population that could
+    potentially be sold back to the MM.
+
+    vsp_circulating = vspToken.totalSupply() - vspToken.balanceOf(MM)
+
+    Cached for _CACHE_TTL seconds. Raises on RPC failure — callers
+    must handle. We do NOT silently return a stale value past TTL
+    because mispriced sells could drain reserves.
+    """
+    def _read():
+        from config import MM_ADDRESS
+        if not MM_ADDRESS:
+            raise RuntimeError("MM_ADDRESS not configured")
+        vsp = _get_vsp_token()
+        total_wei = vsp.functions.totalSupply().call()
+        mm_balance_wei = vsp.functions.balanceOf(
+            Web3.to_checksum_address(MM_ADDRESS)
+        ).call()
+        circulating_wei = max(0, total_wei - mm_balance_wei)
+        # VSPToken uses 18 decimals (ERC20 default).
+        return circulating_wei / 1e18
+    return _cached("mm_vsp_circulating", _read)
+
+
+def read_usdc_reserves() -> float:
+    """
+    Returns the USDC held by the MM treasury, in USDC units (not
+    micro-USDC). This is the pool backing all VSP that's been sold
+    out to users.
+
+    usdc_reserves = usdcToken.balanceOf(MM)
+
+    Cached for _CACHE_TTL seconds. Raises on RPC failure.
+    """
+    def _read():
+        from config import MM_ADDRESS
+        if not MM_ADDRESS:
+            raise RuntimeError("MM_ADDRESS not configured")
+        usdc = _get_usdc_token()
+        balance_micro = usdc.functions.balanceOf(
+            Web3.to_checksum_address(MM_ADDRESS)
+        ).call()
+        # USDC uses 6 decimals.
+        return balance_micro / 1e6
+    return _cached("mm_usdc_reserves", _read)
+
+
+def invalidate_mm_chain_state_cache():
+    """
+    Force the next read to hit the chain. Call this after the relay
+    submits an MM trade transaction, so subsequent quotes see the
+    post-trade state immediately rather than waiting for the cache
+    TTL to expire.
+    """
+    _cache.pop("mm_vsp_circulating", None)
+    _cache.pop("mm_usdc_reserves", None)

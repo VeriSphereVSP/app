@@ -21,6 +21,8 @@
 from __future__ import annotations
 
 import math
+import os
+import logging
 from dataclasses import dataclass
 from typing import Optional
 
@@ -36,6 +38,42 @@ DEFAULT_HALF_SPREAD = 0.0025   # 0.25% half-spread → 0.5% round trip
 
 
 # ────────────────────────────────────────────────────────────
+# Pricing exponent (12c)
+# ────────────────────────────────────────────────────────────
+#
+# Controls the steepness of the supply curve:
+#   price(n) = log10(n + 10) ** _PRICE_EXPONENT * unit_au * gold_usd
+#
+# Default is 3 (cubed) — the launch value. Set MM_PRICE_EXPONENT in
+# the environment to override; any positive rational ≤ 10 works.
+# Useful for A/B and rollback. The variable is read once at module
+# import, so changes require an app restart.
+#
+# Negative-n pricing (the reserve curve) is unaffected by this
+# exponent — that branch uses the constant-product reserve model,
+# not the supply curve.
+
+_PRICE_EXPONENT = float(os.getenv("MM_PRICE_EXPONENT", "3"))
+if not (0.0 < _PRICE_EXPONENT <= 10.0):
+    raise ValueError(
+        f"MM_PRICE_EXPONENT must be in (0, 10]; got {_PRICE_EXPONENT!r}"
+    )
+
+# Epsilon below which a negative net_vsp value is treated as zero.
+# Guards against floating-point artifacts in volume integration
+# (e.g. 10 - 99*0.1 evaluates to 0.0999... not 0.1, and a subsequent
+# subtraction can cross slightly below zero, falsely triggering the
+# reserve curve). Well above float step-size noise; well below any
+# meaningful order quantity.
+_NET_VSP_EPSILON = 1e-9
+
+logging.getLogger(__name__).info(
+    "MM pricing initialised: exponent=%s (set MM_PRICE_EXPONENT to override)",
+    _PRICE_EXPONENT,
+)
+
+
+# ────────────────────────────────────────────────────────────
 # Core price curve
 # ────────────────────────────────────────────────────────────
 
@@ -43,8 +81,9 @@ def _base_price(n: float, gold_usd: float, unit_au: float) -> float:
     """
     Base (mid) price at a given net_vsp position.
 
-    For n >= 0: log-linear supply curve anchored to gold.
-        price = log10(n + 10)^2 * unit_au * gold_usd
+    For n >= 0: log-power supply curve anchored to gold.
+        price = log10(n + 10) ** _PRICE_EXPONENT * unit_au * gold_usd
+        (default _PRICE_EXPONENT = 3; configurable via env)
 
     For n < 0: reserve distribution curve.
         Handled separately in _reserve_price().
@@ -52,7 +91,7 @@ def _base_price(n: float, gold_usd: float, unit_au: float) -> float:
     Returns price in USD per 1 VSP.
     """
     if n >= 0:
-        return math.log10(n + 10) ** 2 * unit_au * gold_usd
+        return math.log10(n + 10) ** _PRICE_EXPONENT * unit_au * gold_usd
     # Negative territory handled by caller via _reserve_price
     # This shouldn't be reached, but defensive:
     return unit_au * gold_usd * 0.01
@@ -174,9 +213,15 @@ def _sell_price_at(
     usdc_reserves: float,
     vsp_circulating: float,
 ) -> float:
-    """Sell price at a specific net_vsp position."""
-    if n >= 0:
-        return _base_price(n, gold_usd, unit_au) * (1 - half_spread)
+    """Sell price at a specific net_vsp position.
+
+    Note: n values within [-_NET_VSP_EPSILON, 0) are treated as zero
+    to handle floating-point artifacts from volume integration. A real
+    negative position requires |n| >> 1e-9, which any meaningful order
+    will produce.
+    """
+    if n >= -_NET_VSP_EPSILON:
+        return _base_price(max(n, 0.0), gold_usd, unit_au) * (1 - half_spread)
     else:
         # Below zero: use reserve distribution, still apply spread
         reserve_p = _reserve_price(n, usdc_reserves, vsp_circulating)
@@ -333,7 +378,8 @@ def get_floor_price(
     if half_spread is None:
         half_spread = DEFAULT_HALF_SPREAD
     if gold_usd is None:
-        from mm.oracle import get_gold_price_usd_per_oz
+        # Use the module-level import (line ~27); a local re-import
+        # would bypass test fixtures patching mm.mm_pricing's name.
         gold_usd = get_gold_price_usd_per_oz()
     reserve_floor = usdc_reserves / vsp_circulating if vsp_circulating > 0 else 0.0
     sell_price = _base_price(net_vsp, gold_usd, unit_au) * (1 - half_spread)

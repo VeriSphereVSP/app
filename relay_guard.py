@@ -61,7 +61,7 @@ ERC20_ALLOWANCE_ABI = [{
 
 # ── Configurable thresholds ───────────────────────────────────
 
-POSTING_FEE_WEI = 10**18           # 1 VSP — matches PostingFeePolicy default
+POSTING_FEE_WEI = 10**18           # 1 VSP — matches ProtocolPolicy default
 MIN_STAKE_WEI = 10**16             # 0.01 VSP — below this, gas costs exceed value
 REVERT_WINDOW = 600                # 10 minutes
 MAX_REVERTS_PER_WINDOW = 5         # after 5 reverts in 10min, throttle

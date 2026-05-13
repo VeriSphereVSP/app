@@ -22,7 +22,115 @@ from sqlalchemy import text as sql_text
 
 logger = logging.getLogger(__name__)
 
-DUPE_THRESHOLD = 0.85  # cosine similarity threshold for grouping
+# patch05: LLM-verified dedup
+# Three-band similarity decision: >=HIGH bundles directly,
+# [LOW, HIGH) asks the LLM for verification, <LOW skips.
+HIGH_THRESHOLD = 0.85   # cosine similarity for direct bundling (no LLM call)
+LOW_THRESHOLD  = 0.65   # cosine similarity floor for LLM verification
+DUPE_THRESHOLD = HIGH_THRESHOLD  # legacy alias; preserved for any external callers
+
+
+def _llm_verify_equivalent(db: Session, text_a: str, text_b: str,
+                            post_a: int, post_b: int,
+                            similarity: float) -> bool:
+    """
+    Ask the LLM whether two claims are semantically equivalent.
+    Cached in claim_dupe_verdict keyed by (min(post_a,post_b), max(...)).
+    Returns True iff EQUIVALENT. On any failure: returns False
+    (conservative — don't bundle on uncertainty).
+    """
+    pa, pb = (post_a, post_b) if post_a < post_b else (post_b, post_a)
+    ta, tb = (text_a, text_b) if post_a < post_b else (text_b, text_a)
+
+    # Check cache first
+    try:
+        row = db.execute(sql_text(
+            "SELECT verdict FROM claim_dupe_verdict "
+            "WHERE post_a = :pa AND post_b = :pb"
+        ), {"pa": pa, "pb": pb}).fetchone()
+        if row:
+            return row[0] == "EQUIVALENT"
+    except Exception as e:
+        # If the verdict table doesn't exist yet (migration not run),
+        # log and fall through to the LLM call. Don't crash.
+        logger.debug("verdict-cache lookup failed: %s", e)
+
+    # Cache miss — ask the LLM
+    try:
+        from llm_provider import complete, MODEL as LLM_MODEL
+    except Exception as e:
+        logger.warning("LLM provider unavailable for dedup verify: %s", e)
+        return False
+
+    system = (
+        "You decide whether two short factual claims express the same "
+        "proposition. Two claims are EQUIVALENT if they make the same "
+        "factual assertion — same subject, same predicate, same truth "
+        "conditions — even if the wording differs. They are DIFFERENT "
+        "if either could be true while the other is false, or if they "
+        "make distinct assertions about distinct things. Answer with "
+        "exactly one word: EQUIVALENT or DIFFERENT. No explanation."
+    )
+    prompt = f"Claim A: {ta!r}\nClaim B: {tb!r}\n\nAnswer (one word):"
+
+    verdict = "DIFFERENT"  # conservative default
+    try:
+        raw = complete(prompt, system=system, max_tokens=10, temperature=0.0)
+        token = (raw or "").strip().upper().split()[0] if raw else ""
+        # Tolerate punctuation, partial matches
+        if token.startswith("EQUIV"):
+            verdict = "EQUIVALENT"
+        elif token.startswith("DIFFER"):
+            verdict = "DIFFERENT"
+        else:
+            logger.warning(
+                "LLM dedup-verify: unparseable response %r for (%d, %d) sim=%.3f — "
+                "defaulting to DIFFERENT",
+                raw, pa, pb, similarity)
+    except Exception as e:
+        logger.warning("LLM dedup-verify call failed for (%d, %d): %s — "
+                       "defaulting to DIFFERENT", pa, pb, e)
+        # Don't cache failed calls — retry on next cycle
+        return False
+
+    # Cache the verdict (best-effort; tolerate if table missing)
+    try:
+        db.execute(sql_text(
+            "INSERT INTO claim_dupe_verdict (post_a, post_b, verdict, similarity, model) "
+            "VALUES (:pa, :pb, :v, :s, :m) "
+            "ON CONFLICT (post_a, post_b) DO NOTHING"
+        ), {"pa": pa, "pb": pb, "v": verdict, "s": float(similarity),
+            "m": LLM_MODEL})
+        db.commit()
+    except Exception as e:
+        logger.debug("verdict-cache write failed: %s", e)
+        try:
+            db.rollback()
+        except Exception:
+            pass
+
+    logger.info("LLM dedup-verify: posts (%d,%d) sim=%.3f → %s",
+                pa, pb, similarity, verdict)
+    return verdict == "EQUIVALENT"
+
+
+def _should_bundle(db: Session, this_pid: int, this_text: str,
+                    candidate_pid: int, candidate_text: str,
+                    distance: float) -> bool:
+    """
+    Three-band decision based on cosine distance:
+      distance <= (1 - HIGH_THRESHOLD): bundle directly
+      (1 - HIGH_THRESHOLD) < distance <= (1 - LOW_THRESHOLD): ask LLM
+      distance > (1 - LOW_THRESHOLD): no
+    """
+    similarity = 1.0 - float(distance)
+    if similarity >= HIGH_THRESHOLD:
+        return True
+    if similarity < LOW_THRESHOLD:
+        return False
+    # In the verification band — ask LLM
+    return _llm_verify_equivalent(
+        db, this_text, candidate_text, this_pid, candidate_pid, similarity)
 
 
 def _fmt_vec(v: list) -> str:
@@ -98,22 +206,27 @@ def assign_to_group(db: Session, post_id: int) -> Optional[int]:
     if existing and existing[0]:
         return existing[0]
 
-    # Compare against all group canonicals using pgvector
-    # cosine_distance = 1 - cosine_similarity
-    # We want similarity >= 0.90, so distance <= 0.10
-    max_distance = 1.0 - DUPE_THRESHOLD
+    # patch05: widen candidate window to LOW_THRESHOLD; gate via
+    # _should_bundle which routes through the LLM if the candidate
+    # falls in the verification band.
+    widest_distance = 1.0 - LOW_THRESHOLD
 
+    # Find best candidate AND fetch its claim text for the LLM check
     matches = db.execute(sql_text(
         "SELECT g.group_id, g.canonical_post_id, "
-        "       (c.embedding <=> (SELECT embedding FROM chain_claim_text WHERE post_id = :pid)) as dist "
+        "       (c.embedding <=> (SELECT embedding FROM chain_claim_text WHERE post_id = :pid)) as dist, "
+        "       c.claim_text "
         "FROM claim_dupe_group g "
         "JOIN chain_claim_text c ON c.post_id = g.canonical_post_id "
         "WHERE c.embedding IS NOT NULL "
+        "  AND g.canonical_post_id != :pid "
         "ORDER BY dist ASC "
         "LIMIT 1"
     ), {"pid": post_id}).fetchone()
 
-    if matches and matches[2] is not None and matches[2] <= max_distance:
+    if matches and matches[2] is not None and matches[2] <= widest_distance \
+            and _should_bundle(db, post_id, claim_text,
+                                matches[1], matches[3], matches[2]):
         group_id = matches[0]
         # Join this group
         db.execute(sql_text(
@@ -199,22 +312,38 @@ def _refresh_group_stats(db: Session, group_id: int):
     ), {"cpid": best_pid, "ctxt": best_text, "mc": len(members),
         "ts": total_sup, "tc": total_chal, "avs": round(agg_vs, 2), "gid": group_id})
 
-    # Eject members not similar to canonical
-    max_dist = 1.0 - DUPE_THRESHOLD
+    # patch05a: fix ejection to use _should_bundle (three-band
+    # LLM-verified gate), matching the merge decisions in
+    # assign_to_group and refresh_all_groups. Without this, the
+    # ejection check used the tight HIGH_THRESHOLD and immediately
+    # tore apart any LLM-justified merge, producing empty groups
+    # and orphaned posts.
+    #
+    # Verdicts are cached, so this only fires an LLM call once per
+    # (canonical, member) pair. Repeated _refresh_group_stats calls
+    # hit the cache and are effectively free.
+    canonical_text = best_text or ""
     for m in members:
         if m[0] == best_pid:
             continue
         dist_row = db.execute(sql_text(
-            "SELECT (c1.embedding <=> c2.embedding) "
+            "SELECT (c1.embedding <=> c2.embedding), c1.claim_text "
             "FROM chain_claim_text c1, chain_claim_text c2 "
             "WHERE c1.post_id = :p1 AND c2.post_id = :p2 "
             "AND c1.embedding IS NOT NULL AND c2.embedding IS NOT NULL"
         ), {"p1": m[0], "p2": best_pid}).fetchone()
-        if dist_row and dist_row[0] is not None and dist_row[0] > max_dist:
+        if not dist_row or dist_row[0] is None:
+            continue
+        distance = dist_row[0]
+        member_text = dist_row[1] or ""
+        # Eject iff _should_bundle says no
+        if not _should_bundle(db, m[0], member_text,
+                               best_pid, canonical_text, distance):
             db.execute(sql_text(
                 "UPDATE chain_claim_text SET dupe_group_id = NULL WHERE post_id = :pid"
             ), {"pid": m[0]})
-            logger.info("Ejected %d from group %d", m[0], group_id)
+            logger.info("Ejected %d from group %d (dist=%.3f, not bundle-worthy)",
+                        m[0], group_id, distance)
             _create_singleton_group(db, m[0])
 
 
@@ -292,18 +421,21 @@ def refresh_all_groups(db: Session):
             logger.warning("Failed to refresh group %d: %s", gid, e)
     db.commit()
 
-    # Reassociate singletons: check if any singleton now matches a non-singleton canonical
-    max_dist = 1.0 - DUPE_THRESHOLD
+    # patch05: widen candidate window to LOW_THRESHOLD; gate via
+    # _should_bundle. Note we now pull both texts for the LLM call.
+    widest_dist = 1.0 - LOW_THRESHOLD
     singletons = db.execute(sql_text(
-        "SELECT g.group_id, g.canonical_post_id "
+        "SELECT g.group_id, g.canonical_post_id, "
+        "       (SELECT claim_text FROM chain_claim_text WHERE post_id = g.canonical_post_id) "
         "FROM claim_dupe_group g WHERE g.member_count = 1"
     )).fetchall()
 
-    for sg_id, sg_pid in singletons:
+    for sg_id, sg_pid, sg_text in singletons:
         try:
             match = db.execute(sql_text(
-                "SELECT g.group_id, "
-                "       (c.embedding <=> (SELECT embedding FROM chain_claim_text WHERE post_id = :pid)) as dist "
+                "SELECT g.group_id, g.canonical_post_id, "
+                "       (c.embedding <=> (SELECT embedding FROM chain_claim_text WHERE post_id = :pid)) as dist, "
+                "       c.claim_text "
                 "FROM claim_dupe_group g "
                 "JOIN chain_claim_text c ON c.post_id = g.canonical_post_id "
                 "WHERE g.group_id != :sg AND g.member_count > 0 "
@@ -311,7 +443,9 @@ def refresh_all_groups(db: Session):
                 "ORDER BY dist ASC LIMIT 1"
             ), {"pid": sg_pid, "sg": sg_id}).fetchone()
 
-            if match and match[1] is not None and match[1] <= max_dist:
+            if match and match[2] is not None and match[2] <= widest_dist \
+                    and _should_bundle(db, sg_pid, sg_text or "",
+                                        match[1], match[3] or "", match[2]):
                 target_gid = match[0]
                 # Move singleton into the target group
                 db.execute(sql_text(
@@ -323,7 +457,7 @@ def refresh_all_groups(db: Session):
                 ), {"sg": sg_id})
                 _refresh_group_stats(db, target_gid)
                 logger.info("Singleton post_id=%d merged into group %d (dist=%.3f)",
-                            sg_pid, target_gid, match[1])
+                            sg_pid, target_gid, match[2])
         except Exception as e:
             logger.debug("Singleton reassociation failed for post %d: %s", sg_pid, e)
     db.commit()
