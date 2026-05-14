@@ -509,24 +509,38 @@ def read_vsp_circulating() -> float:
 
 def read_usdc_reserves() -> float:
     """
-    Returns the USDC held by the MM treasury, in USDC units (not
-    micro-USDC). This is the pool backing all VSP that's been sold
-    out to users.
+    Returns the virtual USDC reserves backing outstanding VSP, in
+    USDC units (not micro-USDC). The virtual reserves are the sum
+    of the hot MM wallet plus any configured cold-storage safes:
 
-    usdc_reserves = usdcToken.balanceOf(MM)
+      usdc_reserves = balanceOf(MM) + sum(balanceOf(s) for s in COLD_SAFE_ADDRESSES)
 
-    Cached for _CACHE_TTL seconds. Raises on RPC failure.
+    If no cold safes are configured (the default), this is just
+    balanceOf(MM) — identical to pre-patch06 behaviour.
+
+    Cached for _CACHE_TTL seconds. The cache is on the aggregate
+    result, not the individual balanceOf calls; a single read
+    triggers up to (1 + len(COLD_SAFE_ADDRESSES)) RPC calls. Raises
+    on RPC failure (any single balanceOf failure raises the whole
+    aggregate read — fail-fast, never partial sums).
     """
     def _read():
-        from config import MM_ADDRESS
+        from config import MM_ADDRESS, COLD_SAFE_ADDRESSES
         if not MM_ADDRESS:
             raise RuntimeError("MM_ADDRESS not configured")
         usdc = _get_usdc_token()
-        balance_micro = usdc.functions.balanceOf(
+        total_micro = 0
+        # Hot wallet
+        total_micro += usdc.functions.balanceOf(
             Web3.to_checksum_address(MM_ADDRESS)
         ).call()
+        # Cold safes (patch06; empty list when COLD_SAFE_ADDRESSES unset)
+        for cold_addr in COLD_SAFE_ADDRESSES:
+            total_micro += usdc.functions.balanceOf(
+                Web3.to_checksum_address(cold_addr)
+            ).call()
         # USDC uses 6 decimals.
-        return balance_micro / 1e6
+        return total_micro / 1e6
     return _cached("mm_usdc_reserves", _read)
 
 

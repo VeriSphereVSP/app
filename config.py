@@ -56,6 +56,42 @@ MM_PRIVATE_KEY = os.getenv("MM_PRIVATE_KEY", "")
 # Treasury wallet (revenue — receives trade fees + relay fees)
 TREASURY_ADDRESS = os.getenv("TREASURY_ADDRESS", MM_ADDRESS)  # fallback to MM if not set
 
+# patch06: virtual reserves — cold-storage addresses whose USDC
+# balances are summed into read_usdc_reserves(). Comma-separated env
+# var, whitespace-tolerant. Empty/unset → behaves as before
+# (balanceOf(MM) only). Each entry must be a valid 0x-prefixed
+# address; malformed entries fail-fast at startup.
+def _parse_cold_safe_addresses(raw: str) -> list:
+    if not raw or not raw.strip():
+        return []
+    result = []
+    seen = set()
+    for tok in raw.split(","):
+        addr = tok.strip()
+        if not addr:
+            continue
+        # Validate shape: 0x + 40 hex chars
+        if not (addr.startswith("0x") and len(addr) == 42 and
+                all(c in "0123456789abcdefABCDEF" for c in addr[2:])):
+            raise ValueError(
+                f"COLD_SAFE_ADDRESSES contains malformed address: {addr!r}"
+            )
+        # Normalize to lowercase for dedup (web3 will checksum at use site)
+        addr_lower = addr.lower()
+        # Skip zero address
+        if addr_lower == "0x" + "0" * 40:
+            continue
+        # Skip duplicates (including MM itself — would double-count)
+        if addr_lower == MM_ADDRESS.lower() or addr_lower in seen:
+            continue
+        seen.add(addr_lower)
+        result.append(addr)
+    return result
+
+COLD_SAFE_ADDRESSES = _parse_cold_safe_addresses(
+    os.getenv("COLD_SAFE_ADDRESSES", "")
+)
+
 # Database
 DB_USER = os.getenv("DB_USER", "verisphere")
 DB_PASS = os.getenv("DB_PASS", "")
