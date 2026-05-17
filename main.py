@@ -1,4 +1,14 @@
 # app/main.py
+# patch_bundle03_logging: ensure logger.info from relay.py, article_routes.py,
+# etc. is visible in 'docker compose logs app'. Mirrors worker.py.
+import logging as _bundle03_logging
+import sys as _bundle03_sys
+_bundle03_logging.basicConfig(
+    level=_bundle03_logging.INFO,
+    format="%(asctime)s %(name)s %(levelname)s %(message)s",
+    stream=_bundle03_sys.stdout,
+)
+
 import asyncio
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Depends, Request

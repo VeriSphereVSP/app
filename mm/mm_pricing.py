@@ -282,8 +282,11 @@ def get_spot_quote(
     buy = mid * (1 + half_spread)
     sell_p = mid * (1 - half_spread)
 
-    # Floor: bonding curve price at n=0
-    # Floor: min(reserves/outstanding, sell_price)
+    # Floor semantics: the maximum buyback price Verisphere can guarantee
+    # if a holder liquidates back to the MM. That is min(reserve_floor,
+    # sell_p) — bounded above by the current sell quote because the MM
+    # never quotes a buyback above the pricing curve, even when reserves
+    # would theoretically support a higher ratio. Confirmed 2026-05-15.
     reserve_floor = usdc_reserves / vsp_circulating if vsp_circulating > 0 else 0.0
     floor = min(reserve_floor, sell_p)
 
@@ -383,4 +386,5 @@ def get_floor_price(
         gold_usd = get_gold_price_usd_per_oz()
     reserve_floor = usdc_reserves / vsp_circulating if vsp_circulating > 0 else 0.0
     sell_price = _base_price(net_vsp, gold_usd, unit_au) * (1 - half_spread)
+    # See get_spot_quote: floor = max guaranteed buyback, never above curve.
     return min(reserve_floor, sell_price)

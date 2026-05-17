@@ -12,6 +12,7 @@ from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 from sqlalchemy import text
+sql_text = text  # alias: legacy code in this file uses both names
 
 from db import get_db
 from fee_calculator import compute_fee as calc_fee
@@ -48,11 +49,15 @@ def _load_mm_state(db: Session, *, for_update: bool = False):
     """
     Returns (net_vsp, unit_au, half_spread, usdc_reserves, vsp_circulating).
 
-    net_vsp, unit_au, half_spread come from the DB (mm_state row).
-    usdc_reserves and vsp_circulating are derived from chain state
-    (patch12a). The DB columns for usdc_reserves and vsp_circulating
-    are still updated by trade paths but ignored here — kept as a
-    forensic record only.
+    All values except unit_au and half_spread are derived from chain:
+      usdc_reserves    = balanceOf(MM) + Σ balanceOf(cold safes)  [USDC]
+      vsp_circulating  = totalSupply - balanceOf(MM)              [VSPToken]
+      net_vsp          = round(vsp_circulating)
+        -- In current accounting net_vsp == vsp_circulating (the n<0 branch
+        -- in pricing is unreachable). Returned as int for legacy callers
+        -- (compute_buy_fill/compute_sell_fill/get_spot_quote take int).
+
+    unit_au and half_spread are MM parameters from the mm_state DB row.
 
     Raises HTTP 503 if MM state row is missing OR if the chain RPC
     is unreachable. We fail closed rather than serve mispriced
@@ -61,13 +66,13 @@ def _load_mm_state(db: Session, *, for_update: bool = False):
     suffix = " FOR UPDATE" if for_update else ""
     row = db.execute(
         text(
-            "SELECT net_vsp, unit_au, half_spread "
+            "SELECT unit_au, half_spread "
             f"FROM mm_state WHERE id = TRUE{suffix}"
         )
     ).fetchone()
     if not row:
         raise HTTPException(503, "MM state not initialized")
-    net_vsp, unit_au, half_spread = row
+    unit_au, half_spread = row
 
     try:
         usdc_reserves = read_usdc_reserves()
@@ -76,18 +81,19 @@ def _load_mm_state(db: Session, *, for_update: bool = False):
         logger.error("MM chain-state read failed: %s", e)
         raise HTTPException(503, f"MM chain state unavailable: {e}")
 
+    net_vsp = int(round(vsp_circulating))
     return (net_vsp, unit_au, half_spread, usdc_reserves, vsp_circulating)
 
 
-def _update_mm_state(db, net_vsp, usdc_reserves, vsp_circulating):
+def _update_mm_state(db, net_vsp=None, usdc_reserves=None, vsp_circulating=None):
+    """
+    Touches updated_at on the mm_state row. Previously also wrote net_vsp,
+    usdc_reserves, vsp_circulating — those columns were dropped in migration
+    031 (derived from chain instead). Args retained for caller compatibility
+    but unused; callers may be cleaned up in a future pass.
+    """
     db.execute(
-        text(
-            "UPDATE mm_state "
-            "SET net_vsp = :n, usdc_reserves = :r, vsp_circulating = :c, "
-            "    updated_at = now() "
-            "WHERE id = TRUE"
-        ),
-        {"n": net_vsp, "r": usdc_reserves, "c": vsp_circulating},
+        text("UPDATE mm_state SET updated_at = now() WHERE id = TRUE")
     )
 
 
@@ -430,14 +436,21 @@ def mm_buy(req: MMTradeRequest, db: Session = Depends(get_db)):
                 transfer_from(USDC_ADDRESS, req.user_address, MM_ADDRESS, fee_micro)
             transfer(VSP_ADDRESS, req.user_address, int(req.qty_vsp * 10**18))
 
-            new_net = fill.new_net_vsp
-            new_reserves = usdc_reserves + fill.total_usd
-            new_circ = vsp_circulating + req.qty_vsp
-
-            # patch12a: forensic-only DB update; callers read from chain.
-            _update_mm_state(db, new_net, new_reserves, new_circ)
-            # Force next quote to re-read chain state (post-transfer).
+            # Force next chain read to skip cache, then re-read chain state
+            # so the audit log records observed-on-chain values rather than
+            # DB-derived arithmetic (which drifts).
             invalidate_mm_chain_state_cache()
+            try:
+                new_reserves = read_usdc_reserves()
+                new_circ = read_vsp_circulating()
+            except Exception as e:
+                logger.warning("Post-buy chain reread failed (%s); using arithmetic", e)
+                new_reserves = usdc_reserves + fill.total_usd
+                new_circ = vsp_circulating + req.qty_vsp
+            new_net = int(round(new_circ))
+
+            # mm_state has no live state to update post-031; just touch updated_at.
+            _update_mm_state(db)
             _log_trade(db, side="buy", user_address=req.user_address,
                        qty_vsp=req.qty_vsp, total_usdc=fill.total_usd,
                        avg_price_usd=fill.avg_price_usd, net_vsp_before=net_vsp,
@@ -529,14 +542,20 @@ def mm_sell(req: MMTradeRequest, db: Session = Depends(get_db)):
             if fee_micro > 0 and TREASURY_ADDRESS.lower() != MM_ADDRESS.lower():
                 transfer(USDC_ADDRESS, TREASURY_ADDRESS, fee_micro)
 
-            new_net = fill.new_net_vsp
-            new_reserves = usdc_reserves - fill.total_usd
-            new_circ = vsp_circulating - req.qty_vsp
-
-            # patch12a: forensic-only DB update; callers read from chain.
-            _update_mm_state(db, new_net, new_reserves, new_circ)
-            # Force next quote to re-read chain state (post-transfer).
+            # Invalidate then re-read chain so audit log records observed
+            # post-trade reality (not DB arithmetic, which drifts).
             invalidate_mm_chain_state_cache()
+            try:
+                new_reserves = read_usdc_reserves()
+                new_circ = read_vsp_circulating()
+            except Exception as e:
+                logger.warning("Post-sell chain reread failed (%s); using arithmetic", e)
+                new_reserves = usdc_reserves - fill.total_usd
+                new_circ = vsp_circulating - req.qty_vsp
+            new_net = int(round(new_circ))
+
+            # mm_state has no live state to update post-031; just touch updated_at.
+            _update_mm_state(db)
             # Track trade fee separately
             try:
                 db.execute(sql_text(
