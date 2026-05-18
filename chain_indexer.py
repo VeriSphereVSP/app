@@ -1,22 +1,37 @@
 # app/chain_indexer.py
 """
-Chain Indexer — watches on-chain events and syncs state to the DB.
+Chain Indexer — atomic single-cursor poll loop with reorg confirmation buffer.
 
-Runs as a background thread inside the app process.
-Polls for new events every POLL_INTERVAL seconds.
-On each relevant event, reads current on-chain state and writes to DB.
+Runs as a background thread inside the worker process. Each cycle:
 
-Tables populated:
+  1. Read chain head.
+  2. Compute safe_head = chain_head - CONFIRMATION_DEPTH (reorg buffer).
+  3. Compute [from_block, to_block] from the global cursor.
+  4. Fetch events from all three contracts for that range (no DB writes).
+  5. Sort events globally by (block, tx_index, log_index).
+  6. Replay events into a transient effects map (affected posts, new links).
+  7. Apply effects in one DB transaction; commit cursor with the rest.
+  8. Resolve any pending tx_log rows.
+
+If any step from (4)-(7) fails, the transaction rolls back and the cursor
+stays at `last_block`. The next cycle retries the same range.
+
+Tables populated (canonical state):
   chain_post         — per-post stake totals, VS, activity status
   chain_user_stake   — per-user per-post stake positions
   chain_link         — evidence links from LinkGraph
   chain_claim_text   — claim text from PostRegistry
   chain_global       — sMax and other global stats
-  chain_indexer_state — last processed block per contract
+  chain_indexer_state — last processed block (key='last_block_global')
+
+Derived state (article system, dupe groups, topic detection) is decoupled
+into derived_state_worker.py. We write to derived_state_queue here; that
+worker reads and applies it.
 """
 
 import json
 import logging
+import os
 import threading
 import time
 from pathlib import Path
@@ -36,15 +51,23 @@ from config import (
 
 logger = logging.getLogger(__name__)
 
-# patch_bundle04b2: trigger_reindex() and _queue_article_refresh() removed.
-# Both were called only from relay.py's now-deleted _relay_sync path.
-# Reindex now happens exclusively via the indexer's poll cycle.
+# ── Constants ──────────────────────────────────────────────────────
 
-# APP-04: Input validation for on-chain claim text
+POLL_INTERVAL = 15  # seconds between cycles
+BLOCK_BATCH   = 2000  # max blocks processed per cycle
+
+# Reorg buffer: never process events from blocks within this many of head.
+# 3 is conservative for Avalanche Fuji (effective finality ~1 block).
+# For mainnet, raise to 5-10.
+CONFIRMATION_DEPTH = int(os.environ.get("INDEXER_CONFIRMATION_DEPTH", "3"))
+
+# Cold-start lookback when last_block_global is 0 (fresh DB).
+COLD_START_LOOKBACK = 100_000
+
+# APP-04: Sanitize on-chain claim text before DB insert.
 MAX_CLAIM_DB_LENGTH = 5000
 
 def _validate_claim_text(text: str) -> str:
-    """Sanitize claim text from on-chain before DB insertion."""
     if not text:
         return ""
     cleaned = "".join(ch for ch in text if ch == '\n' or ch == '\t' or (ord(ch) >= 32))
@@ -52,17 +75,7 @@ def _validate_claim_text(text: str) -> str:
         cleaned = cleaned[:MAX_CLAIM_DB_LENGTH]
     return cleaned
 
-POLL_INTERVAL = 15  # Balanced: fast enough for UX, low RPC cost
-BLOCK_BATCH = 2000  # blocks per poll
-
-# Cold-start lookback: when the indexer state is empty (e.g., after a
-# fresh deploy that wiped the DB), how many blocks back from chain head
-# to begin polling. Must comfortably exceed the worst-case gap between
-# (chain head when first user activity happens) and (chain head when
-# indexer first polls after restart). 100k blocks ≈ 2.3 days on Fuji.
-COLD_START_LOOKBACK = 100_000
-
-# ── Web3 setup ────────────────────────────────────────
+# ── Web3 setup ─────────────────────────────────────────────────────
 
 _w3 = None
 
@@ -81,168 +94,28 @@ def _load_abi(name):
     return []
 
 
-# ── Index a single post ─────────────────────────────────
-
-def index_post(db: Session, post_id: int, user_addresses: list[str] | None = None):
-    """Read on-chain state for a post and upsert into DB.
-    Optionally index specific user positions."""
-    w3 = _get_w3()
-
-    se_abi = _load_abi("StakeEngine")
-    sc_abi = _load_abi("ScoreEngine")
-    reg_abi = _load_abi("PostRegistry")
-
-    se = w3.eth.contract(address=Web3.to_checksum_address(STAKE_ENGINE_ADDRESS), abi=se_abi)
-    sc = w3.eth.contract(address=Web3.to_checksum_address(SCORE_ENGINE_ADDRESS), abi=sc_abi)
-    reg = w3.eth.contract(address=Web3.to_checksum_address(POST_REGISTRY_ADDRESS), abi=reg_abi)
-
-    try:
-        # Stake totals
-        support_wei, challenge_wei = se.functions.getPostTotals(post_id).call()
-        support = support_wei / 1e18
-        challenge = challenge_wei / 1e18
-        total = support + challenge
-
-        # VS
-        try:
-            vs_ray = sc.functions.effectiveVSRay(post_id).call()
-            effective_vs = (vs_ray / 1e18) * 100
-        except Exception:
-            effective_vs = 0.0
-
-        try:
-            base_ray = sc.functions.baseVSRay(post_id).call()
-            base_vs = (base_ray / 1e18) * 100
-        except Exception:
-            base_vs = 0.0
-
-        # Post metadata
-        try:
-            post_data = reg.functions.getPost(post_id).call()
-            creator = post_data[0]
-            content_type = post_data[2]  # 0=claim, 1=link (3rd field)
-            created_epoch = post_data[1]
-        except Exception:
-            creator = None
-            content_type = 0
-            created_epoch = None
-
-        # Activity check (total >= posting fee = 1 VSP)
-        is_active = total >= 1.0
-
-        db.execute(sql_text("""
-            INSERT INTO chain_post (post_id, content_type, creator, support_total, challenge_total,
-                                    base_vs, effective_vs, is_active, created_epoch, indexed_at)
-            VALUES (:pid, :ct, :cr, :s, :c, :bvs, :evs, :active, :epoch, now())
-            ON CONFLICT (post_id) DO UPDATE SET
-                support_total = :s, challenge_total = :c,
-                base_vs = :bvs, effective_vs = :evs,
-                is_active = :active, indexed_at = now()
-        """), {
-            "pid": post_id, "ct": content_type, "cr": creator,
-            "s": support, "c": challenge,
-            "bvs": base_vs, "evs": effective_vs,
-            "active": is_active, "epoch": created_epoch,
-        })
-
-        # Claim text (for claims only)
-        if content_type == 0:
-            try:
-                # getPost returns (creator, timestamp, contentType, contentId, fee)
-                content_id = post_data[3]
-                claim_text = _validate_claim_text(reg.functions.getClaim(content_id).call())
-                # APP-02: Display-side moderation
-                try:
-                    from moderation import check_content_fast
-                    _is_moderated = not check_content_fast(claim_text).allowed
-                except Exception:
-                    _is_moderated = False
-                db.execute(sql_text("""
-                    INSERT INTO chain_claim_text (post_id, claim_text, indexed_at)
-                    VALUES (:pid, :txt, now())
-                    ON CONFLICT (post_id) DO UPDATE SET claim_text = :txt, is_moderated = :mod, indexed_at = now()
-                """), {"pid": post_id, "txt": claim_text, "mod": _is_moderated})
-            except Exception as e:
-                logger.debug("Could not index claim text for post %d: %s", post_id, e)
-
-            # PD-04: Embed claim and assign to dupe group (background-safe)
-            try:
-                from dupe_groups import embed_claim, assign_to_group
-                embed_claim(db, post_id, claim_text)
-                assign_to_group(db, post_id)
-            except Exception as e:
-                logger.debug("Dupe grouping failed for post %d: %s", post_id, e)
-
-            # patch_bundle04a_article_catchup: keep the article system in
-            # sync with chain state at the indexer's cadence, instead of
-            # depending on relay.py's synchronous post-create work. Both
-            # functions are idempotent: calling them when there's nothing
-            # new to link is a no-op.
-            try:
-                if claim_text:
-                    from articles.article_store import apply_new_post
-                    from articles.claim_indexer import cross_index_claim_into_all_articles
-                    apply_new_post(db, post_id, claim_text)
-                    cross_index_claim_into_all_articles(db, claim_text, post_id)
-            except Exception as e:
-                logger.debug("Article catch-up failed for post %d: %s", post_id, e)
-
-            # patch04: topic detection in index_post (canonical path)
-            # Runs for every indexed post, in both full_sync and
-            # poll_events. Idempotent: skips if claim.topic is
-            # already set. ensure_claim() guarantees the claim row
-            # exists before we try to UPDATE it.
-            try:
-                from semantic import ensure_claim
-                from articles.topic_detect import detect_topic, ensure_article_for_claim
-                cid = ensure_claim(db, claim_text)
-                existing_topic = db.execute(sql_text(
-                    "SELECT topic FROM claim WHERE claim_id = :cid"
-                ), {"cid": cid}).fetchone()
-                if not existing_topic or not existing_topic[0]:
-                    _topic = detect_topic(claim_text)
-                    if _topic:
-                        db.execute(sql_text(
-                            "UPDATE claim SET topic = :t "
-                            "WHERE claim_id = :cid AND (topic IS NULL OR topic = '')"
-                        ), {"t": _topic, "cid": cid})
-                        db.commit()
-                        logger.info(
-                            "patch04 topic-detect: post_id=%d cid=%d → %r",
-                            post_id, cid, _topic)
-                        # Article generation runs in background thread
-                        # inside ensure_article_for_claim (non-blocking).
-                        import threading
-                        def _bg_article(ct, pid, topic):
-                            try:
-                                from db import get_session_factory
-                                bg = get_session_factory()()
-                                try:
-                                    ensure_article_for_claim(bg, ct, pid, topic)
-                                finally:
-                                    bg.close()
-                            except Exception as ex:
-                                logger.debug("BG article gen failed for post %d: %s", pid, ex)
-                        threading.Thread(
-                            target=_bg_article, args=(claim_text, post_id, _topic),
-                            daemon=True, name=f"art-gen-{post_id}").start()
-            except Exception as e:
-                logger.warning("patch04 topic-detect failed for post %d: %s", post_id, e)
-
-        # User positions
-        if user_addresses:
-            for addr in user_addresses:
-                _index_user_stake(db, se, addr, post_id)
-
-        db.commit()
-
-    except Exception as e:
-        logger.warning("Failed to index post %d: %s", post_id, e)
-        db.rollback()
+def _get_contracts(w3):
+    """Returns dict of contract_name -> (contract, [event_names_we_care_about])."""
+    se = w3.eth.contract(
+        address=Web3.to_checksum_address(STAKE_ENGINE_ADDRESS),
+        abi=_load_abi("StakeEngine"))
+    reg = w3.eth.contract(
+        address=Web3.to_checksum_address(POST_REGISTRY_ADDRESS),
+        abi=_load_abi("PostRegistry"))
+    lg = w3.eth.contract(
+        address=Web3.to_checksum_address(LINK_GRAPH_ADDRESS),
+        abi=_load_abi("LinkGraph"))
+    return {
+        "StakeEngine":  (se,  ["StakeAdded", "StakeWithdrawn", "PostUpdated"]),
+        "PostRegistry": (reg, ["PostCreated"]),
+        "LinkGraph":    (lg,  ["EdgeAdded"]),
+    }
 
 
-def _index_user_stake(db: Session, se, user_address: str, post_id: int):
-    """Index a user's stake position on a post."""
+# ── Canonical write helpers (no commits — caller manages transaction) ──
+
+def _index_user_stake_canonical(db: Session, se, user_address: str, post_id: int):
+    """Write a single user's stake position on a post. No commit."""
     addr = Web3.to_checksum_address(user_address)
     for side in (0, 1):
         try:
@@ -250,13 +123,12 @@ def _index_user_stake(db: Session, se, user_address: str, post_id: int):
             amount = lot_info[0] / 1e18
             weighted_pos = lot_info[1] / 1e18
             entry_epoch = lot_info[2]
-            pos_weight = lot_info[4] / 1e18
+            pos_weight = lot_info[3] / 1e18
 
             if amount > 0:
                 db.execute(sql_text("""
-                    INSERT INTO chain_user_stake
-                        (user_address, post_id, side, amount, weighted_position,
-                         entry_epoch, tranche, position_weight, indexed_at)
+                    INSERT INTO chain_user_stake (user_address, post_id, side, amount, weighted_position,
+                                                   entry_epoch, tranche, position_weight, indexed_at)
                     VALUES (:addr, :pid, :side, :amt, :wp, :ee, :tr, :pw, now())
                     ON CONFLICT (user_address, post_id, side) DO UPDATE SET
                         amount = :amt, weighted_position = :wp,
@@ -277,9 +149,109 @@ def _index_user_stake(db: Session, se, user_address: str, post_id: int):
                          user_address[:10], post_id, side, e)
 
 
-def index_link(db: Session, link_post_id: int, from_post_id: int,
-               to_post_id: int, is_challenge: bool):
-    """Index an evidence link."""
+def index_post_canonical(
+    db: Session,
+    post_id: int,
+    user_addresses: list[str] | None = None,
+) -> dict:
+    """Write canonical chain state for a post to chain_post, chain_claim_text,
+    chain_user_stake. Does NOT commit. Returns metadata about what was written.
+
+    Returns {'content_type': 0|1, 'is_new': bool, 'claim_text': str|None}.
+    Raises on failure — caller should rollback their transaction.
+    """
+    w3 = _get_w3()
+    se_abi = _load_abi("StakeEngine")
+    sc_abi = _load_abi("ScoreEngine")
+    reg_abi = _load_abi("PostRegistry")
+    se = w3.eth.contract(address=Web3.to_checksum_address(STAKE_ENGINE_ADDRESS), abi=se_abi)
+    sc = w3.eth.contract(address=Web3.to_checksum_address(SCORE_ENGINE_ADDRESS), abi=sc_abi)
+    reg = w3.eth.contract(address=Web3.to_checksum_address(POST_REGISTRY_ADDRESS), abi=reg_abi)
+
+    # ── Stake totals ─────
+    support_wei, challenge_wei = se.functions.getPostTotals(post_id).call()
+    support = support_wei / 1e18
+    challenge = challenge_wei / 1e18
+    total = support + challenge
+
+    # ── VS scores ─────
+    try:
+        vs_ray = sc.functions.effectiveVSRay(post_id).call()
+        effective_vs = (vs_ray / 1e18) * 100
+    except Exception:
+        effective_vs = 0.0
+    try:
+        base_ray = sc.functions.baseVSRay(post_id).call()
+        base_vs = (base_ray / 1e18) * 100
+    except Exception:
+        base_vs = 0.0
+
+    # ── Post metadata ─────
+    try:
+        post_data = reg.functions.getPost(post_id).call()
+        creator = post_data[0]
+        content_type = post_data[2]
+        created_epoch = post_data[1]
+    except Exception:
+        creator = None
+        content_type = 0
+        created_epoch = None
+
+    is_active = total >= 1.0
+
+    # Was this post already in chain_post before this call?
+    existed = db.execute(sql_text(
+        "SELECT 1 FROM chain_post WHERE post_id = :p"
+    ), {"p": post_id}).fetchone()
+    is_new = existed is None
+
+    db.execute(sql_text("""
+        INSERT INTO chain_post (post_id, content_type, creator, support_total, challenge_total,
+                                base_vs, effective_vs, is_active, created_epoch, indexed_at)
+        VALUES (:pid, :ct, :cr, :s, :c, :bvs, :evs, :active, :epoch, now())
+        ON CONFLICT (post_id) DO UPDATE SET
+            support_total = :s, challenge_total = :c,
+            base_vs = :bvs, effective_vs = :evs,
+            is_active = :active, indexed_at = now()
+    """), {
+        "pid": post_id, "ct": content_type, "cr": creator,
+        "s": support, "c": challenge,
+        "bvs": base_vs, "evs": effective_vs,
+        "active": is_active, "epoch": created_epoch,
+    })
+
+    claim_text = None
+    if content_type == 0:
+        try:
+            content_id = post_data[3]
+            claim_text = _validate_claim_text(reg.functions.getClaim(content_id).call())
+            # Display-side moderation flag is best-effort; default False.
+            try:
+                from moderation import check_content_fast
+                is_moderated = not check_content_fast(claim_text).allowed
+            except Exception:
+                is_moderated = False
+            db.execute(sql_text("""
+                INSERT INTO chain_claim_text (post_id, claim_text, indexed_at)
+                VALUES (:pid, :txt, now())
+                ON CONFLICT (post_id) DO UPDATE SET
+                    claim_text = :txt, is_moderated = :mod, indexed_at = now()
+            """), {"pid": post_id, "txt": claim_text, "mod": is_moderated})
+        except Exception as e:
+            logger.debug("Could not index claim text for post %d: %s", post_id, e)
+            claim_text = None
+
+    # User positions
+    if user_addresses:
+        for addr in user_addresses:
+            _index_user_stake_canonical(db, se, addr, post_id)
+
+    return {"content_type": content_type, "is_new": is_new, "claim_text": claim_text}
+
+
+def index_link_canonical(db: Session, link_post_id: int, from_post_id: int,
+                         to_post_id: int, is_challenge: bool):
+    """Insert/update an evidence link. No commit."""
     db.execute(sql_text("""
         INSERT INTO chain_link (link_post_id, from_post_id, to_post_id, is_challenge, indexed_at)
         VALUES (:lpid, :fpid, :tpid, :ic, now())
@@ -287,14 +259,14 @@ def index_link(db: Session, link_post_id: int, from_post_id: int,
             from_post_id = :fpid, to_post_id = :tpid,
             is_challenge = :ic, indexed_at = now()
     """), {"lpid": link_post_id, "fpid": from_post_id, "tpid": to_post_id, "ic": is_challenge})
-    db.commit()
 
 
-def index_global_stats(db: Session):
-    """Index global protocol stats like sMax."""
+def index_global_stats_canonical(db: Session):
+    """Update chain_global stats. No commit. Best-effort within the transaction."""
     w3 = _get_w3()
-    se_abi = _load_abi("StakeEngine")
-    se = w3.eth.contract(address=Web3.to_checksum_address(STAKE_ENGINE_ADDRESS), abi=se_abi)
+    se = w3.eth.contract(
+        address=Web3.to_checksum_address(STAKE_ENGINE_ADDRESS),
+        abi=_load_abi("StakeEngine"))
 
     try:
         s_max_wei = se.functions.sMax().call()
@@ -305,7 +277,6 @@ def index_global_stats(db: Session):
             ON CONFLICT (key) DO UPDATE SET value_num = :val, updated_at = now()
         """), {"val": s_max})
 
-        # sMax decay parameters (governance-configurable since SC-02)
         try:
             decay_rate = se.functions.sMaxDecayRateRay().call()
             db.execute(sql_text("""
@@ -325,7 +296,6 @@ def index_global_stats(db: Session):
         except Exception:
             pass
 
-        # Rate policy parameters (read from ProtocolPolicy via StakeEngine)
         try:
             rp = se.functions.protocolPolicy().call()
             rp_contract = w3.eth.contract(address=rp, abi=[
@@ -346,220 +316,299 @@ def index_global_stats(db: Session):
             """), {"val": r_max_ray / 1e18})
         except Exception:
             pass
-
-        db.commit()
     except Exception as e:
-        logger.warning("Failed to index global stats: %s", e)
+        logger.warning("Failed to read global stats: %s", e)
+        raise
+
+
+# ── Derived-state enqueue ──────────────────────────────────────────
+
+def enqueue_derived_state(db: Session, post_id: int, is_new: bool):
+    """Write a derived_state_queue row for this post. Caller commits.
+
+    patch_bundle04_p2: ON CONFLICT DO NOTHING relies on the partial
+    UNIQUE index uq_dsq_active_per_post (migration 211) so duplicate
+    enqueues for the same (post_id, queue_kind) while an existing row
+    is still pending/in_progress are silently dropped. The derived
+    work is idempotent — one pending row covers all events on a post
+    until processed."""
+    kind = "post_create" if is_new else "post_update"
+    db.execute(sql_text("""
+        INSERT INTO derived_state_queue (post_id, queue_kind, status)
+        VALUES (:pid, :kind, 'pending')
+        -- patch_bundle04_p2_hotfix: ON CONFLICT ON CONSTRAINT works only for
+        -- named constraints; uq_dsq_active_per_post is a partial UNIQUE INDEX,
+        -- so we use the inference form (columns + WHERE predicate matching
+        -- the partial-index definition).
+        ON CONFLICT (post_id, queue_kind) WHERE status IN ('pending', 'in_progress') DO NOTHING
+    """), {"pid": post_id, "kind": kind})
+
+
+# ── Cursor management ─────────────────────────────────────────────
+
+CURSOR_KEY = "last_block_global"
+
+def _get_last_block(db: Session) -> int:
+    row = db.execute(sql_text(
+        "SELECT value FROM chain_indexer_state WHERE key = :k"
+    ), {"k": CURSOR_KEY}).fetchone()
+    return int(row[0]) if row else 0
+
+
+def _set_last_block(db: Session, block: int):
+    """No commit — caller manages transaction."""
+    db.execute(sql_text("""
+        INSERT INTO chain_indexer_state (key, value, updated_at)
+        VALUES (:k, :v, now())
+        ON CONFLICT (key) DO UPDATE SET value = :v, updated_at = now()
+    """), {"k": CURSOR_KEY, "v": str(block)})
+
+
+# ── Connected-post expansion ───────────────────────────────────────
+
+def _list_connected_posts(db: Session, post_id: int) -> set:
+    """Return post_ids one hop away from this post via chain_link.
+    Used for VS recomputation: a new edge into post X means posts that
+    link to X also have their VS affected."""
+    rows = db.execute(sql_text(
+        "SELECT DISTINCT from_post_id AS pid FROM chain_link WHERE to_post_id = :pid "
+        "UNION "
+        "SELECT DISTINCT to_post_id   AS pid FROM chain_link WHERE from_post_id = :pid "
+        "UNION "
+        "SELECT DISTINCT link_post_id AS pid FROM chain_link "
+        "WHERE from_post_id = :pid OR to_post_id = :pid"
+    ), {"pid": post_id}).fetchall()
+    return {row[0] for row in rows if row[0] != post_id}
+
+
+# ── Atomic poll loop ──────────────────────────────────────────────
+
+def poll_events_atomic(db: Session) -> dict:
+    """Run one atomic poll cycle.
+
+    Returns a stats dict; raises only on RPC fetch failure (rare; outer
+    loop catches and continues). DB-write failures are caught here and
+    cause the cursor to stay at last_block.
+    """
+    w3 = _get_w3()
+    current_block = w3.eth.block_number
+    safe_head = current_block - CONFIRMATION_DEPTH
+
+    last_block = _get_last_block(db)
+    if last_block == 0:
+        last_block = max(safe_head - COLD_START_LOOKBACK, 0)
+        logger.info("Indexer cold start: first poll from block %d (head=%d, safe=%d)",
+                    last_block, current_block, safe_head)
+
+    from_block = last_block + 1
+    to_block = min(from_block + BLOCK_BATCH - 1, safe_head)
+    if from_block > to_block:
+        return {"events": 0, "posts": 0, "from_block": from_block, "to_block": from_block - 1}
+
+    # ── Phase 1: fetch all events from chain (idempotent, no DB writes) ──
+    contracts = _get_contracts(w3)
+    all_events = []
+    try:
+        for contract_name, (contract, event_names) in contracts.items():
+            for event_name in event_names:
+                event_obj = getattr(contract.events, event_name)
+                for evt in event_obj.get_logs(from_block=from_block, to_block=to_block):
+                    all_events.append({
+                        "block":      evt.blockNumber,
+                        "tx_index":   evt.transactionIndex,
+                        "log_index":  evt.logIndex,
+                        "contract":   contract_name,
+                        "event_name": event_name,
+                        "evt":        evt,
+                    })
+    except Exception as e:
+        logger.warning("RPC fetch failed for range %d-%d: %s", from_block, to_block, e)
+        # Cursor stays at last_block; next cycle retries.
+        return {"events": 0, "posts": 0, "from_block": from_block, "to_block": to_block, "error": "rpc_fetch"}
+
+    all_events.sort(key=lambda e: (e["block"], e["tx_index"], e["log_index"]))
+
+    # ── Phase 2: build effects map from events (no DB I/O) ──
+    affected_posts = {}   # post_id -> {"users": set[str]}
+    new_links = []        # list of (lpid, fpid, tpid, ic)
+
+    for e in all_events:
+        name = e["event_name"]
+        evt = e["evt"]
+        if name == "StakeAdded":
+            pid = evt.args.postId
+            staker = evt.args.staker.lower()
+            affected_posts.setdefault(pid, {"users": set()})["users"].add(staker)
+        elif name == "StakeWithdrawn":
+            pid = evt.args.postId
+            staker = evt.args.staker.lower()
+            affected_posts.setdefault(pid, {"users": set()})["users"].add(staker)
+        elif name == "PostUpdated":
+            affected_posts.setdefault(evt.args.postId, {"users": set()})
+        elif name == "PostCreated":
+            pid = evt.args.postId
+            creator = evt.args.creator.lower()
+            affected_posts.setdefault(pid, {"users": set()})["users"].add(creator)
+        elif name == "EdgeAdded":
+            link_pid = evt.args.linkPostId
+            from_pid = evt.args["from"]
+            to_pid   = evt.args["to"]
+            ic       = evt.args.isChallenge
+            new_links.append((link_pid, from_pid, to_pid, ic))
+            for p in (from_pid, to_pid, link_pid):
+                affected_posts.setdefault(p, {"users": set()})
+
+    # ── Phase 3: apply effects atomically ──
+    try:
+        # Index links first (chain_link rows must exist before we expand
+        # _list_connected_posts for those links).
+        for (lpid, fpid, tpid, ic) in new_links:
+            index_link_canonical(db, lpid, fpid, tpid, ic)
+
+        # Connected-post expansion (one hop). Run AFTER links written
+        # so newly-added edges contribute to the connectivity.
+        for (lpid, fpid, tpid, _ic) in new_links:
+            for cpid in _list_connected_posts(db, fpid) | _list_connected_posts(db, tpid):
+                affected_posts.setdefault(cpid, {"users": set()})
+
+        # Index each affected post's canonical state. Enqueue derived
+        # state for claim posts.
+        for pid, meta in affected_posts.items():
+            users = list(meta["users"]) or None
+            result = index_post_canonical(db, pid, user_addresses=users)
+            if result["content_type"] == 0:
+                enqueue_derived_state(db, pid, is_new=result["is_new"])
+
+        # Global stats
+        try:
+            index_global_stats_canonical(db)
+        except Exception as e:
+            # Treat as best-effort within the txn. Roll back the
+            # global-stats writes only if they're isolated, but the
+            # poll is atomic — so we let it raise out and roll back
+            # the whole range. Safer.
+            raise
+
+        _set_last_block(db, to_block)
+        db.commit()
+
+        if all_events:
+            logger.info(
+                "Atomic poll: range %d-%d, %d events, %d posts, %d links",
+                from_block, to_block, len(all_events), len(affected_posts), len(new_links))
+
+        return {
+            "events": len(all_events),
+            "posts":  len(affected_posts),
+            "links":  len(new_links),
+            "from_block": from_block,
+            "to_block":   to_block,
+        }
+    except Exception as e:
+        logger.warning("Atomic poll DB write failed for range %d-%d: %s",
+                       from_block, to_block, e)
         db.rollback()
+        return {"events": 0, "posts": 0, "from_block": from_block, "to_block": to_block, "error": "db_write"}
 
 
-# ── Full sync ───────────────────────────────────────────
+# ── Full sync (startup) ───────────────────────────────────────────
 
 def full_sync(db: Session):
-    """Sync all posts from chain to DB. Run at startup."""
+    """Sync all posts and links from chain to DB at startup.
+
+    Writes canonical state synchronously for every post (fast); enqueues
+    derived-state work for the worker to chew through asynchronously.
+    Startup is bounded by chain reads + DB writes, not by external API
+    latency. Result: ~seconds instead of ~minutes.
+    """
     w3 = _get_w3()
-    reg_abi = _load_abi("PostRegistry")
-    lg_abi = _load_abi("LinkGraph")
-    reg = w3.eth.contract(address=Web3.to_checksum_address(POST_REGISTRY_ADDRESS), abi=reg_abi)
-    lg = w3.eth.contract(address=Web3.to_checksum_address(LINK_GRAPH_ADDRESS), abi=lg_abi)
+    reg = w3.eth.contract(
+        address=Web3.to_checksum_address(POST_REGISTRY_ADDRESS),
+        abi=_load_abi("PostRegistry"))
+    lg = w3.eth.contract(
+        address=Web3.to_checksum_address(LINK_GRAPH_ADDRESS),
+        abi=_load_abi("LinkGraph"))
 
     try:
         next_post_id = reg.functions.nextPostId().call()
     except Exception as e:
-        logger.error("Could not read nextPostId: %s", e)
+        logger.error("Full sync: cannot read nextPostId: %s", e)
         return
 
-    logger.info("Full sync: indexing posts 1..%d", next_post_id - 1)
+    last_post = next_post_id - 1
+    logger.info("Full sync: indexing posts 1..%d (canonical only)", last_post)
 
+    # Index posts
     for pid in range(1, next_post_id):
-        index_post(db, pid)
+        try:
+            result = index_post_canonical(db, pid)
+            if result["content_type"] == 0:
+                enqueue_derived_state(db, pid, is_new=result["is_new"])
+            db.commit()
+        except Exception as e:
+            logger.warning("Full sync: post %d failed: %s", pid, e)
+            db.rollback()
 
     # Index links
     for pid in range(1, next_post_id):
         try:
             outgoing = lg.functions.getOutgoing(pid).call()
             for edge in outgoing:
-                to_id = edge[0]
-                link_pid = edge[1]
-                is_challenge = edge[2]
-                index_link(db, link_pid, pid, to_id, is_challenge)
-        except Exception:
-            pass
+                to_id, link_pid, is_challenge = edge[0], edge[1], edge[2]
+                index_link_canonical(db, link_pid, pid, to_id, is_challenge)
+            db.commit()
+        except Exception as e:
+            logger.debug("Full sync: link iter for post %d: %s", pid, e)
+            db.rollback()
 
-    index_global_stats(db)
-    logger.info("Full sync complete: %d posts indexed", next_post_id - 1)
+    # Global stats
+    try:
+        index_global_stats_canonical(db)
+        db.commit()
+    except Exception as e:
+        logger.warning("Full sync: global stats failed: %s", e)
+        db.rollback()
 
-
-# ── Event poller ────────────────────────────────────────
-
-def _get_last_block(db: Session, contract_name: str) -> int:
-    row = db.execute(sql_text(
-        "SELECT value FROM chain_indexer_state WHERE key = :k"
-    ), {"k": f"last_block_{contract_name}"}).fetchone()
-    return int(row[0]) if row else 0
+    logger.info("Full sync complete: %d posts indexed (derived-state queued)", last_post)
 
 
-def _set_last_block(db: Session, contract_name: str, block: int):
-    db.execute(sql_text("""
-        INSERT INTO chain_indexer_state (key, value, updated_at)
-        VALUES (:k, :v, now())
-        ON CONFLICT (key) DO UPDATE SET value = :v, updated_at = now()
-    """), {"k": f"last_block_{contract_name}", "v": str(block)})
-    db.commit()
+# ── Compatibility wrapper: old call sites that want all-in-one ────
+# Kept for full_sync's per-post path inside the (legacy) startup flow
+# and for any external callers (e.g., a future manual backfill CLI).
+# New code in the poll loop calls index_post_canonical + enqueue_derived_state
+# directly.
 
+def index_post(db: Session, post_id: int, user_addresses: list[str] | None = None):
+    """Index one post (canonical + derived-state queued). Commits."""
+    try:
+        result = index_post_canonical(db, post_id, user_addresses=user_addresses)
+        if result["content_type"] == 0:
+            enqueue_derived_state(db, post_id, is_new=result["is_new"])
+        db.commit()
+    except Exception as e:
+        logger.warning("index_post(%d) failed: %s", post_id, e)
+        db.rollback()
+
+
+def index_link(db: Session, link_post_id: int, from_post_id: int,
+               to_post_id: int, is_challenge: bool):
+    """Compatibility wrapper for index_link_canonical that commits."""
+    try:
+        index_link_canonical(db, link_post_id, from_post_id, to_post_id, is_challenge)
+        db.commit()
+    except Exception as e:
+        logger.warning("index_link(%d) failed: %s", link_post_id, e)
+        db.rollback()
 
 
 def _reindex_connected(db: Session, post_id: int):
-    """Re-index all posts connected to this post via links (one hop)."""
-    try:
-        rows = db.execute(sql_text(
-            "SELECT DISTINCT from_post_id FROM chain_link WHERE to_post_id = :pid "
-            "UNION "
-            "SELECT DISTINCT to_post_id FROM chain_link WHERE from_post_id = :pid "
-            "UNION "
-            "SELECT DISTINCT link_post_id FROM chain_link WHERE from_post_id = :pid OR to_post_id = :pid"
-        ), {"pid": post_id}).fetchall()
-        for (connected_pid,) in rows:
-            if connected_pid != post_id:
-                index_post(db, connected_pid)
-    except Exception as e:
-        logger.debug("_reindex_connected(%d) failed: %s", post_id, e)
-
-def poll_events(db: Session):
-    """Poll for new events from all contracts and index affected posts."""
-    w3 = _get_w3()
-    current_block = w3.eth.block_number
-
-    # StakeEngine events
-    se_abi = _load_abi("StakeEngine")
-    se = w3.eth.contract(address=Web3.to_checksum_address(STAKE_ENGINE_ADDRESS), abi=se_abi)
-    last_block = _get_last_block(db, "StakeEngine")
-    if last_block == 0:
-        last_block = max(current_block - COLD_START_LOOKBACK, 0)
-        logger.info("StakeEngine cold-start: first poll from block %d (current head: %d)",
-                    last_block, current_block)
-
-    from_block = last_block + 1
-    to_block = min(from_block + BLOCK_BATCH, current_block)
-
-    if from_block <= to_block:
-        logger.debug("StakeEngine: polling blocks %d..%d", from_block, to_block)
-        affected_posts = set()
-        affected_users = {}  # post_id -> set of addresses
-
-        try:
-            # StakeAdded
-            for event in se.events.StakeAdded.get_logs(from_block=from_block, to_block=to_block):
-                pid = event.args.postId
-                staker = event.args.staker.lower()
-                logger.info("StakeEngine: indexed StakeAdded post_id=%d staker=%s (block %d)",
-                            pid, staker[:10], event.blockNumber)
-                affected_posts.add(pid)
-                affected_users.setdefault(pid, set()).add(staker)
-
-            # StakeWithdrawn
-            for event in se.events.StakeWithdrawn.get_logs(from_block=from_block, to_block=to_block):
-                pid = event.args.postId
-                staker = event.args.staker.lower()
-                affected_posts.add(pid)
-                affected_users.setdefault(pid, set()).add(staker)
-
-            # PostUpdated (snapshot)
-            for event in se.events.PostUpdated.get_logs(from_block=from_block, to_block=to_block):
-                affected_posts.add(event.args.postId)
-
-        except Exception as e:
-            logger.warning("Error polling StakeEngine events: %s", e)
-
-        for pid in affected_posts:
-            users = list(affected_users.get(pid, []))
-            index_post(db, pid, user_addresses=users)
-
-        # Incremental cache update: patch any cached article containing these posts
-        # with fresh stake/VS values. Much faster than invalidating + rebuilding.
-        if affected_posts:
-            try:
-                from articles.article_store import apply_stake_delta
-                from chain.chain_reader import get_stake_totals, get_verity_score
-                for pid in affected_posts:
-                    try:
-                        s, ch = get_stake_totals(pid)
-                        vs = get_verity_score(pid)
-                        apply_stake_delta(db, pid, s, ch, vs)
-                    except Exception as e:
-                        logger.debug("apply_stake_delta(%d) failed: %s", pid, e)
-            except Exception as e:
-                logger.debug("Stake-delta update failed: %s", e)
-
-        _set_last_block(db, "StakeEngine", to_block)
-
-    # PostRegistry events
-    reg_abi = _load_abi("PostRegistry")
-    reg = w3.eth.contract(address=Web3.to_checksum_address(POST_REGISTRY_ADDRESS), abi=reg_abi)
-    last_block = _get_last_block(db, "PostRegistry")
-    if last_block == 0:
-        last_block = max(current_block - COLD_START_LOOKBACK, 0)
-        logger.info("PostRegistry cold-start: first poll from block %d (current head: %d)",
-                    last_block, current_block)
-
-    from_block = last_block + 1
-    to_block = min(from_block + BLOCK_BATCH, current_block)
-
-    if from_block <= to_block:
-        logger.debug("PostRegistry: polling blocks %d..%d", from_block, to_block)
-        try:
-            for event in reg.events.PostCreated.get_logs(from_block=from_block, to_block=to_block):
-                pid = event.args.postId
-                creator = event.args.creator.lower()
-                logger.info("PostRegistry: indexed PostCreated post_id=%d creator=%s (block %d)",
-                            pid, creator[:10], event.blockNumber)
-                # patch04: topic detection now lives inside index_post(),
-                # so it runs in BOTH full_sync and poll_events paths
-                # automatically. No additional code needed here.
-                index_post(db, pid, user_addresses=[creator])
-        except Exception as e:
-            logger.warning("Error polling PostRegistry events: %s", e)
-        _set_last_block(db, "PostRegistry", to_block)
-
-    # LinkGraph events
-    lg_abi = _load_abi("LinkGraph")
-    lg = w3.eth.contract(address=Web3.to_checksum_address(LINK_GRAPH_ADDRESS), abi=lg_abi)
-    last_block = _get_last_block(db, "LinkGraph")
-    if last_block == 0:
-        last_block = max(current_block - COLD_START_LOOKBACK, 0)
-        logger.info("LinkGraph cold-start: first poll from block %d (current head: %d)",
-                    last_block, current_block)
-
-    from_block = last_block + 1
-    to_block = min(from_block + BLOCK_BATCH, current_block)
-
-    if from_block <= to_block:
-        logger.debug("LinkGraph: polling blocks %d..%d", from_block, to_block)
-        try:
-            for event in lg.events.EdgeAdded.get_logs(from_block=from_block, to_block=to_block):
-                from_pid = event.args["from"]
-                to_pid = event.args["to"]
-                link_pid = event.args.linkPostId
-                is_challenge = event.args.isChallenge
-                logger.info("LinkGraph: indexed EdgeAdded link_post=%d from=%d to=%d challenge=%s (block %d)",
-                            link_pid, from_pid, to_pid, is_challenge, event.blockNumber)
-                index_link(db, link_pid, from_pid, to_pid, is_challenge)
-                # Re-index all connected posts (link affects VS of targets)
-                index_post(db, to_pid)
-                index_post(db, from_pid)
-                index_post(db, link_pid)
-                # Also re-index any posts linked to/from the affected claims
-                _reindex_connected(db, to_pid)
-                _reindex_connected(db, from_pid)
-        except Exception as e:
-            logger.warning("Error polling LinkGraph events: %s", e)
-        _set_last_block(db, "LinkGraph", to_block)
-
-    # Global stats (every poll)
-    index_global_stats(db)
+    """Re-index posts connected to this one via links. Compatibility wrapper.
+    Each connected post gets its own commit via index_post."""
+    for cpid in _list_connected_posts(db, post_id):
+        index_post(db, cpid)
 
 
-# ── Background thread ───────────────────────────────────
+# ── Background thread ─────────────────────────────────────────────
 
 _indexer_thread = None
 
@@ -570,13 +619,16 @@ def start_indexer():
         return
 
     def _run():
-        logger.info("Chain indexer starting...")
+        logger.info("Chain indexer starting (atomic, single-cursor, depth=%d)...",
+                    CONFIRMATION_DEPTH)
 
-        # Initial full sync
+        # Initial full sync — canonical only; derived state queued.
         try:
             db = get_session_factory()()
-            full_sync(db)
-            db.close()
+            try:
+                full_sync(db)
+            finally:
+                db.close()
         except Exception as e:
             logger.error("Full sync failed: %s", e)
 
@@ -584,12 +636,13 @@ def start_indexer():
         while True:
             try:
                 db = get_session_factory()()
-                poll_events(db)
-                # patch_bundle04a_hook_resolve: resolve pending tx_log rows
-                resolve_pending_txs(db)
-                db.close()
+                try:
+                    poll_events_atomic(db)
+                    resolve_pending_txs(db)
+                finally:
+                    db.close()
             except Exception as e:
-                logger.warning("Indexer poll error: %s", e)
+                logger.warning("Indexer poll outer error: %s", e)
             time.sleep(POLL_INTERVAL)
 
     _indexer_thread = threading.Thread(target=_run, daemon=True, name="chain-indexer")
@@ -597,31 +650,20 @@ def start_indexer():
     logger.info("Chain indexer thread started (poll every %ds)", POLL_INTERVAL)
 
 
-# patch_bundle04a_watcher: confirmation watcher for /api/relay/async
-# --- tx_log confirmation watcher (Bundle 4a) -------------------------
-# Resolves pending tx_log rows by fetching their receipts from chain.
-# Called from the indexer's poll loop after poll_events. Pure status-flip:
-# does NOT trigger reindex, cache busts, or any chain_* writes. The
-# indexer's normal poll cycle handles those independently via its event
-# stream.
+# ── tx_log confirmation watcher (Bundle 4a) ───────────────────────
+# Resolves pending tx_log rows by fetching their receipts. Called from
+# the poll loop after poll_events_atomic. Pure status-flip; does NOT
+# write chain_* tables — the indexer's normal event stream does that.
 
-TX_PENDING_TIMEOUT_SECONDS = 600   # 10 minutes — receipts not found by then are dropped
-TX_WATCHER_BATCH_LIMIT     = 50    # max rows to resolve per cycle
-TX_WATCHER_MIN_AGE_SECONDS = 5     # let RPC see the tx in mempool first
+TX_PENDING_TIMEOUT_SECONDS = 600   # 10 min
+TX_WATCHER_BATCH_LIMIT     = 50
+TX_WATCHER_MIN_AGE_SECONDS = 5
 
 
 def _extract_post_id_from_receipt(receipt, action_type, calldata_hex):
-    """Best-effort: pull post_id out of the receipt logs (for claim creates and
-    links) or out of the calldata (for stake actions). Returns None on failure.
-
-    For 'stake': the post_id is the first uint256 in setStake/stake calldata.
-    For 'claim': pull from PostCreated event in PostRegistry logs.
-    For 'link':  pull from EdgeAdded event in LinkGraph logs (the link's own
-                 post_id is the linkPostId field of the event).
-    """
+    """Best-effort post_id extraction from a confirmed receipt's logs/calldata."""
     try:
         if action_type == "stake":
-            # calldata layout: 4-byte selector + uint256 postId + …
             cd = calldata_hex
             if cd.startswith("0x"):
                 cd = cd[2:]
@@ -631,11 +673,9 @@ def _extract_post_id_from_receipt(receipt, action_type, calldata_hex):
 
         w3 = _get_w3()
         if action_type == "claim":
-            reg_abi = _load_abi("PostRegistry")
             reg = w3.eth.contract(
                 address=Web3.to_checksum_address(POST_REGISTRY_ADDRESS),
-                abi=reg_abi,
-            )
+                abi=_load_abi("PostRegistry"))
             from web3.logs import DISCARD
             logs = reg.events.PostCreated().process_receipt(receipt, errors=DISCARD)
             if logs:
@@ -643,15 +683,12 @@ def _extract_post_id_from_receipt(receipt, action_type, calldata_hex):
             return None
 
         if action_type == "link":
-            lg_abi = _load_abi("LinkGraph")
             lg = w3.eth.contract(
                 address=Web3.to_checksum_address(LINK_GRAPH_ADDRESS),
-                abi=lg_abi,
-            )
+                abi=_load_abi("LinkGraph"))
             from web3.logs import DISCARD
             logs = lg.events.EdgeAdded().process_receipt(receipt, errors=DISCARD)
             if logs:
-                # The link itself is a post; its post_id is linkPostId.
                 return int(logs[0].args.linkPostId)
             return None
     except Exception as e:
@@ -660,22 +697,36 @@ def _extract_post_id_from_receipt(receipt, action_type, calldata_hex):
 
 
 def _decode_revert_message(receipt):
-    """Best-effort revert reason from a status=0 receipt. Returns a short string.
-
-    Reading the actual revert reason requires a replay (eth_call) at the tx's
-    block, which is expensive and provider-dependent. For now we record a
-    generic message; the frontend can offer "view on explorer" for details.
-    Future enhancement: trace_transaction for clients that support it.
-    """
     return f"Transaction reverted (gasUsed={getattr(receipt, 'gasUsed', '?')})"
 
 
-def resolve_pending_txs(db):
-    """Resolve pending tx_log rows by fetching their receipts from chain.
+INDEXER_LAG_WARN_BLOCKS = 10  # patch_bundle04_p2: warn if indexer is this many blocks behind a confirmed tx
 
-    Called from the indexer poll loop after poll_events(). Read-modify-write
-    on tx_log only; no other side effects.
-    """
+
+def _check_indexer_lag(db, tx_block: int, tx_log_id: int) -> None:
+    """Log a warning if the event indexer's cursor is sustained-behind
+    the block where a tx was just confirmed. Brief lag (<10 blocks) is
+    normal — the watcher fetches by hash so it can outrun the event
+    poller by a few blocks."""
+    try:
+        row = db.execute(sql_text(
+            "SELECT value FROM chain_indexer_state WHERE key = :k"
+        ), {"k": CURSOR_KEY}).fetchone()
+        if not row:
+            return
+        last_block = int(row[0])
+        lag = tx_block - last_block
+        if lag > INDEXER_LAG_WARN_BLOCKS:
+            logger.warning(
+                "indexer-lag: tx_log %d confirmed at block %d but indexer cursor at %d (%d blocks behind)",
+                tx_log_id, tx_block, last_block, lag)
+    except Exception as e:
+        logger.debug("_check_indexer_lag failed: %s", e)
+
+
+def resolve_pending_txs(db):
+    """Resolve pending tx_log rows by fetching their receipts. Called from the
+    indexer poll loop after poll_events_atomic. No-op if nothing's pending."""
     import tx_log as _tx_log
     try:
         rows = _tx_log.get_pending_for_watcher(
@@ -695,13 +746,11 @@ def resolve_pending_txs(db):
         try:
             try:
                 receipt = w3.eth.get_transaction_receipt(row.tx_hash)
-            except Exception as e:
-                # web3.py raises TransactionNotFound (or generic) until mined.
+            except Exception:
                 if row.age_sec > TX_PENDING_TIMEOUT_SECONDS:
                     _tx_log.mark_dropped(db, row.id)
                     db.commit()
                     logger.info("tx_log %d: dropped (timeout) %s", row.id, row.tx_hash)
-                # else: stays pending, will retry next cycle
                 continue
 
             if receipt is None:
@@ -711,9 +760,7 @@ def resolve_pending_txs(db):
                 continue
 
             if int(receipt.status) == 1:
-                post_id = _extract_post_id_from_receipt(
-                    receipt, row.action_type, row.calldata,
-                )
+                post_id = _extract_post_id_from_receipt(receipt, row.action_type, row.calldata)
                 _tx_log.mark_confirmed(
                     db, row.id,
                     block_number=int(receipt.blockNumber),
@@ -723,6 +770,10 @@ def resolve_pending_txs(db):
                 db.commit()
                 logger.info("tx_log %d: confirmed %s block=%d post_id=%s",
                             row.id, row.tx_hash, receipt.blockNumber, post_id)
+                # patch_bundle04_p2: indexer-lag alert. The watcher resolves
+                # by receipt-hash and can be ahead of the event indexer
+                # briefly; only warn on sustained lag.
+                _check_indexer_lag(db, int(receipt.blockNumber), row.id)
             else:
                 err = _decode_revert_message(receipt)
                 _tx_log.mark_reverted(
@@ -735,8 +786,134 @@ def resolve_pending_txs(db):
                 logger.info("tx_log %d: reverted %s block=%d",
                             row.id, row.tx_hash, receipt.blockNumber)
         except Exception as e:
-            logger.warning("resolve_pending_txs: failed to resolve row %d: %s",
-                           row.id, e)
+            logger.warning("resolve_pending_txs: failed to resolve row %d: %s", row.id, e)
             try: db.rollback()
             except Exception: pass
             continue
+
+
+# ── Manual backfill CLI ─────────────────────────────────────────
+# Invoke from inside the worker or app container:
+#   python -m chain_indexer backfill --post-id N
+#   python -m chain_indexer backfill --from-block X --to-block Y
+#
+# Out-of-band re-processing. Bypasses the cursor (does NOT update
+# last_block_global). Uses the same canonical-write path as live polling.
+
+def _backfill_post(post_id: int) -> None:
+    """Re-index one post by id. Useful for fixing drift identified by audit."""
+    db = get_session_factory()()
+    try:
+        result = index_post_canonical(db, post_id)
+        if result["content_type"] == 0:
+            enqueue_derived_state(db, post_id, is_new=result["is_new"])
+        db.commit()
+        print(f"backfill: post {post_id} re-indexed "
+              f"(content_type={result['content_type']}, "
+              f"is_new={result['is_new']})")
+    except Exception as e:
+        db.rollback()
+        print(f"backfill: post {post_id} failed: {e}")
+    finally:
+        db.close()
+
+
+def _backfill_block_range(from_block: int, to_block: int) -> None:
+    """Re-process events in a block range. Does NOT update last_block_global —
+    purely out-of-band re-application. Affected posts will get their
+    canonical state re-written and derived state re-enqueued."""
+    w3 = _get_w3()
+    contracts = _get_contracts(w3)
+    all_events = []
+    for contract_name, (contract, event_names) in contracts.items():
+        for event_name in event_names:
+            event_obj = getattr(contract.events, event_name)
+            for evt in event_obj.get_logs(from_block=from_block, to_block=to_block):
+                all_events.append({
+                    "block": evt.blockNumber, "tx_index": evt.transactionIndex,
+                    "log_index": evt.logIndex, "contract": contract_name,
+                    "event_name": event_name, "evt": evt,
+                })
+    all_events.sort(key=lambda e: (e["block"], e["tx_index"], e["log_index"]))
+
+    affected_posts = {}
+    new_links = []
+    for e in all_events:
+        name, evt = e["event_name"], e["evt"]
+        if name in ("StakeAdded", "StakeWithdrawn"):
+            pid = evt.args.postId
+            staker = evt.args.staker.lower()
+            affected_posts.setdefault(pid, {"users": set()})["users"].add(staker)
+        elif name == "PostUpdated":
+            affected_posts.setdefault(evt.args.postId, {"users": set()})
+        elif name == "PostCreated":
+            pid = evt.args.postId
+            creator = evt.args.creator.lower()
+            affected_posts.setdefault(pid, {"users": set()})["users"].add(creator)
+        elif name == "EdgeAdded":
+            link_pid = evt.args.linkPostId
+            from_pid = evt.args["from"]
+            to_pid   = evt.args["to"]
+            ic       = evt.args.isChallenge
+            new_links.append((link_pid, from_pid, to_pid, ic))
+            for p in (from_pid, to_pid, link_pid):
+                affected_posts.setdefault(p, {"users": set()})
+
+    db = get_session_factory()()
+    try:
+        for (lpid, fpid, tpid, ic) in new_links:
+            index_link_canonical(db, lpid, fpid, tpid, ic)
+        for (lpid, fpid, tpid, _ic) in new_links:
+            for cpid in _list_connected_posts(db, fpid) | _list_connected_posts(db, tpid):
+                affected_posts.setdefault(cpid, {"users": set()})
+        for pid, meta in affected_posts.items():
+            users = list(meta["users"]) or None
+            result = index_post_canonical(db, pid, user_addresses=users)
+            if result["content_type"] == 0:
+                enqueue_derived_state(db, pid, is_new=result["is_new"])
+        db.commit()
+        print(f"backfill: range {from_block}-{to_block}, "
+              f"{len(all_events)} events, {len(affected_posts)} posts, "
+              f"{len(new_links)} links re-applied")
+    except Exception as e:
+        db.rollback()
+        print(f"backfill: range {from_block}-{to_block} failed: {e}")
+    finally:
+        db.close()
+
+
+def _cli_main() -> int:
+    import argparse
+    p = argparse.ArgumentParser(description="chain_indexer manual backfill")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    b = sub.add_parser("backfill", help="re-index specific posts or block ranges")
+    g = b.add_mutually_exclusive_group(required=True)
+    g.add_argument("--post-id", type=int, help="re-index a single post by id")
+    g.add_argument("--from-block", type=int, help="re-process events in [from-block, to-block]")
+    b.add_argument("--to-block", type=int, help="upper bound for --from-block (required with --from-block)")
+    args = p.parse_args()
+
+    # Configure logging so backfill output is visible.
+    import logging, sys as _sys
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+        stream=_sys.stdout)
+
+    if args.cmd == "backfill":
+        if args.post_id is not None:
+            _backfill_post(args.post_id)
+            return 0
+        if args.from_block is not None:
+            if args.to_block is None:
+                p.error("--to-block is required with --from-block")
+            if args.to_block < args.from_block:
+                p.error("--to-block must be >= --from-block")
+            _backfill_block_range(args.from_block, args.to_block)
+            return 0
+    return 1
+
+
+if __name__ == "__main__":
+    import sys as _sys
+    _sys.exit(_cli_main())

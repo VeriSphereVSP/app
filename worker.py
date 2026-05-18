@@ -32,10 +32,23 @@ async def main():
     # claim-row update path, producing rows with claim.post_id=0.
     # The main indexer in chain_indexer.py covers all of its
     # functionality plus more.
+    # patch_bundle04_atomic: start derived-state worker alongside indexer.
+    # Indexer writes canonical chain state synchronously; derived-state
+    # worker chews through the slow article-system/dupe-grouping/topic
+    # detection work asynchronously from derived_state_queue.
     from chain_indexer import start_indexer
+    from derived_state_worker import start_derived_state_worker
 
     start_indexer()
     print("Chain indexer started (legacy run_indexer disabled by patch04a)")
+
+    start_derived_state_worker()
+    print("Derived-state worker started")
+
+    # patch_bundle04_p2: periodic drift-check between DB and chain.
+    from indexer_audit import start_indexer_audit
+    start_indexer_audit()
+    print("Indexer audit started")
 
     # Periodic dupe group refresh (every 5 minutes)
     async def _dupe_refresh():
@@ -56,58 +69,11 @@ async def main():
     asyncio.create_task(_dupe_refresh())
     print("Dupe group refresh scheduled")
 
-    # patch04: one-shot topic backfill at startup.
-    # Finds chain_claim_text rows whose corresponding claim has no
-    # topic, and runs detect_topic for each. Catches any posts that
-    # were indexed before patch04 landed, or any posts indexed while
-    # the LLM provider was temporarily unavailable.
-    async def _topic_backfill():
-        await asyncio.sleep(30)  # let indexer's full_sync settle
-        try:
-            from db import get_session_factory
-            from sqlalchemy import text as sql_text
-            from articles.topic_detect import detect_topic, ensure_article_for_claim
-            from semantic import ensure_claim
-            sess = get_session_factory()()
-            try:
-                rows = sess.execute(sql_text(
-                    "SELECT ct.post_id, ct.claim_text "
-                    "FROM chain_claim_text ct "
-                    "LEFT JOIN claim c ON c.post_id = ct.post_id "
-                    "WHERE c.topic IS NULL OR c.topic = '' "
-                    "ORDER BY ct.post_id"
-                )).fetchall()
-                if not rows:
-                    print("topic-backfill: no posts need topic")
-                    return
-                print(f"topic-backfill: {len(rows)} post(s) need topic")
-                done = 0
-                for pid, text in rows:
-                    try:
-                        cid = ensure_claim(sess, text)
-                        topic = detect_topic(text)
-                        if topic:
-                            sess.execute(sql_text(
-                                "UPDATE claim SET topic = :t "
-                                "WHERE claim_id = :cid AND (topic IS NULL OR topic = '')"
-                            ), {"t": topic, "cid": cid})
-                            sess.commit()
-                            try:
-                                ensure_article_for_claim(sess, text, pid, topic)
-                            except Exception as ex:
-                                print(f"topic-backfill: ensure_article for post {pid} failed: {ex}")
-                            done += 1
-                            print(f"topic-backfill: post {pid} → {topic!r}")
-                    except Exception as ex:
-                        print(f"topic-backfill: post {pid} failed: {ex}")
-                print(f"topic-backfill: complete ({done}/{len(rows)} succeeded)")
-            finally:
-                sess.close()
-        except Exception as e:
-            print(f"topic-backfill: top-level error: {e}")
-
-    asyncio.create_task(_topic_backfill())
-    print("Topic backfill scheduled")
+    # patch_bundle04_atomic: _topic_backfill removed.
+    # full_sync at startup now enqueues derived-state work for every
+    # claim post; the derived-state worker handles topic detection
+    # uniformly with the rest of the derivation pipeline. No separate
+    # backfill task needed.
 
     # Background article refresh
     async def _daily_refresh():
@@ -159,8 +125,8 @@ async def main():
     # patch04b: keep-alive loop. The main indexer runs in a native
     # thread via start_indexer() and doesn't need to be awaited.
     # We just need to keep the asyncio event loop alive so the
-    # background tasks scheduled above (dupe_refresh, topic_backfill,
-    # daily_refresh) can run their initial sleeps and cycles.
+    # background tasks scheduled above (dupe_refresh, daily_refresh)
+    # can run their initial sleeps and cycles.
     try:
         while True:
             await asyncio.sleep(3600)
