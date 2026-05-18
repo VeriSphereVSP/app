@@ -380,6 +380,31 @@ def _list_connected_posts(db: Session, post_id: int) -> set:
     ), {"pid": post_id}).fetchall()
     return {row[0] for row in rows if row[0] != post_id}
 
+def _apply_stake_deltas_best_effort(db: Session, post_ids: list) -> None:
+    """patch_bundle04_followup: patch cached article JSON with fresh
+    stake/VS values for the given posts. Cheap (no LLM calls, just
+    DB writes); kept in the indexer poll loop rather than the
+    derived-state worker since it's needed promptly for UI freshness.
+
+    Best-effort: individual failures logged at DEBUG; outer try wraps
+    the whole batch."""
+    try:
+        from articles.article_store import apply_stake_delta
+        from chain.chain_reader import get_stake_totals, get_verity_score
+    except Exception as e:
+        logger.debug("apply_stake_delta unavailable: %s", e)
+        return
+    for pid in post_ids:
+        try:
+            s, ch = get_stake_totals(pid)
+            vs = get_verity_score(pid)
+            apply_stake_delta(db, pid, s, ch, vs)
+        except Exception as e:
+            logger.debug("apply_stake_delta(%d) failed: %s", pid, e)
+
+
+
+
 
 # ── Atomic poll loop ──────────────────────────────────────────────
 
@@ -497,6 +522,13 @@ def poll_events_atomic(db: Session) -> dict:
                 "Atomic poll: range %d-%d, %d events, %d posts, %d links",
                 from_block, to_block, len(all_events), len(affected_posts), len(new_links))
 
+        # patch_bundle04_followup: incremental article-cache update for
+        # stake/VS changes on affected posts. Best-effort, post-commit:
+        # failures don't roll back the canonical state. Matches the
+        # behavior of the pre-bundle-4 chain_indexer that I'd dropped.
+        if affected_posts:
+            _apply_stake_deltas_best_effort(db, list(affected_posts.keys()))
+
         return {
             "events": len(all_events),
             "posts":  len(affected_posts),
@@ -512,6 +544,27 @@ def poll_events_atomic(db: Session) -> dict:
 
 
 # ── Full sync (startup) ───────────────────────────────────────────
+
+def _derived_state_complete(db: Session, post_id: int) -> bool:
+    """patch_dedup_fix: True if a completed derived_state_queue row already
+    exists for this post (in either queue_kind). The queue itself is the
+    source of truth about prior derivation work — using claim.topic as
+    the signal (previous approach) was wrong because topic legitimately
+    remains NULL when detect_topic() returns no confident topic for
+    short or generic claims, causing those posts to be re-derived on
+    every worker restart.
+
+    Used by full_sync to skip re-enqueueing derivation work for posts
+    that have already been processed at least once. The derived pipeline
+    is idempotent so re-enqueueing is correctness-safe; this check is
+    purely an LLM-cost optimization."""
+    row = db.execute(sql_text(
+        "SELECT 1 FROM derived_state_queue "
+        "WHERE post_id = :p AND status = 'completed' "
+        "LIMIT 1"
+    ), {"p": post_id}).fetchone()
+    return row is not None
+
 
 def full_sync(db: Session):
     """Sync all posts and links from chain to DB at startup.
@@ -542,7 +595,10 @@ def full_sync(db: Session):
     for pid in range(1, next_post_id):
         try:
             result = index_post_canonical(db, pid)
-            if result["content_type"] == 0:
+            # patch_bundle04_followup: skip enqueue if derived state is
+            # already complete (claim.topic IS NOT NULL). Avoids re-doing
+            # LLM-bound work for every claim on each worker restart.
+            if result["content_type"] == 0 and not _derived_state_complete(db, pid):
                 enqueue_derived_state(db, pid, is_new=result["is_new"])
             db.commit()
         except Exception as e:

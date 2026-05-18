@@ -1448,31 +1448,49 @@ def background_refresh_worker():
         # Initial sleep to avoid hitting LLM during app startup
         time.sleep(60)
         
+        # patch_session_leak_bg_refresh: previously this loop leaked
+        # sessions in two ways: (a) db.close() was after the execute
+        # calls, so any DB error skipped it; (b) refresh_article/
+        # persist_dedup/build_and_cache_response were called with
+        # inline Sess() instances that were never closed. Now each
+        # session is wrapped in try/finally.
         while True:
             try:
+                # ── pick the oldest article ──
                 db = Sess()
-                # Pick the oldest article by last_refreshed_at (NULLs first)
-                row = db.execute(sql_text(
-                    "SELECT topic_key, article_id FROM topic_article "
-                    "ORDER BY last_refreshed_at NULLS FIRST LIMIT 1"
-                )).fetchone()
-                
-                # Count for autotune
-                n_row = db.execute(sql_text(
-                    "SELECT COUNT(*) FROM topic_article"
-                )).fetchone()
-                N = n_row[0] if n_row else 1
-                db.close()
-                
+                try:
+                    row = db.execute(sql_text(
+                        "SELECT topic_key, article_id FROM topic_article "
+                        "ORDER BY last_refreshed_at NULLS FIRST LIMIT 1"
+                    )).fetchone()
+                    n_row = db.execute(sql_text(
+                        "SELECT COUNT(*) FROM topic_article"
+                    )).fetchone()
+                    N = n_row[0] if n_row else 1
+                finally:
+                    db.close()
+
                 if not row:
                     time.sleep(300)
                     continue
-                
+
                 topic_key, article_id = row
                 t0 = time.time()
                 try:
-                    refresh_article(Sess(), topic_key)
-                    persist_dedup(Sess(), article_id)
+                    # ── refresh_article ──
+                    s1 = Sess()
+                    try:
+                        refresh_article(s1, topic_key)
+                    finally:
+                        s1.close()
+                    # ── persist_dedup ──
+                    s2 = Sess()
+                    try:
+                        persist_dedup(s2, article_id)
+                    finally:
+                        s2.close()
+                    # build_and_cache_response takes the factory and
+                    # manages its own sessions internally — no leak risk.
                     build_and_cache_response(Sess, topic_key)
                     elapsed = time.time() - t0
                     recent_elapsed.append(elapsed)
@@ -1484,8 +1502,8 @@ def background_refresh_worker():
                 except Exception as e:
                     logger.warning("bg-refresh failed for '%s': %s", topic_key, e)
                     elapsed = time.time() - t0
-                
-                # Autotune sleep: distribute remaining 24h budget across N articles
+
+                # Autotune sleep
                 avg_elapsed = statistics.mean(recent_elapsed) if recent_elapsed else 30.0
                 sleep_time = max(60, (CYCLE_SECONDS - N * avg_elapsed) / max(N, 1))
                 logger.info("bg-refresh: sleeping %.0fs before next refresh (N=%d, avg=%.1fs)",
