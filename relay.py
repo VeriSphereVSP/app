@@ -786,4 +786,157 @@ def _relay_sync(body: RelayRequest, db: Session):
         raise
     except Exception as e:
         logger.exception("Relay failed")
-        raise HTTPException(500, str(e))
+        raise HTTPException(500, str(e))# ── /api/relay/async (Bundle 4a) ────────────────────────────────────
+# Submits a meta-transaction and returns immediately with tx_hash and a
+# tx_log row id. The chain indexer's poll cycle resolves the row by
+# fetching the receipt later, and the frontend polls
+# /api/notifications/{address} to learn the outcome.
+#
+# Code is DUPLICATED from /api/relay's _relay_sync rather than shared via a
+# helper. The two paths will diverge during the transition: /api/relay keeps
+# all its post-submit work (receipt wait, reindex, cache busts), this one
+# does none of that. After the frontend cuts over and /api/relay is
+# deleted, the duplication goes away.
+#
+# NOT replicated from /api/relay: the TIMING: prints, DuplicateClaim
+# recovery on revert, post-success state attachment in the response.
+# Those were UX optimizations for synchronous responses that no longer
+# apply in the async flow.
+
+@router.post("/api/relay/async")
+@relay_rate_limit
+async def relay_async(body: RelayRequest, db: Session = Depends(get_db)):
+    """Async relay: submit tx, record tx_log row, return immediately."""
+    import asyncio
+    return await asyncio.to_thread(_relay_async_sync, body, db)
+
+
+def _relay_async_sync(body: RelayRequest, db: Session):
+    from tx_log import record_pending
+    try:
+        fwd = _get_forwarder()
+        req = body.request
+        sig_bytes = bytes.fromhex(body.signature.removeprefix("0x"))
+        calldata_hex = req.data.removeprefix("0x")
+
+        request_data = (
+            Web3.to_checksum_address(req.from_),
+            Web3.to_checksum_address(req.to),
+            req.value,
+            req.gas,
+            req.deadline,
+            bytes.fromhex(calldata_hex),
+            sig_bytes,
+        )
+
+        # Permits (gasless pre-grant of allowances)
+        if body.permit:
+            _execute_permit(body.permit)
+
+        if body.fee_permit:
+            try:
+                _execute_permit(body.fee_permit)
+                logger.info("Fee permit executed for %s", req.from_[:10])
+            except Exception as e:
+                logger.debug("Fee permit skip (non-fatal): %s", e)
+
+        # Content moderation gate
+        _moderate_claim(calldata_hex)
+
+        # Verify signature
+        try:
+            is_valid = fwd.functions.verify(request_data).call()
+            if not is_valid:
+                raise HTTPException(400, "Invalid signature")
+        except HTTPException:
+            raise
+        except Exception as e:
+            if "invalid" in str(e).lower() or "revert" in str(e).lower():
+                raise HTTPException(400, f"Signature verification failed: {e}")
+            logger.warning("verify() call failed (proceeding anyway): %s", e)
+
+        # createClaim detection — pre-flight duplicate check
+        is_create = (
+            req.to.lower() == POST_REGISTRY_ADDRESS.lower()
+            and calldata_hex[:8] == CREATE_CLAIM_SELECTOR
+        )
+        if is_create:
+            dup = _check_duplicate_claim(calldata_hex, req.from_, db)
+            if dup:
+                logger.info("Pre-flight: claim already exists on-chain, returning existing")
+                # In async mode the frontend wasn't waiting for a result. Return
+                # the duplicate marker; client can route accordingly.
+                return {"status": "duplicate_claim", "claim": dup.get("claim")}
+
+        # Pre-flight simulation for non-create calls
+        if not is_create:
+            try:
+                w3.eth.call({
+                    "from": Web3.to_checksum_address(req.from_),
+                    "to":   Web3.to_checksum_address(req.to),
+                    "data": "0x" + calldata_hex,
+                    "value": req.value,
+                })
+            except Exception as sim_err:
+                reason = _decode_revert_reason(sim_err)
+                logger.info("Pre-flight simulation reverted: %s", reason)
+                raise HTTPException(400, reason)
+
+        # On-chain fee verification (read what forwarder will charge)
+        user_addr = Web3.to_checksum_address(req.from_)
+        try:
+            calldata_bytes = bytes.fromhex(calldata_hex)
+            fee_wei = fwd.functions.estimateFee(calldata_bytes).call()
+        except Exception as e:
+            raise HTTPException(400, f'Forwarder rejects this call: {e}')
+
+        vsp_c = w3.eth.contract(
+            address=Web3.to_checksum_address(VSP_ADDRESS), abi=_VSP_FEE_ABI)
+        user_balance = vsp_c.functions.balanceOf(user_addr).call()
+        user_allowance = vsp_c.functions.allowance(
+            user_addr, Web3.to_checksum_address(FORWARDER_ADDRESS)).call()
+        if user_balance < fee_wei:
+            raise HTTPException(400,
+                f'Insufficient VSP for relay fee: need {fee_wei / 1e18:.4f} VSP, '
+                f'have {user_balance / 1e18:.4f}')
+        if user_allowance < fee_wei:
+            raise HTTPException(400,
+                f'Insufficient VSP allowance for relay fee: need {fee_wei / 1e18:.4f} VSP, '
+                f'allowance {user_allowance / 1e18:.4f}. Sign a fee permit.')
+
+        # Build, sign, submit
+        tx = fwd.functions.execute(request_data).build_transaction({
+            "from": w3.eth.default_account or Web3.to_checksum_address(
+                __import__("config").MM_ADDRESS),
+            "value": req.value,
+            "gas":   req.gas + 800_000,
+        })
+        tx_hash = sign_and_send(tx)
+        logger.info("Async relay submitted: from=%s to=%s tx=%s",
+                    req.from_, req.to, tx_hash)
+
+        # Record pending tx_log row.
+        action_type, action_value = _detect_tx_type(calldata_hex, req.to)
+        tx_log_id = record_pending(
+            db,
+            tx_hash=tx_hash,
+            user_address=req.from_,
+            to_address=req.to,
+            calldata=calldata_hex,
+            action_type=action_type,
+            action_value=action_value,
+        )
+        db.commit()
+
+        return {
+            "tx_hash":      tx_hash,
+            "tx_log_id":    tx_log_id,
+            "action_type":  action_type,
+            "action_value": action_value,
+            "status":       "submitted",
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Async relay failed")
+        raise HTTPException(500, f"Relay error: {e}")

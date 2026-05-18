@@ -30,6 +30,7 @@ from semantic import compute_one
 from chain.claim_registry import create_claim
 from chain.stake import stake_claim
 from relay import router as relay_router
+from notifications import router as notifications_router  # patch_bundle04a_notifications_mount
 from supersedes import router as supersedes_router
 from mm.mm_routes import router as mm_router
 from claim_views import router as claim_views_router
@@ -129,6 +130,7 @@ app = FastAPI(title="VeriSphere App API", version="0.1.0", lifespan=lifespan)
 app.add_middleware(RateLimitMiddleware)
 
 app.include_router(relay_router)
+app.include_router(notifications_router)
 app.include_router(supersedes_router)
 app.include_router(mm_router)
 app.include_router(claim_views_router)

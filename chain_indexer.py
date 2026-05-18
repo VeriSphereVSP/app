@@ -169,6 +169,20 @@ def index_post(db: Session, post_id: int, user_addresses: list[str] | None = Non
             except Exception as e:
                 logger.debug("Dupe grouping failed for post %d: %s", post_id, e)
 
+            # patch_bundle04a_article_catchup: keep the article system in
+            # sync with chain state at the indexer's cadence, instead of
+            # depending on relay.py's synchronous post-create work. Both
+            # functions are idempotent: calling them when there's nothing
+            # new to link is a no-op.
+            try:
+                if claim_text:
+                    from articles.article_store import apply_new_post
+                    from articles.claim_indexer import cross_index_claim_into_all_articles
+                    apply_new_post(db, post_id, claim_text)
+                    cross_index_claim_into_all_articles(db, claim_text, post_id)
+            except Exception as e:
+                logger.debug("Article catch-up failed for post %d: %s", post_id, e)
+
             # patch04: topic detection in index_post (canonical path)
             # Runs for every indexed post, in both full_sync and
             # poll_events. Idempotent: skips if claim.topic is
@@ -567,6 +581,8 @@ def start_indexer():
             try:
                 db = get_session_factory()()
                 poll_events(db)
+                # patch_bundle04a_hook_resolve: resolve pending tx_log rows
+                resolve_pending_txs(db)
                 db.close()
             except Exception as e:
                 logger.warning("Indexer poll error: %s", e)
@@ -592,3 +608,147 @@ def _queue_article_refresh(db, post_id):
     Kept as a stub for backward compatibility with callers."""
     return
 
+
+# patch_bundle04a_watcher: confirmation watcher for /api/relay/async
+# --- tx_log confirmation watcher (Bundle 4a) -------------------------
+# Resolves pending tx_log rows by fetching their receipts from chain.
+# Called from the indexer's poll loop after poll_events. Pure status-flip:
+# does NOT trigger reindex, cache busts, or any chain_* writes. The
+# indexer's normal poll cycle handles those independently via its event
+# stream.
+
+TX_PENDING_TIMEOUT_SECONDS = 600   # 10 minutes — receipts not found by then are dropped
+TX_WATCHER_BATCH_LIMIT     = 50    # max rows to resolve per cycle
+TX_WATCHER_MIN_AGE_SECONDS = 5     # let RPC see the tx in mempool first
+
+
+def _extract_post_id_from_receipt(receipt, action_type, calldata_hex):
+    """Best-effort: pull post_id out of the receipt logs (for claim creates and
+    links) or out of the calldata (for stake actions). Returns None on failure.
+
+    For 'stake': the post_id is the first uint256 in setStake/stake calldata.
+    For 'claim': pull from PostCreated event in PostRegistry logs.
+    For 'link':  pull from EdgeAdded event in LinkGraph logs (the link's own
+                 post_id is the linkPostId field of the event).
+    """
+    try:
+        if action_type == "stake":
+            # calldata layout: 4-byte selector + uint256 postId + …
+            cd = calldata_hex
+            if cd.startswith("0x"):
+                cd = cd[2:]
+            if len(cd) >= 8 + 64:
+                return int(cd[8:8+64], 16)
+            return None
+
+        w3 = _get_w3()
+        if action_type == "claim":
+            reg_abi = _load_abi("PostRegistry")
+            reg = w3.eth.contract(
+                address=Web3.to_checksum_address(POST_REGISTRY_ADDRESS),
+                abi=reg_abi,
+            )
+            from web3.logs import DISCARD
+            logs = reg.events.PostCreated().process_receipt(receipt, errors=DISCARD)
+            if logs:
+                return int(logs[0].args.postId)
+            return None
+
+        if action_type == "link":
+            lg_abi = _load_abi("LinkGraph")
+            lg = w3.eth.contract(
+                address=Web3.to_checksum_address(LINK_GRAPH_ADDRESS),
+                abi=lg_abi,
+            )
+            from web3.logs import DISCARD
+            logs = lg.events.EdgeAdded().process_receipt(receipt, errors=DISCARD)
+            if logs:
+                # The link itself is a post; its post_id is linkPostId.
+                return int(logs[0].args.linkPostId)
+            return None
+    except Exception as e:
+        logger.debug("post_id extraction failed (action=%s): %s", action_type, e)
+    return None
+
+
+def _decode_revert_message(receipt):
+    """Best-effort revert reason from a status=0 receipt. Returns a short string.
+
+    Reading the actual revert reason requires a replay (eth_call) at the tx's
+    block, which is expensive and provider-dependent. For now we record a
+    generic message; the frontend can offer "view on explorer" for details.
+    Future enhancement: trace_transaction for clients that support it.
+    """
+    return f"Transaction reverted (gasUsed={getattr(receipt, 'gasUsed', '?')})"
+
+
+def resolve_pending_txs(db):
+    """Resolve pending tx_log rows by fetching their receipts from chain.
+
+    Called from the indexer poll loop after poll_events(). Read-modify-write
+    on tx_log only; no other side effects.
+    """
+    import tx_log as _tx_log
+    try:
+        rows = _tx_log.get_pending_for_watcher(
+            db,
+            min_age_seconds=TX_WATCHER_MIN_AGE_SECONDS,
+            limit=TX_WATCHER_BATCH_LIMIT,
+        )
+    except Exception as e:
+        logger.warning("resolve_pending_txs: query for pending rows failed: %s", e)
+        return
+
+    if not rows:
+        return
+
+    w3 = _get_w3()
+    for row in rows:
+        try:
+            try:
+                receipt = w3.eth.get_transaction_receipt(row.tx_hash)
+            except Exception as e:
+                # web3.py raises TransactionNotFound (or generic) until mined.
+                if row.age_sec > TX_PENDING_TIMEOUT_SECONDS:
+                    _tx_log.mark_dropped(db, row.id)
+                    db.commit()
+                    logger.info("tx_log %d: dropped (timeout) %s", row.id, row.tx_hash)
+                # else: stays pending, will retry next cycle
+                continue
+
+            if receipt is None:
+                if row.age_sec > TX_PENDING_TIMEOUT_SECONDS:
+                    _tx_log.mark_dropped(db, row.id)
+                    db.commit()
+                continue
+
+            if int(receipt.status) == 1:
+                post_id = _extract_post_id_from_receipt(
+                    receipt, row.action_type, row.calldata,
+                )
+                _tx_log.mark_confirmed(
+                    db, row.id,
+                    block_number=int(receipt.blockNumber),
+                    gas_used=int(receipt.gasUsed),
+                    post_id=post_id,
+                )
+                db.commit()
+                logger.info("tx_log %d: confirmed %s block=%d post_id=%s",
+                            row.id, row.tx_hash, receipt.blockNumber, post_id)
+            else:
+                err = _decode_revert_message(receipt)
+                _tx_log.mark_reverted(
+                    db, row.id,
+                    error_message=err,
+                    block_number=int(receipt.blockNumber),
+                    gas_used=int(receipt.gasUsed),
+                )
+                db.commit()
+                logger.info("tx_log %d: reverted %s block=%d",
+                            row.id, row.tx_hash, receipt.blockNumber)
+        except Exception as e:
+            logger.warning("resolve_pending_txs: failed to resolve row %d: %s",
+                           row.id, e)
+            try: db.rollback()
+            except Exception: pass
+            continue
