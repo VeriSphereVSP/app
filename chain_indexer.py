@@ -36,6 +36,10 @@ from config import (
 
 logger = logging.getLogger(__name__)
 
+# patch_bundle04b2: trigger_reindex() and _queue_article_refresh() removed.
+# Both were called only from relay.py's now-deleted _relay_sync path.
+# Reindex now happens exclusively via the indexer's poll cycle.
+
 # APP-04: Input validation for on-chain claim text
 MAX_CLAIM_DB_LENGTH = 5000
 
@@ -591,22 +595,6 @@ def start_indexer():
     _indexer_thread = threading.Thread(target=_run, daemon=True, name="chain-indexer")
     _indexer_thread.start()
     logger.info("Chain indexer thread started (poll every %ds)", POLL_INTERVAL)
-
-
-def trigger_reindex(post_id: int, user_address: str | None = None):
-    """Trigger immediate re-indexing of a post (called by relay after meta-tx)."""
-    try:
-        db = get_session_factory()()
-        users = [user_address] if user_address else None
-        index_post(db, post_id, user_addresses=users)
-        db.close()
-    except Exception as e:
-        logger.warning("Trigger reindex failed for post %d: %s", post_id, e)
-def _queue_article_refresh(db, post_id):
-    """No-op. Article caches are now maintained incrementally via apply_stake_delta
-    (called from chain_indexer event loop) and apply_new_post (from relay.py).
-    Kept as a stub for backward compatibility with callers."""
-    return
 
 
 # patch_bundle04a_watcher: confirmation watcher for /api/relay/async

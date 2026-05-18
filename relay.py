@@ -12,7 +12,6 @@ from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 from web3 import Web3
-from chain_indexer import trigger_reindex
 from web3.logs import DISCARD
 
 from config import FORWARDER_ADDRESS, POST_REGISTRY_ADDRESS
@@ -24,6 +23,12 @@ from moderation import check_content
 from rate_limit import relay_rate_limit
 
 logger = logging.getLogger(__name__)
+
+# patch_bundle04b2: /api/relay (sync) + _relay_sync + _get_post_registry
+# + trigger_reindex import removed. Frontend now calls /api/relay/async
+# exclusively (since bundle 4b-1). The synchronous post-success path
+# (receipt wait, reindex, cache busts) was duplicated work — the
+# indexer's normal poll cycle handles all of it.
 
 # VSP token ABI for fee collection
 _VSP_FEE_ABI = [
@@ -203,7 +208,6 @@ class NonceResponse(BaseModel):
 
 
 _forwarder = None
-_post_registry = None
 
 
 def _get_forwarder():
@@ -214,14 +218,6 @@ def _get_forwarder():
         _forwarder = w3.eth.contract(
             address=Web3.to_checksum_address(FORWARDER_ADDRESS), abi=FORWARDER_ABI)
     return _forwarder
-
-
-def _get_post_registry():
-    global _post_registry
-    if _post_registry is None:
-        _post_registry = w3.eth.contract(
-            address=Web3.to_checksum_address(POST_REGISTRY_ADDRESS), abi=POST_REGISTRY_ABI)
-    return _post_registry
 
 
 def _decode_claim_text(calldata_hex):
@@ -452,341 +448,7 @@ async def estimate_fee(to: str, calldata: str, db: Session = Depends(get_db)):
     except Exception as e:
         raise HTTPException(500, f"Fee estimation failed: {e}")
 
-@router.post("/api/relay")
-@relay_rate_limit
-async def relay(body: RelayRequest, db: Session = Depends(get_db)):
-    """Relay meta-transaction. Runs blocking RPC/chain calls in a thread pool."""
-    import asyncio
-    return await asyncio.to_thread(_relay_sync, body, db)
-
-def _relay_sync(body: RelayRequest, db: Session):
-    try:
-        fwd = _get_forwarder()
-        req = body.request
-        print(f"RELAY DEBUG: req.gas={req.gas} req.to={req.to[:10]}")
-        import time as _t; _relay_t0 = _t.time()
-        print(f"TIMING: relay start", flush=True)
-        sig_bytes = bytes.fromhex(body.signature.removeprefix("0x"))
-        calldata_hex = req.data.removeprefix("0x")
-
-        request_data = (
-            Web3.to_checksum_address(req.from_),
-            Web3.to_checksum_address(req.to),
-            req.value,
-            req.gas,
-            req.deadline,
-            bytes.fromhex(calldata_hex),
-            sig_bytes,
-        )
-
-        # Execute permit if provided (relay pays gas)
-        if body.permit:
-            _execute_permit(body.permit)
-
-        # Execute fee permit if provided (grants Forwarder VSP allowance for relay fee)
-        if body.fee_permit:
-            try:
-                _execute_permit(body.fee_permit)
-                logger.info("Fee permit executed for %s", req.from_[:10])
-            except Exception as e:
-                logger.debug("Fee permit skip (non-fatal): %s", e)
-
-        # Content moderation gate
-        _moderate_claim(calldata_hex)
-
-        # Verify signature
-        try:
-            print(f"TIMING: verify start {_t.time()-_relay_t0:.1f}s", flush=True)
-            is_valid = fwd.functions.verify(request_data).call()
-            print(f"TIMING: verify done {_t.time()-_relay_t0:.1f}s valid={is_valid}", flush=True)
-            if not is_valid:
-                raise HTTPException(400, "Invalid signature")
-        except HTTPException:
-            raise
-        except Exception as e:
-            if "invalid" in str(e).lower() or "revert" in str(e).lower():
-                raise HTTPException(400, f"Signature verification failed: {e}")
-            logger.warning("verify() call failed (proceeding anyway): %s", e)
-
-        # Check if this is a createClaim call
-        is_create = (
-            req.to.lower() == POST_REGISTRY_ADDRESS.lower()
-            and calldata_hex[:8] == CREATE_CLAIM_SELECTOR
-        )
-
-        # Pre-flight: for createClaim, check for duplicate BEFORE wasting gas
-        if is_create:
-            dup = _check_duplicate_claim(calldata_hex, req.from_, db)
-            if dup:
-                logger.info("Pre-flight: claim already exists on-chain, returning existing")
-                return dup
-
-        # Pre-flight: simulate inner call to catch reverts cheaply
-        # Skip for createClaim (already handled by duplicate-check pre-flight above)
-        if not is_create:
-            try:
-                w3.eth.call({
-                    "from": Web3.to_checksum_address(req.from_),
-                    "to": Web3.to_checksum_address(req.to),
-                    "data": "0x" + calldata_hex,
-                    "value": req.value,
-                })
-            except Exception as sim_err:
-                reason = _decode_revert_reason(sim_err)
-                logger.info("Pre-flight simulation reverted: %s", reason)
-                raise HTTPException(400, reason)
-
-
-        # ── RELAY FEE: blocking enforcement ──
-        # patch02: on-chain fee only
-        # The single fee is collected by VerisphereForwarder._collectFee()
-        # on-chain (feeBps * txValue, floored at minFeeWei). We pre-flight
-        # validate against the same amount via forwarder.estimateFee() so
-        # users don't pay gas for txs that will revert in _collectFee.
-        user_addr = Web3.to_checksum_address(req.from_)
-        relay_fee_info = None  # dead-code guard for legacy log inserts below
-
-        # Execute fee permit if provided (grants forwarder VSP allowance
-        # for the on-chain fee). Still supported for client convenience.
-        if body.fee_permit:
-            try:
-                _execute_permit(body.fee_permit)
-                logger.info('Fee permit executed for %s', req.from_[:10])
-            except Exception as fp_err:
-                raise HTTPException(400, f'Fee permit failed: {fp_err}')
-
-        # Read the exact fee the on-chain forwarder will charge.
-        # Reverts on unknown selectors (acts as a relay-side allow-list check).
-        try:
-            print(f"TIMING: estimateFee start {_t.time()-_relay_t0:.1f}s", flush=True)
-            calldata_bytes = bytes.fromhex(calldata_hex)
-            fee_wei = fwd.functions.estimateFee(calldata_bytes).call()
-        except Exception as e:
-            # Unknown selector or revert in _extractTxValue. The forwarder
-            # refuses this op; we refuse it here too rather than burning gas.
-            raise HTTPException(400, f'Forwarder rejects this call: {e}')
-
-        # Check balance and allowance against the on-chain fee amount.
-        vsp_c = w3.eth.contract(address=Web3.to_checksum_address(VSP_ADDRESS), abi=_VSP_FEE_ABI)
-        print(f"TIMING: balance check start {_t.time()-_relay_t0:.1f}s", flush=True)
-        user_balance = vsp_c.functions.balanceOf(user_addr).call()
-        user_allowance = vsp_c.functions.allowance(
-            user_addr, Web3.to_checksum_address(FORWARDER_ADDRESS)).call()
-
-        if user_balance < fee_wei:
-            raise HTTPException(400,
-                f'Insufficient VSP for relay fee: need {fee_wei / 1e18:.4f} VSP, '
-                f'have {user_balance / 1e18:.4f}')
-
-        if user_allowance < fee_wei:
-            raise HTTPException(400,
-                f'Insufficient VSP allowance for relay fee: need {fee_wei / 1e18:.4f} VSP, '
-                f'allowance {user_allowance / 1e18:.4f}. Sign a fee permit.')
-
-
-        # Submit transaction
-        print(f"TIMING: build_tx start {_t.time()-_relay_t0:.1f}s", flush=True)
-        tx = fwd.functions.execute(request_data).build_transaction({
-            "from": w3.eth.default_account or Web3.to_checksum_address(
-                __import__("config").MM_ADDRESS),
-            "value": req.value,
-            "gas": req.gas + 800_000,
-        })
-        print(f"TIMING: sign_and_send start {_t.time()-_relay_t0:.1f}s", flush=True); tx_hash = sign_and_send(tx); print(f"TIMING: sign_and_send done {_t.time()-_relay_t0:.1f}s", flush=True)
-        logger.info("Submitted meta-tx: from=%s to=%s tx=%s", req.from_, req.to, tx_hash)
-
-        # Wait for receipt
-        try:
-            print(f"TIMING: wait_receipt start {_t.time()-_relay_t0:.1f}s", flush=True); receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=RECEIPT_TIMEOUT); print(f"TIMING: wait_receipt done {_t.time()-_relay_t0:.1f}s", flush=True)
-        except Exception as e:
-            logger.warning("Receipt timeout: %s", e)
-            raise HTTPException(500,
-                f"Transaction submitted ({tx_hash}) but could not confirm. "
-                "Please check the transaction on the explorer.")
-
-        if receipt.status == 0:
-            logger.warning("Meta-tx REVERTED: tx=%s gasUsed=%d", tx_hash, receipt.gasUsed)
-
-            # For createClaim reverts, try DuplicateClaim recovery
-            if is_create:
-                dup = _check_duplicate_claim(calldata_hex, req.from_, db)
-                if dup:
-                    dup["tx_hash"] = tx_hash
-                    return dup
-
-            raise HTTPException(400,
-                "Transaction reverted on-chain. "
-                "Common causes: insufficient VSP balance, duplicate claim, or contract error.")
-
-        logger.info("Meta-tx confirmed: tx=%s gasUsed=%d", tx_hash, receipt.gasUsed)
-
-        response = {"ok": True, "tx_hash": tx_hash}
-
-        # Log relay fee
-        if relay_fee_info:
-            try:
-                import sqlalchemy
-                tx_type_final, _ = _detect_tx_type(calldata_hex, req.to)
-                db.execute(sqlalchemy.text(
-                    'UPDATE mm_state SET relay_fees_collected_vsp = '
-                    'COALESCE(relay_fees_collected_vsp, 0) + :fee, '
-                    'total_gas_spent_avax = COALESCE(total_gas_spent_avax, 0) + :gas'
-                ), {'fee': relay_fee_info['fee_vsp'], 'gas': relay_fee_info['gas_cost_avax']})
-                db.execute(sqlalchemy.text(
-                    'INSERT INTO relay_fee_log '
-                    '(tx_hash, user_address, gas_estimated, gas_used, gas_price_gwei, '
-                    'gas_cost_avax, gas_cost_usd, fee_charged_vsp, fee_margin_pct, tx_type) '
-                    'VALUES (:txh, :addr, :ge, :gu, :gp, :gca, :gcu, :fcv, :fmp, :tt)'
-                ), {'txh': tx_hash, 'addr': req.from_.lower(),
-                    'ge': relay_fee_info['gas_estimate'], 'gu': receipt.gasUsed,
-                    'gp': relay_fee_info['gas_price_gwei'],
-                    'gca': relay_fee_info['gas_cost_avax'],
-                    'gcu': relay_fee_info['gas_cost_usd'],
-                    'fcv': relay_fee_info['fee_vsp'],
-                    'fmp': relay_fee_info['margin_pct'],
-                    'tt': tx_type_final})
-                db.commit()
-                response['relay_fee_vsp'] = relay_fee_info['fee_vsp']
-            except Exception as log_err:
-                logger.warning('Fee log DB error (non-fatal): %s', log_err)
-
-
-        # Detect createClaim success
-        if is_create:
-            try:
-                reg = _get_post_registry()
-                logs = reg.events.PostCreated().process_receipt(receipt, errors=DISCARD)
-                if logs:
-                    post_id = logs[0].args.postId
-                    claim_text = _decode_claim_text(calldata_hex)
-                    _mark_claim_on_chain(db, claim_text, post_id)
-                    # Incremental cache update: link this new claim to any article
-                    # sentence with matching text
-                    try:
-                        from articles.article_store import apply_new_post
-                        apply_new_post(db, post_id, claim_text)
-                    except Exception as e:
-                        logger.debug("apply_new_post failed (non-fatal): %s", e)
-                    claim_state = _get_claim_state(post_id, req.from_)
-                    claim_state["text"] = claim_text
-                    claim_state["creator"] = req.from_
-                    response["claim"] = claim_state
-                    logger.info("Claim created: post_id=%d text=%s", post_id, claim_text[:50])
-                    # APP-07: Bust chain_reader cache
-                    try:
-                        from chain.chain_reader import _cache as _cr_cache
-                        for _ck in list(_cr_cache.keys()):
-                            if f":{post_id}" in _ck:
-                                del _cr_cache[_ck]
-                    except Exception:
-                        pass
-
-                    # Immediate cross-index into all relevant articles
-                    try:
-                        from articles.claim_indexer import cross_index_claim_into_all_articles
-                        from chain_indexer import _queue_article_refresh
-                        cross_index_claim_into_all_articles(db, claim_text, post_id)
-                        _queue_article_refresh(db, post_id)
-                    except Exception as e:
-                        logger.debug("Cross-index from relay failed (non-fatal): %s", e)
-
-                    # patch04: APP-10 removed; topic detection happens
-                    # in chain_indexer.index_post() instead. The frontend's
-                    # /api/claims/detect-topic endpoint still provides
-                    # immediate UX feedback for UI-driven creation.
-                    # APP-11: Synchronous cache rebuild so frontend sees update immediately
-                    try:
-                        from db import get_session_factory
-                        from articles.article_store import build_and_cache_response
-                        # Find which articles contain this post
-                        _art_rows = db.execute(__import__("sqlalchemy").text(
-                            "SELECT DISTINCT ta.topic_key FROM article_sentence s "
-                            "JOIN article_section sec ON s.section_id = sec.section_id "
-                            "JOIN topic_article ta ON sec.article_id = ta.article_id "
-                            "WHERE s.post_id = :pid"
-                        ), {"pid": post_id}).fetchall()
-                        for _ar in _art_rows:
-                            build_and_cache_response(get_session_factory(), _ar[0])
-                        if _art_rows:
-                            logger.info("Cache rebuilt for %d articles after claim create", len(_art_rows))
-                    except Exception as e:
-                        logger.debug("Sync cache rebuild failed (non-fatal): %s", e)
-
-                else:
-                    logger.warning("createClaim succeeded but no PostCreated event found")
-            except Exception as e:
-                logger.warning("Post-create processing failed (non-fatal): %s", e)
-
-        # Detect stake/withdraw (target is StakeEngine)
-        from config import STAKE_ENGINE_ADDRESS
-        is_stake = req.to.lower() == STAKE_ENGINE_ADDRESS.lower()
-
-        if is_stake:
-            try:
-                print(f"TIMING: stake post-processing start {_t.time()-_relay_t0:.1f}s", flush=True)
-                data = bytes.fromhex(calldata_hex)
-                post_id = int.from_bytes(data[4:36], "big")
-                claim_state = _get_claim_state(post_id, req.from_)
-                response["claim"] = claim_state
-                logger.info("Stake updated: post_id=%d", post_id)
-                # APP-07: Bust chain_reader cache for this post
-                try:
-                    from chain.chain_reader import _cache as _cr_cache
-                    for _ck in list(_cr_cache.keys()):
-                        if f":{post_id}" in _ck:
-                            del _cr_cache[_ck]
-                except Exception:
-                    pass
-                # Re-index this post and connected posts so VS/stakes are fresh
-                try:
-                    print(f"TIMING: reindex start {_t.time()-_relay_t0:.1f}s", flush=True)
-                    from chain_indexer import index_post, _reindex_connected, _queue_article_refresh
-                    # Pass user_addresses=[req.from_] so chain_user_stake is
-                    # refreshed for the user who just acted. Without this, the
-                    # row stays stale until the background indexer's event
-                    # handler eventually catches the StakeAdded/StakeWithdrawn
-                    # event, which can be delayed or missed.
-                    index_post(db, post_id, user_addresses=[req.from_.lower()])
-                    _reindex_connected(db, post_id)
-                    _queue_article_refresh(db, post_id)
-                except Exception as e2:
-                    logger.debug("Post-stake reindex failed (non-fatal): %s", e2)
-                print(f"TIMING: reindex done {_t.time()-_relay_t0:.1f}s", flush=True)
-                # APP-11: Rebuild article caches in background (don't block response)
-                try:
-                    _art_rows = db.execute(__import__("sqlalchemy").text(
-                        "SELECT DISTINCT ta.topic_key FROM article_sentence s "
-                        "JOIN article_section sec ON s.section_id = sec.section_id "
-                        "JOIN topic_article ta ON sec.article_id = ta.article_id "
-                        "WHERE s.post_id = :pid"
-                    ), {"pid": post_id}).fetchall()
-                    topics_to_rebuild = [r[0] for r in _art_rows]
-                    if topics_to_rebuild:
-                        import threading
-                        def _bg_cache_rebuild(topics):
-                            try:
-                                from db import get_session_factory
-                                from articles.article_store import build_and_cache_response
-                                for t in topics:
-                                    try:
-                                        build_and_cache_response(get_session_factory(), t)
-                                    except Exception:
-                                        pass
-                            except Exception:
-                                pass
-                        threading.Thread(target=_bg_cache_rebuild, args=(topics_to_rebuild,), daemon=True).start()
-                except Exception:
-                    pass
-            except Exception as e:
-                logger.warning("Post-stake processing failed (non-fatal): %s", e)
-
-        return response
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.exception("Relay failed")
-        raise HTTPException(500, str(e))# ── /api/relay/async (Bundle 4a) ────────────────────────────────────
+# ── /api/relay/async (Bundle 4a) ────────────────────────────────────
 # Submits a meta-transaction and returns immediately with tx_hash and a
 # tx_log row id. The chain indexer's poll cycle resolves the row by
 # fetching the receipt later, and the frontend polls
