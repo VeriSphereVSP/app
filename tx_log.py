@@ -150,19 +150,77 @@ def get_pending_for_watcher(db: Session, min_age_seconds: int = 5,
     return rows
 
 
+import base64 as _b64  # patch_bundle04_5_p2_unified_feed
+import json as _json
+from datetime import datetime as _datetime, timezone as _tz
+
+
+def _encode_cursor(ts_unix: int, source: str, source_id: int) -> str:
+    """Opaque pagination cursor. Client treats as a black box.
+    Encodes [timestamp_unix, source_table, source_id] so the server
+    can resume strictly earlier than this point."""
+    payload = _json.dumps([int(ts_unix), str(source), int(source_id)], separators=(",", ":"))
+    return _b64.urlsafe_b64encode(payload.encode("ascii")).decode("ascii").rstrip("=")
+
+
+def _decode_cursor(cursor: str):
+    """Return (ts_unix:int, source:str, source_id:int) or None if invalid.
+    Invalid cursors do NOT raise — they're treated as 'no cursor' so a
+    stale client doesn't take the API down."""
+    if not cursor:
+        return None
+    try:
+        pad = "=" * (-len(cursor) % 4)
+        raw = _b64.urlsafe_b64decode(cursor + pad).decode("ascii")
+        ts, src, sid = _json.loads(raw)
+        return int(ts), str(src), int(sid)
+    except Exception:
+        return None
+
+
+def _ts_to_unix(v) -> int:
+    """Datetime|int|None -> unix seconds (int). None -> 0."""
+    if v is None:
+        return 0
+    if isinstance(v, _datetime):
+        if v.tzinfo is None:
+            v = v.replace(tzinfo=_tz.utc)
+        return int(v.timestamp())
+    try:
+        return int(v)
+    except Exception:
+        return 0
+
+
 def get_user_notifications(
     db: Session,
     user_address: str,
     pending_limit: int = 50,
     recent_limit: int = 50,
+    before_cursor: Optional[str] = None,
 ) -> dict:
-    """Return pending + recent tx_log rows for a user, ordered for UI display.
+    """Unified-feed notifications for a user.
 
-    pending: oldest first (FIFO display)
-    recent:  newest resolved first (reverse chrono)
+    pending: tx_log rows where status='pending'. Oldest first (FIFO).
+    recent:  merged stream from three sources, newest first, capped at
+             recent_limit AFTER merge & dedup:
+               - tx_log         (relays we submitted, incl. reverts)
+               - mm_trade       (MM buys/sells)
+               - chain_tx       (per-event chain-sourced history,
+                                 incl. transfers + protocol events)
+             Dedup on tx_hash: chain_tx wins (authoritative timestamp
+             via block_epoch), with tx_log enrichment (status,
+             error_message, friendly action_type) folded in.
+             Rows joined to chain_claim_text by post_id to populate
+             a snippet field for display.
+    next_cursor: opaque string; pass back as before_cursor to fetch
+                 the next page. None if no more results.
+
+    pending is NOT paginated (it's bounded by user activity).
     """
     user = user_address.lower()
 
+    # ── pending: unchanged from prior behavior ──
     pending = db.execute(sql_text("""
         SELECT id, tx_hash, action_type, action_value, to_address,
                post_id, submitted_at
@@ -173,26 +231,283 @@ def get_user_notifications(
         LIMIT :lim
     """), {"user": user, "lim": pending_limit}).fetchall()
 
-    recent = db.execute(sql_text("""
-        SELECT id, tx_hash, action_type, action_value, to_address,
-               status, post_id, block_number, gas_used,
-               error_message, submitted_at, resolved_at
-        FROM tx_log
-        WHERE user_address = :user
-          AND status IN ('confirmed','reverted','dropped')
-        ORDER BY resolved_at DESC NULLS LAST
-        LIMIT :lim
-    """), {"user": user, "lim": recent_limit}).fetchall()
+    # ── recent: pull from three sources, fetch ~3x limit each so
+    #            we have headroom to dedup and still return `limit` rows ──
+    fetch_n = max(recent_limit * 3, 60)
+    cur = _decode_cursor(before_cursor)
 
-    def serialize(row, fields):
-        return {f: getattr(row, f, None) for f in fields}
+    # tx_log resolved rows
+    if cur is None:
+        txlog_rows = db.execute(sql_text("""
+            SELECT t.id, t.tx_hash, t.action_type, t.action_value, t.to_address,
+                   t.status, t.post_id, t.block_number, t.gas_used,
+                   t.error_message, t.submitted_at, t.resolved_at,
+                   cct.claim_text     AS claim_text,
+                   cp.content_type    AS post_content_type,
+                   cl_from.claim_text AS link_from_text,
+                   cl_to.claim_text   AS link_to_text
+            FROM tx_log t
+            LEFT JOIN chain_claim_text cct       ON cct.post_id     = t.post_id
+            LEFT JOIN chain_post       cp        ON cp.post_id      = t.post_id
+            LEFT JOIN chain_link       cl_edge   ON cl_edge.link_post_id = t.post_id
+            LEFT JOIN chain_claim_text cl_from   ON cl_from.post_id = cl_edge.from_post_id
+            LEFT JOIN chain_claim_text cl_to     ON cl_to.post_id   = cl_edge.to_post_id
+            WHERE t.user_address = :user
+              AND t.status IN ('confirmed','reverted','dropped')
+            ORDER BY t.resolved_at DESC NULLS LAST
+            LIMIT :lim
+        """), {"user": user, "lim": fetch_n}).fetchall()
+    else:
+        # Cursor is (ts_unix, source, source_id). For tx_log, restrict
+        # to rows older than ts (resolved_at < ts) or same-ts smaller id.
+        ts, _src, _sid = cur
+        txlog_rows = db.execute(sql_text("""
+            SELECT t.id, t.tx_hash, t.action_type, t.action_value, t.to_address,
+                   t.status, t.post_id, t.block_number, t.gas_used,
+                   t.error_message, t.submitted_at, t.resolved_at,
+                   cct.claim_text     AS claim_text,
+                   cp.content_type    AS post_content_type,
+                   cl_from.claim_text AS link_from_text,
+                   cl_to.claim_text   AS link_to_text
+            FROM tx_log t
+            LEFT JOIN chain_claim_text cct       ON cct.post_id     = t.post_id
+            LEFT JOIN chain_post       cp        ON cp.post_id      = t.post_id
+            LEFT JOIN chain_link       cl_edge   ON cl_edge.link_post_id = t.post_id
+            LEFT JOIN chain_claim_text cl_from   ON cl_from.post_id = cl_edge.from_post_id
+            LEFT JOIN chain_claim_text cl_to     ON cl_to.post_id   = cl_edge.to_post_id
+            WHERE t.user_address = :user
+              AND t.status IN ('confirmed','reverted','dropped')
+              AND t.resolved_at IS NOT NULL
+              AND EXTRACT(EPOCH FROM t.resolved_at) < :ts
+            ORDER BY t.resolved_at DESC
+            LIMIT :lim
+        """), {"user": user, "ts": ts, "lim": fetch_n}).fetchall()
+
+    # mm_trade rows
+    if cur is None:
+        mm_rows = db.execute(sql_text("""
+            -- patch_bundle04_5_p33_txlog_select
+            SELECT trade_id, side, qty_vsp, total_usdc, avg_price_usd,
+                   created_at, tx_hash, fee_usdc
+            FROM mm_trade
+            WHERE lower(user_address) = :user
+            ORDER BY created_at DESC
+            LIMIT :lim
+        """), {"user": user, "lim": fetch_n}).fetchall()
+    else:
+        ts, _src, _sid = cur
+        mm_rows = db.execute(sql_text("""
+            SELECT trade_id, side, qty_vsp, total_usdc, avg_price_usd,
+                   created_at, tx_hash, fee_usdc
+            FROM mm_trade
+            WHERE lower(user_address) = :user
+              AND EXTRACT(EPOCH FROM created_at) < :ts
+            ORDER BY created_at DESC
+            LIMIT :lim
+        """), {"user": user, "ts": ts, "lim": fetch_n}).fetchall()
+
+    # chain_tx rows, with LEFT JOIN to chain_claim_text for snippet
+    if cur is None:
+        ct_rows = db.execute(sql_text("""
+            -- patch_bundle04_5_p32_link_joins
+            SELECT ct.id, ct.block_number, ct.tx_hash, ct.log_index,
+                   ct.block_epoch, ct.contract, ct.event_name,
+                   ct.action_type, ct.counterparty,
+                   ct.post_id, ct.amount_vsp, ct.is_challenge,
+                   ct.principal_vsp, ct.fee_vsp,
+                   ct.indexed_at, cct.claim_text,
+                   cp.content_type AS post_content_type,
+                   cl_from.claim_text AS link_from_text,
+                   cl_to.claim_text   AS link_to_text
+            FROM chain_tx ct
+            LEFT JOIN chain_claim_text cct       ON cct.post_id     = ct.post_id
+            LEFT JOIN chain_post       cp        ON cp.post_id      = ct.post_id
+            LEFT JOIN chain_link       cl_edge   ON cl_edge.link_post_id = ct.post_id
+            LEFT JOIN chain_claim_text cl_from   ON cl_from.post_id = cl_edge.from_post_id
+            LEFT JOIN chain_claim_text cl_to     ON cl_to.post_id   = cl_edge.to_post_id
+            WHERE ct.user_address = :user
+            ORDER BY COALESCE(ct.block_epoch, 0) DESC, ct.id DESC
+            LIMIT :lim
+        """), {"user": user, "lim": fetch_n}).fetchall()
+    else:
+        ts, _src, _sid = cur
+        ct_rows = db.execute(sql_text("""
+            SELECT ct.id, ct.block_number, ct.tx_hash, ct.log_index,
+                   ct.block_epoch, ct.contract, ct.event_name,
+                   ct.action_type, ct.counterparty,
+                   ct.post_id, ct.amount_vsp, ct.is_challenge,
+                   ct.principal_vsp, ct.fee_vsp,
+                   ct.indexed_at, cct.claim_text,
+                   cp.content_type AS post_content_type,
+                   cl_from.claim_text AS link_from_text,
+                   cl_to.claim_text   AS link_to_text
+            FROM chain_tx ct
+            LEFT JOIN chain_claim_text cct       ON cct.post_id     = ct.post_id
+            LEFT JOIN chain_post       cp        ON cp.post_id      = ct.post_id
+            LEFT JOIN chain_link       cl_edge   ON cl_edge.link_post_id = ct.post_id
+            LEFT JOIN chain_claim_text cl_from   ON cl_from.post_id = cl_edge.from_post_id
+            LEFT JOIN chain_claim_text cl_to     ON cl_to.post_id   = cl_edge.to_post_id
+            WHERE ct.user_address = :user
+              AND COALESCE(ct.block_epoch, 0) < :ts
+            ORDER BY COALESCE(ct.block_epoch, 0) DESC, ct.id DESC
+            LIMIT :lim
+        """), {"user": user, "ts": ts, "lim": fetch_n}).fetchall()
+
+    # ── Build a unified item list with normalized fields ──
+    # Each item carries: ts_unix, source, source_id, tx_hash, action_type,
+    # status (when knowable), post_id, amount_vsp, counterparty,
+    # gas_used, error_message, claim_text_snippet.
+    items = []
+
+    # Index tx_log rows by tx_hash (lowercased) for fast lookup when
+    # merging with chain_tx — we want to enrich chain_tx with
+    # tx_log.status / error_message when both exist for the same hash.
+    txlog_by_hash = {}
+    for r in txlog_rows:
+        h = (r.tx_hash or "").lower()
+        if h:
+            txlog_by_hash[h] = r
+
+    # Track tx_hashes claimed by chain_tx so we can skip tx_log dupes.
+    chain_tx_hashes = set()
+
+    # chain_tx first (authoritative timestamp)
+    for r in ct_rows:
+        h = (r.tx_hash or "").lower()
+        chain_tx_hashes.add(h)
+        enrich = txlog_by_hash.get(h)
+        snippet = None
+        ctext = getattr(r, "claim_text", None)
+        if ctext:
+            snippet = (ctext[:160] + "…") if len(ctext) > 160 else ctext
+        # patch_bundle04_5_p21_enrich_gating
+        # Only enrich rows where the chain_tx event is the canonical
+        # protocol event for the action — NOT Transfer rows that may
+        # share a tx_hash with the same relay. Otherwise a stake's
+        # mechanical Transfer row inherits action_type='stake' and
+        # the user sees three near-duplicate 'stake' rows.
+        is_protocol_event = r.event_name in (
+            "StakeAdded", "StakeWithdrawn", "PostCreated", "EdgeAdded"
+        )
+        action_type = r.action_type
+        if is_protocol_event and enrich is not None and enrich.action_type in (
+                "claim","link","stake","unstake"):
+            action_type = enrich.action_type
+        # gas_used and error_message: only attach to the canonical
+        # protocol-event row (the one the user thinks of as 'the action').
+        if is_protocol_event and enrich is not None:
+            gas_used_val = int(enrich.gas_used) if enrich.gas_used is not None else None
+            error_message_val = enrich.error_message
+            status_val = enrich.status
+        else:
+            gas_used_val = None
+            error_message_val = None
+            status_val = "confirmed"
+        items.append({
+            "source":          "chain_tx",
+            "source_id":       int(r.id),
+            "ts_unix":         _ts_to_unix(r.block_epoch) or _ts_to_unix(r.indexed_at),
+            "tx_hash":         r.tx_hash,
+            "block_number":    int(r.block_number) if r.block_number is not None else None,
+            "action_type":     action_type,
+            "event_name":      r.event_name,
+            "contract":        r.contract,
+            "status":          status_val,
+            "post_id":         int(r.post_id) if r.post_id is not None else None,
+            "amount_vsp":      float(r.amount_vsp) if r.amount_vsp is not None else None,
+            "counterparty":    r.counterparty,
+            "is_challenge":    bool(r.is_challenge) if r.is_challenge is not None else None,
+            "gas_used":        gas_used_val,
+            "error_message":   error_message_val,
+            "claim_snippet":   snippet,
+            "principal_vsp":   float(r.principal_vsp) if getattr(r, "principal_vsp", None) is not None else None,
+            "fee_vsp":         float(r.fee_vsp) if getattr(r, "fee_vsp", None) is not None else None,
+            # patch_bundle04_5_p32_link_fields
+            "is_link_post":    (getattr(r, "post_content_type", None) == 1),
+            "link_from_text":  getattr(r, "link_from_text", None),
+            "link_to_text":    getattr(r, "link_to_text", None),
+        })
+
+    # tx_log rows that did NOT get claimed by chain_tx (e.g. reverts —
+    # no chain event was emitted, but tx_log knows it happened).
+    for r in txlog_rows:
+        h = (r.tx_hash or "").lower()
+        if h in chain_tx_hashes:
+            continue
+        items.append({
+            "source":          "tx_log",
+            "source_id":       int(r.id),
+            "ts_unix":         _ts_to_unix(r.resolved_at) or _ts_to_unix(r.submitted_at),
+            "tx_hash":         r.tx_hash,
+            "block_number":    int(r.block_number) if r.block_number is not None else None,
+            "action_type":     r.action_type,
+            "event_name":      None,
+            "contract":        None,
+            "status":          r.status,
+            "post_id":         int(r.post_id) if r.post_id is not None else None,
+            "amount_vsp":      float(r.action_value) if r.action_value is not None else None,
+            "counterparty":    r.to_address,
+            "is_challenge":    None,
+            "gas_used":        int(r.gas_used) if r.gas_used is not None else None,
+            "error_message":   r.error_message,
+            "claim_snippet":   ((getattr(r, "claim_text", None) or "")[:160] + ("…" if len(getattr(r, "claim_text", None) or "") > 160 else "")) or None,
+            "is_link_post":    (getattr(r, "post_content_type", None) == 1),
+            "link_from_text":  getattr(r, "link_from_text", None),
+            "link_to_text":    getattr(r, "link_to_text", None),
+        })
+
+    # mm_trade rows. These don't carry a tx_hash today, so they can't
+    # be deduped against chain_tx — accept as-is; the chain_tx side
+    # would show as VSP transfer rows anyway, which is fine for the
+    # "all my activity" view.
+    for r in mm_rows:
+        items.append({
+            "source":          "mm_trade",
+            "source_id":       int(r.trade_id),
+            "ts_unix":         _ts_to_unix(r.created_at),
+            "tx_hash":         getattr(r, "tx_hash", None),  # patch_bundle04_5_p33_txlog_item
+            "block_number":    None,
+            "action_type":     r.side,  # 'buy' | 'sell'
+            "event_name":      None,
+            "contract":        "MM",
+            "status":          "confirmed",  # synchronous; always confirmed by the time the row exists
+            "post_id":         None,
+            "amount_vsp":      float(r.qty_vsp) if r.qty_vsp is not None else None,
+            "counterparty":    None,
+            "is_challenge":    None,
+            "gas_used":        None,
+            "error_message":   None,
+            "claim_snippet":   None,
+            "total_usdc":      float(r.total_usdc) if r.total_usdc is not None else None,
+            "avg_price_usd":   float(r.avg_price_usd) if r.avg_price_usd is not None else None,
+            "fee_usdc":        float(r.fee_usdc) if getattr(r, "fee_usdc", None) is not None else None,
+        })
+
+    # Sort newest-first by ts_unix, tiebreak by (source, source_id) DESC
+    # for stable ordering. Then trim to recent_limit; compute cursor
+    # from the last (oldest in page) item.
+    items.sort(key=lambda x: (x["ts_unix"], x["source"], x["source_id"]),
+               reverse=True)
+    page = items[: recent_limit]
+    next_cursor = None
+    if len(items) > recent_limit and page:
+        last = page[-1]
+        next_cursor = _encode_cursor(last["ts_unix"], last["source"], last["source_id"])
+
+    def serialize_pending(r):
+        return {
+            "id":            int(r.id),
+            "tx_hash":       r.tx_hash,
+            "action_type":   r.action_type,
+            "action_value":  float(r.action_value) if r.action_value is not None else None,
+            "to_address":    r.to_address,
+            "post_id":       int(r.post_id) if r.post_id is not None else None,
+            "submitted_at":  r.submitted_at,
+        }
 
     return {
-        "address": user,
-        "pending": [serialize(r, ["id","tx_hash","action_type","action_value",
-                                  "to_address","post_id","submitted_at"]) for r in pending],
-        "recent":  [serialize(r, ["id","tx_hash","action_type","action_value",
-                                  "to_address","status","post_id","block_number",
-                                  "gas_used","error_message","submitted_at",
-                                  "resolved_at"]) for r in recent],
+        "address":     user,
+        "pending":     [serialize_pending(r) for r in pending],
+        "recent":      page,
+        "next_cursor": next_cursor,
     }

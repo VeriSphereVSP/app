@@ -84,8 +84,19 @@ async def main():
         CYCLE_SECONDS = 86400  # 24h target
         recent_elapsed = []
         await asyncio.sleep(120)  # Initial delay
+        # patch_bundle04_5_p7_worker_session_leak: session must be opened, used, and closed
+        # ENTIRELY BEFORE any `await asyncio.sleep(...)`. Holding a session
+        # across an async sleep, while it has an open (implicit) transaction
+        # from a prior SELECT, is what produced the idle-in-transaction
+        # leak on `SELECT count(*) FROM topic_article` (bounded by the 5-min
+        # idle_in_transaction_session_timeout, but leaking real connections
+        # every cycle until then).
         while True:
             try:
+                # Compute next sleep INSIDE the DB-work block and use it
+                # AFTER db.close(). The two paths (no-article vs. refreshed)
+                # set `next_sleep` independently; we sleep once below.
+                next_sleep = 60  # default if anything unexpected
                 Sess = get_session_factory()
                 db = Sess()
                 try:
@@ -94,27 +105,34 @@ async def main():
                         "ORDER BY last_refreshed_at ASC NULLS FIRST LIMIT 1"
                     )).fetchone()
                     if not row:
-                        await asyncio.sleep(60)
-                        continue
-                    aid, topic = row
-                    t0 = time.time()
-                    refresh_article(db, topic)
-                    persist_dedup(db, aid)
-                    build_and_cache_response(db, topic)
-                    elapsed = time.time() - t0
-                    recent_elapsed.append(elapsed)
-                    if len(recent_elapsed) > 20:
-                        recent_elapsed = recent_elapsed[-20:]
-                    # Count total articles
-                    total = db.execute(sql_text(
-                        "SELECT count(*) FROM topic_article"
-                    )).scalar() or 1
-                    avg = statistics.mean(recent_elapsed) if recent_elapsed else 30
-                    gap = max((CYCLE_SECONDS / total) - avg, 5)
-                    print(f"Refreshed article '{topic}' in {elapsed:.1f}s, next in {gap:.0f}s")
-                    await asyncio.sleep(gap)
+                        # No articles yet — just poll again in 60s.
+                        next_sleep = 60
+                    else:
+                        aid, topic = row
+                        t0 = time.time()
+                        refresh_article(db, topic)
+                        persist_dedup(db, aid)
+                        build_and_cache_response(db, topic)
+                        elapsed = time.time() - t0
+                        recent_elapsed.append(elapsed)
+                        if len(recent_elapsed) > 20:
+                            recent_elapsed = recent_elapsed[-20:]
+                        total = db.execute(sql_text(
+                            "SELECT count(*) FROM topic_article"
+                        )).scalar() or 1
+                        avg = statistics.mean(recent_elapsed) if recent_elapsed else 30
+                        gap = max((CYCLE_SECONDS / total) - avg, 5)
+                        print(f"Refreshed article '{topic}' in {elapsed:.1f}s, next in {gap:.0f}s")
+                        next_sleep = gap
+                    # Commit closes any implicit transaction opened by the
+                    # SELECTs above. The article-store helpers above commit
+                    # their own writes; this catches the read-only SELECTs.
+                    db.commit()
                 finally:
                     db.close()
+                # Session is closed here. Safe to sleep without holding
+                # an idle-in-transaction session.
+                await asyncio.sleep(next_sleep)
             except Exception as e:
                 print(f"Article refresh error: {e}")
                 await asyncio.sleep(60)

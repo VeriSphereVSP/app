@@ -112,16 +112,20 @@ EMBEDDINGS_MODEL = os.getenv("EMBEDDINGS_MODEL", "text-embedding-3-small")
 DUPLICATE_THRESHOLD = float(os.getenv("DUPLICATE_THRESHOLD", "0.95"))
 NEAR_DUPLICATE_THRESHOLD = float(os.getenv("NEAR_DUPLICATE_THRESHOLD", "0.85"))
 
-# Print config (APP-08: password redacted)
+# Print config (APP-08: password redacted)  # patch_bundle04_5_p22_config_stderr
+# Banner goes to stderr so `docker compose logs` still shows it
+# (captures both streams) but one-liner pipelines that consume
+# `docker compose exec app python -c '...'` stdout aren't polluted.
+import sys as _sys_for_banner
 _db_url_safe = f"postgresql://{DB_USER}:***@{DB_HOST}:{DB_PORT}/{DB_NAME}"
-print("Config loaded:")
-print(f"  CHAIN_ID: {CHAIN_ID}")
-print(f"  NETWORK: {NETWORK}")
-print(f"  POST_REGISTRY: {POST_REGISTRY_ADDRESS}")
-print(f"  FORWARDER: {FORWARDER_ADDRESS}")
-print(f"  MM_ADDRESS: {MM_ADDRESS}")
-print(f"  RPC_URL: {RPC_URL[:50]}...")
-print(f"  DB: {_db_url_safe}")
+print("Config loaded:",                              file=_sys_for_banner.stderr)
+print(f"  CHAIN_ID: {CHAIN_ID}",                     file=_sys_for_banner.stderr)
+print(f"  NETWORK: {NETWORK}",                       file=_sys_for_banner.stderr)
+print(f"  POST_REGISTRY: {POST_REGISTRY_ADDRESS}",   file=_sys_for_banner.stderr)
+print(f"  FORWARDER: {FORWARDER_ADDRESS}",           file=_sys_for_banner.stderr)
+print(f"  MM_ADDRESS: {MM_ADDRESS}",                 file=_sys_for_banner.stderr)
+print(f"  RPC_URL: {RPC_URL[:50]}...",               file=_sys_for_banner.stderr)
+print(f"  DB: {_db_url_safe}",                       file=_sys_for_banner.stderr)
 
 
 # Relay fee configuration
@@ -129,3 +133,15 @@ RELAY_FEE_MARGIN_PCT = float(os.getenv("RELAY_FEE_MARGIN_PCT", "0.30"))  # 30% m
 RELAY_FEE_MIN_VSP = float(os.getenv("RELAY_FEE_MIN_VSP", "0.1"))  # Minimum relay fee
 RELAY_FEE_TXN_PCT = float(os.getenv("RELAY_FEE_TXN_PCT", "0.01"))  # 1% of txn value
 AVAX_PRICE_USD = float(os.getenv("AVAX_PRICE_USD", "20.0"))  # Fallback AVAX price
+
+# patch_bundle10_5_part2b_treasury_worker: base URL the treasury worker uses to reach the app's
+# read API (e.g. /api/mm/floor). Inside the docker network the worker
+# reaches the app by service name; override via env if needed.
+APP_API_BASE = os.getenv("APP_API_BASE", "http://app:8070")
+
+# patch_bundle10_5_part2b_treasury_worker: treasury worker tunables are read directly from the
+# environment inside treasury_worker.py (so switches can be re-read each
+# loop iteration). They are intentionally NOT bound here as module
+# constants. The only worker value imported from config is APP_API_BASE
+# above (plus the existing VSP_TOKEN_ADDRESS / USDC_ADDRESS / MM_ADDRESS
+# / TREASURY_ADDRESS).

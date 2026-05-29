@@ -47,6 +47,9 @@ from config import (
     STAKE_ENGINE_ADDRESS,
     SCORE_ENGINE_ADDRESS,
     LINK_GRAPH_ADDRESS,
+    VSP_TOKEN_ADDRESS,           # patch_bundle04_5_chain_tx_config_import
+    MM_ADDRESS,
+    COLD_SAFE_ADDRESSES,
 )
 
 logger = logging.getLogger(__name__)
@@ -94,6 +97,25 @@ def _load_abi(name):
     return []
 
 
+# patch_bundle04_5_p21_load_abi_path
+def _load_abi_paths(name, candidate_paths):
+    """Try multiple paths in order, return the first ABI found.
+    Used for contracts that may live in different build dirs
+    (e.g. Forwarder lives in app/contracts/out, not /core/out).
+    Returns [] if none of the candidates exist.
+    """
+    for p in candidate_paths:
+        path = Path(p)
+        if path.exists():
+            try:
+                with open(path) as f:
+                    return json.load(f)["abi"]
+            except Exception as _e:
+                logger.warning("ABI parse failed at %s: %s", p, _e)
+                return []
+    return []
+
+
 def _get_contracts(w3):
     """Returns dict of contract_name -> (contract, [event_names_we_care_about])."""
     se = w3.eth.contract(
@@ -105,12 +127,344 @@ def _get_contracts(w3):
     lg = w3.eth.contract(
         address=Web3.to_checksum_address(LINK_GRAPH_ADDRESS),
         abi=_load_abi("LinkGraph"))
-    return {
+    # patch_bundle04_5_chain_tx_vsp_subscription
+    contracts = {
         "StakeEngine":  (se,  ["StakeAdded", "StakeWithdrawn", "PostUpdated"]),
         "PostRegistry": (reg, ["PostCreated"]),
         "LinkGraph":    (lg,  ["EdgeAdded"]),
     }
+    if VSP_TOKEN_ADDRESS:
+        try:
+            vsp_abi = _load_abi("VSPToken")
+            if vsp_abi:
+                vsp = w3.eth.contract(
+                    address=Web3.to_checksum_address(VSP_TOKEN_ADDRESS),
+                    abi=vsp_abi)
+                contracts["VSPToken"] = (vsp, ["Transfer"])
+                logger.info("Indexer subscribed to VSPToken Transfer events at %s", VSP_TOKEN_ADDRESS)  # patch_bundle04_5_p2_vsp_success_log
+            else:
+                logger.warning("VSPToken ABI empty — Transfer events disabled")
+        except Exception as _e:
+            logger.warning("VSPToken ABI/contract load failed (Transfer events disabled): %s", _e)
+    return contracts
 
+
+
+# patch_bundle04_5_chain_tx_helper
+_FORWARDER_TREASURY_CACHE = {"addr": None, "resolved": False}  # patch_bundle04_5_p2_treasury_filter
+
+def _forwarder_treasury_address():
+    """Read Forwarder.treasury() from chain once and cache it for
+    the indexer process lifetime. Returns lowercase hex string or
+    None if the Forwarder isn't deployed / ABI not present / RPC
+    fails. A None result is cached too — we won't keep retrying
+    on every poll. To re-discover, restart the worker container.
+    """
+    if _FORWARDER_TREASURY_CACHE["resolved"]:
+        return _FORWARDER_TREASURY_CACHE["addr"]
+    addr = None
+    try:
+        from config import FORWARDER_ADDRESS  # local import; avoid cycles at module load
+        if FORWARDER_ADDRESS:
+            abi = _load_abi_paths("VerisphereForwarder", [
+                "/core/out/VerisphereForwarder.sol/VerisphereForwarder.json",
+                "/app/contracts/out/VerisphereForwarder.sol/VerisphereForwarder.json",
+            ])
+            if abi:
+                w3 = _get_w3()
+                fwd = w3.eth.contract(
+                    address=Web3.to_checksum_address(FORWARDER_ADDRESS),
+                    abi=abi)
+                addr = fwd.functions.treasury().call().lower()
+                logger.info("Forwarder treasury (fee recipient) discovered: %s", addr)
+            else:
+                logger.info("Forwarder ABI not present at /core/out or /app/contracts/out — fee-recipient filter disabled")
+        else:
+            logger.info("FORWARDER_ADDRESS not configured — fee-recipient filter disabled")
+    except Exception as _e:
+        logger.warning("Forwarder.treasury() read failed (fee-recipient filter disabled): %s", _e)
+    _FORWARDER_TREASURY_CACHE["addr"] = addr
+    _FORWARDER_TREASURY_CACHE["resolved"] = True
+    return addr
+
+
+def _chain_tx_internal_addresses():
+    """Return the set (lowercase) of addresses that should be filtered
+    out of VSP Transfer chain_tx rows: protocol-internal sinks where
+    transfers are mechanics of stake/MM operations, not user moves.
+
+    Includes StakeEngine, MM_ADDRESS, Forwarder.treasury() (fee recipient,
+    discovered from chain — patch_bundle04_5_p2), COLD_SAFE_ADDRESSES,
+    and the zero address. Re-evaluated on each call so env changes
+    (via --force-recreate) take effect; the Forwarder.treasury() read
+    is cached after first successful call.
+    """
+    out = {"0x" + "0" * 40}
+    if STAKE_ENGINE_ADDRESS:
+        out.add(STAKE_ENGINE_ADDRESS.lower())
+    if MM_ADDRESS:
+        out.add(MM_ADDRESS.lower())
+    treas = _forwarder_treasury_address()
+    if treas:
+        out.add(treas)
+    # patch_bundle04_5_p22_protocol_contracts_internal
+    # PostRegistry + LinkGraph: protocol contracts the user
+    # interacts with via the Forwarder. user↔contract VSP
+    # movements (claim/link bonds) are mechanics, not user
+    # activity — mirror the existing StakeEngine treatment.
+    if POST_REGISTRY_ADDRESS:
+        out.add(POST_REGISTRY_ADDRESS.lower())
+    if LINK_GRAPH_ADDRESS:
+        out.add(LINK_GRAPH_ADDRESS.lower())
+    for a in COLD_SAFE_ADDRESSES:
+        out.add(a.lower())
+    return out
+
+
+_BLOCK_TS_CACHE = {}
+_BLOCK_TS_CACHE_MAX = 4096
+
+def _block_timestamp(w3, block_number: int):
+    """Fetch and cache the timestamp (uint64 unix epoch) for a block.
+    Returns None on RPC failure (so the chain_tx row still writes with
+    NULL block_epoch — the row's existence matters more than the ts)."""
+    cached = _BLOCK_TS_CACHE.get(block_number)
+    if cached is not None:
+        return cached
+    try:
+        ts = int(w3.eth.get_block(block_number).timestamp)
+    except Exception as _e:
+        logger.warning("block_timestamp(%d) failed: %s", block_number, _e)
+        return None
+    if len(_BLOCK_TS_CACHE) >= _BLOCK_TS_CACHE_MAX:
+        # Crude eviction: drop the oldest ~25%. Not LRU but adequate;
+        # the dict is small and this rarely fires.
+        for k in list(_BLOCK_TS_CACHE.keys())[: _BLOCK_TS_CACHE_MAX // 4]:
+            _BLOCK_TS_CACHE.pop(k, None)
+    _BLOCK_TS_CACHE[block_number] = ts
+    return ts
+
+
+def _insert_chain_tx_row(db, row):  # patch_bundle04_5_p21_fee_summary
+    """Insert a single chain_tx row. UNIQUE(tx_hash, log_index, user_address)
+    means ON CONFLICT DO NOTHING is the idempotent path for the rare case
+    where a manual backfill replays an already-indexed log.
+
+    `row` may include principal_vsp and fee_vsp; both default to None
+    so older callers (pre-2.1) don't need to change."""
+    row = dict(row)  # don't mutate caller's dict
+    row.setdefault("prin", None)
+    row.setdefault("fee", None)
+    db.execute(sql_text("""
+        INSERT INTO chain_tx (
+            block_number, tx_hash, log_index, block_epoch,
+            contract, event_name, action_type,
+            user_address, counterparty,
+            post_id, amount_vsp, is_challenge,
+            principal_vsp, fee_vsp
+        ) VALUES (
+            :bn, :txh, :li, :be,
+            :ct, :en, :at,
+            :ua, :cp,
+            :pid, :amt, :ic,
+            :prin, :fee
+        )
+        ON CONFLICT (tx_hash, log_index, user_address) DO NOTHING
+    """), row)
+
+
+def _compute_fee_summary_by_tx(all_events, internal_addrs):
+    """For each tx_hash, sum Transfer values where the recipient is
+    an internal address — these are mechanical fees/principal moves
+    that we'll attribute to the protocol-event row(s) for that tx.
+
+    Returns dict: tx_hash -> {
+        'principal_to_stake_engine_vsp': float,
+        'fee_to_other_internal_vsp':    float,
+        'sender':                       lowercase address or None,
+    }
+
+    Convention:
+      • Transfer to STAKE_ENGINE_ADDRESS  → principal (stake)
+      • Transfer from STAKE_ENGINE_ADDRESS → principal (unstake)
+      • Transfer to any other internal addr → fee
+    The protocol-event row picks which side it represents:
+      • StakeAdded     → principal_vsp = principal_to_stake_engine,
+                          fee_vsp = fee_to_other_internal
+      • StakeWithdrawn → principal_vsp = principal_from_stake_engine,
+                          fee_vsp = fee_to_other_internal
+      • PostCreated / EdgeAdded → fee_vsp only (no principal moves
+                                    with claim/link creation today)
+    """
+    summary = {}
+    se_addr = STAKE_ENGINE_ADDRESS.lower() if STAKE_ENGINE_ADDRESS else None
+    for e in all_events:
+        if e["event_name"] != "Transfer":
+            continue
+        evt = e["evt"]
+        a = evt.args
+        try:
+            amt = float(a["value"]) / 1e18
+        except Exception:
+            continue
+        try:
+            f = a["from"].lower()
+            t = a["to"].lower()
+        except Exception:
+            continue
+        txh = evt.transactionHash.hex().lower() if hasattr(evt.transactionHash, "hex") else str(evt.transactionHash).lower()
+        if not txh.startswith("0x"):
+            txh = "0x" + txh
+        bucket = summary.setdefault(txh, {
+            "principal_to_se_vsp":   0.0,
+            "principal_from_se_vsp": 0.0,
+            "fee_to_other_internal_vsp": 0.0,
+            "sender": None,
+        })
+        if se_addr and t == se_addr:
+            bucket["principal_to_se_vsp"] += amt
+            if bucket["sender"] is None and f not in internal_addrs:
+                bucket["sender"] = f
+        elif se_addr and f == se_addr:
+            bucket["principal_from_se_vsp"] += amt
+        elif t in internal_addrs:
+            # patch_bundle04_5_p22_fee_sender_guard
+            # Require sender external. Without this guard, an
+            # internal-to-internal Transfer (e.g. PostRegistry
+            # burning the claim bond by sending to 0x0) would be
+            # counted as a user fee — but the user already paid
+            # that VSP earlier in the same tx via the user→PostReg
+            # Transfer, which is what really counts as their fee.
+            if f not in internal_addrs:
+                bucket["fee_to_other_internal_vsp"] += amt
+                if bucket["sender"] is None:
+                    bucket["sender"] = f
+    return summary
+
+
+def _record_chain_tx_for_event(db, w3, e, internal_addrs, fee_summary=None):
+    """Write 1-2 chain_tx rows for a single indexed event.
+
+    Protocol events: 1 row, user_address = the staker/creator.
+    Transfer events: up to 2 rows (from-side transfer_out, to-side
+    transfer_in), each suppressed if its side address is internal.
+    """
+    name = e["event_name"]
+    contract = e["contract"]
+    evt = e["evt"]
+    bn = e["block"]
+    txh = evt.transactionHash.hex().lower() if hasattr(evt.transactionHash, "hex") else str(evt.transactionHash).lower()
+    if not txh.startswith("0x"):
+        txh = "0x" + txh
+    li = int(e["log_index"])
+    be = _block_timestamp(w3, bn)
+
+    if name == "StakeAdded":
+        a = evt.args
+        try:
+            amt = float(a.amount) / 1e18 if hasattr(a, "amount") else None
+        except Exception:
+            amt = None
+        ic = bool(getattr(a, "isChallenge", False))
+        s = (fee_summary or {}).get(txh) or {}
+        _insert_chain_tx_row(db, {
+            "bn": bn, "txh": txh, "li": li, "be": be,
+            "ct": contract, "en": name, "at": "stake",
+            "ua": a.staker.lower(), "cp": None,
+            "pid": int(a.postId), "amt": amt, "ic": ic,
+            "prin": s.get("principal_to_se_vsp") or None,
+            "fee":  s.get("fee_to_other_internal_vsp") or None,
+        })
+    elif name == "StakeWithdrawn":
+        a = evt.args
+        try:
+            amt = float(a.amount) / 1e18 if hasattr(a, "amount") else None
+        except Exception:
+            amt = None
+        ic = bool(getattr(a, "isChallenge", False))
+        s = (fee_summary or {}).get(txh) or {}
+        _insert_chain_tx_row(db, {
+            "bn": bn, "txh": txh, "li": li, "be": be,
+            "ct": contract, "en": name, "at": "unstake",
+            "ua": a.staker.lower(), "cp": None,
+            "pid": int(a.postId), "amt": amt, "ic": ic,
+            "prin": s.get("principal_from_se_vsp") or None,
+            "fee":  s.get("fee_to_other_internal_vsp") or None,
+        })
+    elif name == "PostCreated":
+        a = evt.args
+        s = (fee_summary or {}).get(txh) or {}
+        _insert_chain_tx_row(db, {
+            "bn": bn, "txh": txh, "li": li, "be": be,
+            "ct": contract, "en": name, "at": "claim",
+            "ua": a.creator.lower(), "cp": None,
+            "pid": int(a.postId), "amt": None, "ic": None,
+            "prin": None,
+            "fee":  s.get("fee_to_other_internal_vsp") or None,
+        })
+    elif name == "EdgeAdded":
+        a = evt.args
+        ic = bool(getattr(a, "isChallenge", False))
+        link_pid = int(a.linkPostId)
+        creator_row = db.execute(sql_text(
+            "SELECT creator FROM chain_post WHERE post_id = :p"
+        ), {"p": link_pid}).fetchone()
+        if creator_row and creator_row[0]:
+            s = (fee_summary or {}).get(txh) or {}
+            _insert_chain_tx_row(db, {
+                "bn": bn, "txh": txh, "li": li, "be": be,
+                "ct": contract, "en": name, "at": "link",
+                "ua": creator_row[0].lower(), "cp": None,
+                "pid": link_pid, "amt": None, "ic": ic,
+                "prin": None,
+                "fee":  s.get("fee_to_other_internal_vsp") or None,
+            })
+    elif name == "Transfer":
+        # patch_bundle04_5_p21_transfer_filter_tight
+        a = evt.args
+        # Standard ERC20: from, to, value
+        try:
+            amt = float(a["value"]) / 1e18 if "value" in a else float(a.value) / 1e18
+        except Exception:
+            amt = None
+        try:
+            from_addr = a["from"].lower()
+        except Exception:
+            from_addr = getattr(a, "from", "").lower()
+        try:
+            to_addr = a["to"].lower()
+        except Exception:
+            to_addr = getattr(a, "to", "").lower()
+
+        # Option-C filter: suppress entire Transfer when EITHER side
+        # is an internal address. Mechanical transfers (stake principal
+        # to StakeEngine, relay fee to Forwarder.treasury, MM trade legs)
+        # are folded into the protocol-event row's principal_vsp/fee_vsp
+        # at write time (see fee_summary_by_tx in poll_events_atomic).
+        # Genuine wallet-to-wallet transfers (faucet drops, gifts, sends)
+        # survive — both sides external.
+        if (from_addr in internal_addrs) or (to_addr in internal_addrs):
+            return  # nothing written for this Transfer
+
+        # transfer_out for from-side
+        if from_addr:
+            _insert_chain_tx_row(db, {
+                "bn": bn, "txh": txh, "li": li, "be": be,
+                "ct": contract, "en": name, "at": "transfer_out",
+                "ua": from_addr, "cp": to_addr or None,
+                "pid": None, "amt": amt, "ic": None,
+            })
+        # transfer_in for to-side
+        if to_addr:
+            _insert_chain_tx_row(db, {
+                "bn": bn, "txh": txh, "li": li, "be": be,
+                "ct": contract, "en": name, "at": "transfer_in",
+                "ua": to_addr, "cp": from_addr or None,
+                "pid": None, "amt": amt, "ic": None,
+            })
+    # Other event names (PostUpdated, etc.) intentionally produce
+    # no chain_tx rows: they're state-recomputation triggers, not
+    # user-visible actions.
 
 # ── Canonical write helpers (no commits — caller manages transaction) ──
 
@@ -123,7 +477,14 @@ def _index_user_stake_canonical(db: Session, se, user_address: str, post_id: int
             amount = lot_info[0] / 1e18
             weighted_pos = lot_info[1] / 1e18
             entry_epoch = lot_info[2]
-            pos_weight = lot_info[3] / 1e18
+            # patch_bundle04_5_p6_apr_pos_weight_off_by_one: positionWeight is lot_info[4], not [3].
+            # StakeEngine.getUserLotInfo returns 5 values:
+            #   0=amount, 1=weightedPosition, 2=entryEpoch,
+            #   3=sideTotal, 4=positionWeight
+            # Reading [3] mis-populated chain_user_stake.position_weight
+            # with sideTotal (post-side total stake), producing absurd
+            # APRs downstream via daily-compounded inflation.
+            pos_weight = lot_info[4] / 1e18
 
             if amount > 0:
                 db.execute(sql_text("""
@@ -503,6 +864,21 @@ def poll_events_atomic(db: Session) -> dict:
             result = index_post_canonical(db, pid, user_addresses=users)
             if result["content_type"] == 0:
                 enqueue_derived_state(db, pid, is_new=result["is_new"])
+
+        # patch_bundle04_5_chain_tx_phase3_writes
+        # Per-event chain-sourced transaction history.
+        # Runs inside the same transaction as the cursor
+        # advance, so rollback discards these rows on failure.
+        try:
+            _ct_internal = _chain_tx_internal_addresses()
+            _ct_fee_summary = _compute_fee_summary_by_tx(all_events, _ct_internal)
+            for _ev in all_events:
+                _record_chain_tx_for_event(db, w3, _ev, _ct_internal, _ct_fee_summary)
+        except Exception as _ct_e:
+            # chain_tx is forensic; a failure here should NOT
+            # block the canonical write. Log and continue;
+            # the outer txn still commits.
+            logger.warning("chain_tx write failed (canonical unaffected): %s", _ct_e)
 
         # Global stats
         try:

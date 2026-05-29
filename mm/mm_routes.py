@@ -35,6 +35,8 @@ logger = logging.getLogger(__name__)
 from chain.chain_reader import (
     read_vsp_circulating,
     read_usdc_reserves,
+    read_vsp_balance_of_mm,
+    read_usdc_balance_of_mm,
     invalidate_mm_chain_state_cache,
 )
 
@@ -98,17 +100,24 @@ def _update_mm_state(db, net_vsp=None, usdc_reserves=None, vsp_circulating=None)
 
 
 def _log_trade(db, *, side, user_address, qty_vsp, total_usdc, avg_price_usd,
-               net_vsp_before, net_vsp_after, usdc_reserves_after, vsp_circulating_after):
+               net_vsp_before, net_vsp_after, usdc_reserves_after, vsp_circulating_after,
+               tx_hash=None, fee_usdc=None):  # patch_bundle04_5_p21_mm_log_trade_tx_hash + patch_bundle04_5_p33_log_trade_sig
+    txh = None
+    if tx_hash:
+        txh = tx_hash.lower() if tx_hash.startswith("0x") else ("0x" + tx_hash.lower())
     db.execute(
         text(
+            # patch_bundle04_5_p33_log_trade_sql
             "INSERT INTO mm_trade "
             "(side, user_address, qty_vsp, total_usdc, avg_price_usd, "
-            " net_vsp_before, net_vsp_after, usdc_reserves_after, vsp_circulating_after) "
-            "VALUES (:side, :user, :qty, :total, :avg, :nb, :na, :ra, :ca)"
+            " net_vsp_before, net_vsp_after, usdc_reserves_after, vsp_circulating_after, "
+            " tx_hash, fee_usdc) "
+            "VALUES (:side, :user, :qty, :total, :avg, :nb, :na, :ra, :ca, :tx, :fee)"
         ),
         {"side": side, "user": user_address, "qty": qty_vsp, "total": total_usdc,
          "avg": avg_price_usd, "nb": net_vsp_before, "na": net_vsp_after,
-         "ra": usdc_reserves_after, "ca": vsp_circulating_after},
+         "ra": usdc_reserves_after, "ca": vsp_circulating_after, "tx": txh,
+         "fee": fee_usdc},
     )
 
 
@@ -340,23 +349,78 @@ def preview_buy(qty_vsp: float = None, usdc_amount: float = None, db: Session = 
             "breakdown": fee["breakdown"],
         }
     elif usdc_amount and usdc_amount > 0:
-        # Iterate to find qty that fits budget including fee
+        # patch_bundle09_p3_preview_buy_convergence: one-sided convergence + defensive shave + post-loop consistency
+        # Old (buggy) behaviour: symmetric abs() convergence could land slightly
+        # over budget; on non-convergence the returned (qty_vsp, total_usdc) pair
+        # was internally inconsistent (qty from iter N, total from iter N-1).
+        # Both led to FE confirm-time `usdcBalance < preview.total_usdc` failures.
         fill1 = compute_buy_fill(net_vsp, 1.0, usdc_reserves, vsp_circulating, unit_au, half_spread)
         price = fill1.avg_price_usd
         qty_est = usdc_amount / price
+
+        # Helper: compute fill+fee+total for a given qty_est. Pure function of
+        # inputs; safe to call multiple times.
+        def _price_qty(q: float):
+            f = compute_buy_fill(net_vsp, q, usdc_reserves, vsp_circulating, unit_au, half_spread)
+            ff = calc_fee(db, "buy", q)
+            fu = ff["fee_vsp"] * f.avg_price_usd
+            return f, ff, fu, f.total_usd + fu
+
+        TOLERANCE = 0.001  # USDC
+        converged = False
         for _ in range(10):
-            fill = compute_buy_fill(net_vsp, qty_est, usdc_reserves, vsp_circulating, unit_au, half_spread)
-            fee = calc_fee(db, "buy", qty_est)
-            fee_usdc = fee["fee_vsp"] * fill.avg_price_usd
-            total = fill.total_usd + fee_usdc
-            if abs(total - usdc_amount) < 0.001:
+            fill, fee, fee_usdc, total = _price_qty(qty_est)
+            # One-sided convergence: must be at or below budget, within tolerance.
+            if total <= usdc_amount and (usdc_amount - total) < TOLERANCE:
+                converged = True
                 break
+            # Newton-style rescale; safe even when total > usdc_amount.
             qty_est *= usdc_amount / total
             qty_est = max(qty_est, 0.001)
+
+        if not converged:
+            # Defensive shave: trim qty_est by 0.1% per step until it fits.
+            # 30 steps * 0.1% = ~3% total reduction, enough to clear any
+            # realistic post-loop overshoot.
+            for _ in range(30):
+                fill, fee, fee_usdc, total = _price_qty(qty_est)
+                if total <= usdc_amount:
+                    break
+                qty_est *= 0.999
+                if qty_est < 0.001:
+                    break
+
+        # If we still can't fit, the budget is too small to buy any VSP after
+        # fees. Surface as a clear error rather than returning misleading numbers.
+        if total > usdc_amount or qty_est < 0.001:
+            raise HTTPException(
+                400,
+                f"Budget {usdc_amount:.6f} USDC too small to buy any VSP after fees "
+                f"(minimum needed ~{total:.6f} USDC at this market state)",
+            )
+
+        # Snap qty to the same 6dp precision the FE will see, then do one final
+        # consistency pass. This guarantees (qty_vsp, total_usdc) match exactly
+        # at the precision the response carries.
+        qty_est = round(qty_est, 6)
+        fill, fee, fee_usdc, total = _price_qty(qty_est)
+        # Edge case: rounding up by 6dp may have pushed total back over budget by
+        # sub-cent fractions. If so, shave once more.
+        if total > usdc_amount:
+            qty_est = round(qty_est - 0.000001, 6)
+            qty_est = max(qty_est, 0.001)
+            fill, fee, fee_usdc, total = _price_qty(qty_est)
+            if total > usdc_amount:
+                raise HTTPException(
+                    400,
+                    f"Budget {usdc_amount:.6f} USDC too small after 6dp snap "
+                    f"(needed ~{total:.6f})",
+                )
+
         return {
             "mode": "usdc",
             "usdc_budget": usdc_amount,
-            "qty_vsp": round(qty_est, 6),
+            "qty_vsp": qty_est,
             "subtotal_usdc": round(fill.total_usd, 6),
             "fee_vsp": fee["fee_vsp"],
             "fee_usdc": round(fee_usdc, 6),
@@ -402,6 +466,21 @@ def mm_buy(req: MMTradeRequest, db: Session = Depends(get_db)):
 
             if fill.total_usd > req.max_total_usdc:
                 raise HTTPException(400, f"Fill cost {fill.total_usd:.6f} USDC exceeds max {req.max_total_usdc:.6f}")
+            # patch_bundle04_6_mm_buy_balance_guard: read MM's live VSP balance BEFORE any
+            # on-chain transfer. mm_buy is a three-leg flow (USDC reserves
+            # in, USDC fee in, VSP out); if the third leg reverts because MM
+            # is out of VSP, the user's USDC is already gone on-chain. This
+            # guard fails loud first so no user funds move.
+            try:
+                mm_vsp_balance = read_vsp_balance_of_mm()
+            except Exception as e:
+                raise HTTPException(503, f"MM balance check failed: {e}")
+            if mm_vsp_balance < req.qty_vsp:
+                raise HTTPException(
+                    503,
+                    f"MM temporarily out of VSP — please retry later "
+                    f"(have {mm_vsp_balance:.4f}, need {req.qty_vsp:.4f})",
+                )
 
             usdc_micro = int(fill.total_usd * 1_000_000)
 
@@ -434,7 +513,7 @@ def mm_buy(req: MMTradeRequest, db: Session = Depends(get_db)):
                 transfer_from(USDC_ADDRESS, req.user_address, TREASURY_ADDRESS, fee_micro)
             elif fee_micro > 0:
                 transfer_from(USDC_ADDRESS, req.user_address, MM_ADDRESS, fee_micro)
-            transfer(VSP_ADDRESS, req.user_address, int(req.qty_vsp * 10**18))
+            _buy_vsp_tx_hash = transfer(VSP_ADDRESS, req.user_address, int(req.qty_vsp * 10**18))  # patch_bundle04_5_p21_mm_buy_tx_hash
 
             # Force next chain read to skip cache, then re-read chain state
             # so the audit log records observed-on-chain values rather than
@@ -455,7 +534,9 @@ def mm_buy(req: MMTradeRequest, db: Session = Depends(get_db)):
                        qty_vsp=req.qty_vsp, total_usdc=fill.total_usd,
                        avg_price_usd=fill.avg_price_usd, net_vsp_before=net_vsp,
                        net_vsp_after=new_net, usdc_reserves_after=new_reserves,
-                       vsp_circulating_after=new_circ)
+                       vsp_circulating_after=new_circ,
+                       tx_hash=_buy_vsp_tx_hash,
+                       fee_usdc=fee_usdc)  # patch_bundle04_5_p33_buy_call
 
             # Track trade fee separately from reserves
             try:
@@ -510,6 +591,26 @@ def mm_sell(req: MMTradeRequest, db: Session = Depends(get_db)):
 
             if fill.total_usd > usdc_reserves:
                 raise HTTPException(400, "Insufficient USDC reserves to fill this sell order")
+            # patch_bundle04_6_mm_sell_balance_guard: tight on-chain USDC balance check,
+            # BEFORE the user's VSP is pulled. The cached check above
+            # uses read_usdc_reserves() (hot+cold sum) and catches the
+            # formal-reserves-too-low case; this read is hot-wallet ONLY
+            # and uncached, catching the case where reserves are formally
+            # sufficient (cold safes hold the difference) but the hot
+            # wallet currently can't pay out. fee_usdc isn't computed yet
+            # at this point so we guard against fill.total_usd (gross);
+            # the net after-fee amount is strictly smaller, so a gross
+            # check is conservative and correct.
+            try:
+                mm_usdc_balance = read_usdc_balance_of_mm()
+            except Exception as e:
+                raise HTTPException(503, f"MM balance check failed: {e}")
+            if mm_usdc_balance < fill.total_usd:
+                raise HTTPException(
+                    503,
+                    f"MM temporarily out of USDC — please retry later "
+                    f"(have {mm_usdc_balance:.6f}, need {fill.total_usd:.6f})",
+                )
 
             vsp_wei = int(req.qty_vsp * 10**18)
 
@@ -534,7 +635,7 @@ def mm_sell(req: MMTradeRequest, db: Session = Depends(get_db)):
                 raise HTTPException(400, "Trade too small to cover fees")
 
             # Execute on-chain transfers
-            transfer_from(VSP_ADDRESS, req.user_address, MM_ADDRESS, vsp_wei)
+            _sell_vsp_tx_hash = transfer_from(VSP_ADDRESS, req.user_address, MM_ADDRESS, vsp_wei)  # patch_bundle04_5_p21_mm_sell_tx_hash
             usdc_micro = int(net_usdc * 1_000_000)
             transfer(USDC_ADDRESS, req.user_address, usdc_micro)
             # Send fee to treasury
@@ -577,7 +678,9 @@ def mm_sell(req: MMTradeRequest, db: Session = Depends(get_db)):
                        qty_vsp=req.qty_vsp, total_usdc=fill.total_usd,
                        avg_price_usd=fill.avg_price_usd, net_vsp_before=net_vsp,
                        net_vsp_after=new_net, usdc_reserves_after=new_reserves,
-                       vsp_circulating_after=new_circ)
+                       vsp_circulating_after=new_circ,
+                       tx_hash=_sell_vsp_tx_hash,
+                       fee_usdc=fee_usdc)  # patch_bundle04_5_p33_sell_call
 
         return {"ok": True, "qty_vsp": req.qty_vsp,
                 "fee_vsp": fee_info["fee_vsp"],

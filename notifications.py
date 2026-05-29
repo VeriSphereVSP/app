@@ -34,11 +34,12 @@ def _serialize_dt(obj):
     return obj
 
 
-@router.get("/api/notifications/{address}")
+@router.get("/api/notifications/{address}")  # patch_bundle04_5_p2_notifications_route
 async def list_notifications(
     address: str,
     pending_limit: int = 50,
     recent_limit: int = 50,
+    before_cursor: str | None = None,
     db: Session = Depends(get_db),
 ):
     """Return pending and recently-resolved tx_log entries for the user.
@@ -75,5 +76,6 @@ async def list_notifications(
         db, address,
         pending_limit=pending_limit,
         recent_limit=recent_limit,
+        before_cursor=before_cursor,
     )
     return _serialize_dt(data)
