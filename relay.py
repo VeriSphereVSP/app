@@ -16,7 +16,7 @@ from web3.logs import DISCARD
 
 from config import FORWARDER_ADDRESS, POST_REGISTRY_ADDRESS
 from db import get_db
-from mm_wallet import w3, sign_and_send
+from mm_wallet import w3, sign_and_send, TxRevertedError
 from fee_calculator import compute_relay_fee, is_fee_exempt
 from config import VSP_ADDRESS, MM_ADDRESS as FEE_WALLET
 from moderation import check_content
@@ -573,11 +573,25 @@ def _relay_async_sync(body: RelayRequest, db: Session):
             "value": req.value,
             "gas":   req.gas + 800_000,
         })
-        tx_hash = sign_and_send(tx)
-        logger.info("Async relay submitted: from=%s to=%s tx=%s",
-                    req.from_, req.to, tx_hash)
+        # patch_bundle04_6_relay_revert_catch: catch on-chain revert so tx_log still records the hash.
+        # The unified resolve_pending_txs / chain_indexer pipeline will see the
+        # failed receipt and surface it via the verisphere:tx-confirmed FE event;
+        # the only thing we need to do here is make sure the row exists.
+        try:
+            tx_hash = sign_and_send(tx)
+            tx_status = "submitted"
+        except TxRevertedError as e:
+            tx_hash = e.tx_hash
+            tx_status = "reverted"
+            logger.warning(
+                "Async relay tx reverted on-chain (from=%s to=%s tx=%s); "
+                "recording tx_log row so unified pipeline can surface failure",
+                req.from_, req.to, tx_hash,
+            )
+        logger.info("Async relay submitted: from=%s to=%s tx=%s status=%s",
+                    req.from_, req.to, tx_hash, tx_status)
 
-        # Record pending tx_log row.
+        # Record pending tx_log row (resolve_pending_txs will move it to confirmed/failed).
         action_type, action_value = _detect_tx_type(calldata_hex, req.to)
         tx_log_id = record_pending(
             db,
@@ -595,7 +609,7 @@ def _relay_async_sync(body: RelayRequest, db: Session):
             "tx_log_id":    tx_log_id,
             "action_type":  action_type,
             "action_value": action_value,
-            "status":       "submitted",
+            "status":       tx_status,
         }
     except HTTPException:
         raise

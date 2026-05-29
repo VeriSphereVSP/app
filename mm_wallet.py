@@ -24,6 +24,18 @@ account = Account.from_key(MM_PRIVATE_KEY)
 if account.address.lower() != MM_ADDRESS.lower():
     raise RuntimeError("MM_PRIVATE_KEY does not match MM_ADDRESS")
 
+# patch_bundle04_6_sign_and_send_strict
+class TxRevertedError(Exception):
+    """Raised by sign_and_send when wait_for_transaction_receipt returns
+    status==0 (on-chain revert). Carries tx_hash so callers that need to
+    record the submitted hash (e.g. /api/relay/async tx_log row) can do so.
+    """
+    def __init__(self, tx_hash: str, receipt=None, message: str = ""):
+        self.tx_hash = tx_hash
+        self.receipt = receipt
+        super().__init__(message or f"on-chain revert (tx_hash={tx_hash})")
+
+
 def sign_and_send(tx: dict) -> str:
     tx = dict(tx)
     tx.pop("gasPrice", None)
@@ -48,11 +60,29 @@ def sign_and_send(tx: dict) -> str:
 
     signed = account.sign_transaction(tx)
     tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+    # patch_bundle04_6_sign_and_send_strict: strict revert handling.
     # Wait for receipt before returning so the caller's next tx sees the
     # updated chain state. Avoids race conditions on stake flips
     # (withdraw old side then stake new side).
+    #
+    # Three outcomes:
+    #   - status == 1     → success: fall through and return the canonical hash.
+    #   - status == 0     → on-chain revert: raise TxRevertedError carrying the hash.
+    #   - timeout         → caller may still want the hash (e.g. relay records it
+    #                       and lets the unified resolve_pending_txs watcher catch
+    #                       up); log a warning but do not raise.
+    from web3.exceptions import TimeExhausted
+    _raw = tx_hash.hex().lower().removeprefix("0x")
+    _canonical = "0x" + _raw
     try:
-        w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
-    except Exception:
-        pass  # if it timed out, return the hash anyway; relay can detect failure later
-    return tx_hash.hex()
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+    except TimeExhausted:
+        import logging
+        logging.getLogger(__name__).warning(
+            "sign_and_send: receipt timeout for %s; returning hash anyway",
+            _canonical,
+        )
+        return _canonical
+    if getattr(receipt, "status", 1) == 0:
+        raise TxRevertedError(_canonical, receipt=receipt)
+    return _canonical

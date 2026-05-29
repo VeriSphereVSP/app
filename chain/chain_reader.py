@@ -544,6 +544,40 @@ def read_usdc_reserves() -> float:
     return _cached("mm_usdc_reserves", _read)
 
 
+# patch_bundle04_6_balance_of_mm
+def read_vsp_balance_of_mm() -> float:
+    """
+    Returns the live VSP balance of the MM hot wallet, in VSP units (not wei).
+    UNCACHED — this is a guard read used immediately before signing a transfer,
+    so staleness would defeat the guard. One RPC call per invocation.
+    """
+    from config import MM_ADDRESS
+    if not MM_ADDRESS:
+        raise RuntimeError("MM_ADDRESS not configured")
+    vsp = _get_vsp_token()
+    balance_wei = vsp.functions.balanceOf(
+        Web3.to_checksum_address(MM_ADDRESS)
+    ).call()
+    return balance_wei / 1e18
+
+
+def read_usdc_balance_of_mm() -> float:
+    """
+    Returns the live USDC balance of the MM hot wallet ONLY, in USDC units
+    (not micro-USDC). Excludes cold-safe balances — those count toward virtual
+    reserves for floor math, but the actual transfer() will draw from the hot
+    wallet alone. UNCACHED for the same reason as read_vsp_balance_of_mm.
+    """
+    from config import MM_ADDRESS
+    if not MM_ADDRESS:
+        raise RuntimeError("MM_ADDRESS not configured")
+    usdc = _get_usdc_token()
+    balance_micro = usdc.functions.balanceOf(
+        Web3.to_checksum_address(MM_ADDRESS)
+    ).call()
+    return balance_micro / 1e6
+
+
 def invalidate_mm_chain_state_cache():
     """
     Force the next read to hit the chain. Call this after the relay
