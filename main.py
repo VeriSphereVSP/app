@@ -25,7 +25,7 @@ from sqlalchemy import text
 from sqlalchemy import text as sql_text
 
 from db import get_db
-from config import USDC_ADDRESS, VSP_ADDRESS, FORWARDER_ADDRESS
+from config import USDC_ADDRESS, VSP_ADDRESS, FORWARDER_ADDRESS, DIRECT_MM_SIGNING_ENABLED
 from semantic import compute_one
 from chain.claim_registry import create_claim
 from chain.stake import stake_claim
@@ -37,7 +37,7 @@ from claim_views import router as claim_views_router
 from portfolio_views import router as portfolio_router
 from articles.article_routes import router as article_router
 from semantic_dedup import router as semantic_dedup_router
-from rate_limit import RateLimitMiddleware, cleanup_rate_limiter
+from rate_limit import RateLimitMiddleware, cleanup_rate_limiter, _client_ip as _rl_client_ip
 
 
 # patch_bundle10c_backend_hardening_main: startup CHAIN_ID consistency check.
@@ -197,14 +197,12 @@ ADMIN_IP_ALLOWLIST = [ip.strip() for ip in _os.getenv("ADMIN_IP_ALLOWLIST", "").
 
 
 def _get_client_ip(request) -> str:
+    # patch_bundle06_xff_trusted_proxy: delegate to the single canonical,
+    # topology-aware resolver in rate_limit so the admin IP allowlist and
+    # the rate limiter agree on one X-Forwarded-For trust rule.
     if not request:
         return "unknown"
-    forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    if request.client:
-        return request.client.host
-    return "unknown"
+    return _rl_client_ip(request)
 
 
 def _log_admin_action(db, action: str, params: dict, request):
@@ -419,6 +417,14 @@ class CreateClaimRequest(BaseModel):
 
 @app.post("/api/claims/create")
 def create_claim_endpoint(req: CreateClaimRequest):
+    # patch_bundle06_moderation_activation: gate the MM-signed direct claim
+    # path too (mirrors the relay createClaim gate).
+    from moderation import check_content
+    _mod = check_content(req.text)
+    if getattr(_mod, "unavailable", False):
+        raise HTTPException(503, "Moderation temporarily unavailable - please retry shortly.")
+    if not _mod.allowed:
+        raise HTTPException(400, f"Content blocked: {_mod.reason}")
     try:
         tx_hash = create_claim(req.text)
         return {"tx_hash": tx_hash}
@@ -561,6 +567,11 @@ def reindex_post(post_id: int, user: str = None):
 
 @app.post("/api/claims/stake")
 def stake_endpoint(req: StakeRequest):
+    # patch_bundle06_dms_lockdown_stake: MM-key-signing, no counterparty
+    # sig. Disabled in prod (and on Fuji unless ALLOW_DIRECT_MM_SIGNING
+    # is set). Prod staking goes through /api/relay/async. See config.py.
+    if not DIRECT_MM_SIGNING_ENABLED:
+        raise HTTPException(404)
     try:
         tx_hash = stake_claim(req.claim_id, req.side, req.amount)
         return {"tx_hash": tx_hash}
@@ -577,6 +588,11 @@ class WithdrawRequest(BaseModel):
 
 @app.post("/api/claims/unstake")
 def unstake_endpoint(req: WithdrawRequest):
+    # patch_bundle06_dms_lockdown_unstake: MM-key-signing, no counterparty
+    # sig. Disabled in prod (and on Fuji unless ALLOW_DIRECT_MM_SIGNING
+    # is set). Prod unstaking goes through /api/relay/async. See config.py.
+    if not DIRECT_MM_SIGNING_ENABLED:
+        raise HTTPException(404)
     try:
         from chain.stake import withdraw_stake
         tx_hash = withdraw_stake(req.claim_id, req.side, req.amount, req.lifo)
@@ -593,6 +609,11 @@ class CreateLinkRequest(BaseModel):
 
 @app.post("/api/links/create")
 def create_link_endpoint(req: CreateLinkRequest):
+    # patch_bundle06_dms_lockdown_link: MM-key-signing, no counterparty
+    # sig. Disabled in prod (and on Fuji unless ALLOW_DIRECT_MM_SIGNING
+    # is set). Prod link creation goes through /api/relay/async. See config.py.
+    if not DIRECT_MM_SIGNING_ENABLED:
+        raise HTTPException(404)
     try:
         from chain.claim_registry import create_link
         tx_hash = create_link(req.independent_post_id, req.dependent_post_id, req.is_challenge)

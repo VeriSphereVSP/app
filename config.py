@@ -19,6 +19,19 @@ elif CHAIN_ID == 43114:
 else:
     NETWORK = f"chain-{CHAIN_ID}"
 
+# patch_bundle06_direct_mm_signing_lockdown: the direct MM-key-signing
+# endpoints (/api/claims/stake, /api/claims/unstake, /api/links/create)
+# sign on-chain txs with the MM hot wallet and carry NO counterparty
+# signature. They were only ever used by the retired test-vs.sh /
+# test-e2e.sh; prod create/stake/link go through /api/relay/async
+# (user-signed). Disabled in prod unconditionally; on non-mainnet they
+# stay disabled unless explicitly re-enabled for ad-hoc testnet use.
+DIRECT_MM_SIGNING_ENABLED = (
+    NETWORK != "mainnet"
+    and os.getenv("ALLOW_DIRECT_MM_SIGNING", "0").strip().lower()
+    in ("1", "true", "yes", "on")
+)
+
 # patch_bundle10c_backend_hardening_config: fail-loud on missing required env when on mainnet.
 # Fuji keeps the convenience fallbacks; mainnet raises RuntimeError on any
 # unset value, so a stale /dev/shm/vsp-resolved.env or a typo can never

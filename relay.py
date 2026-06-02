@@ -171,7 +171,7 @@ POST_REGISTRY_ABI = _load_abi("PostRegistry") or [
 ]
 
 # Function selectors (first 4 bytes of keccak256)
-CREATE_CLAIM_SELECTOR = "4a3e1b89"
+CREATE_CLAIM_SELECTOR = "84c08ed3"  # keccak256("createClaim(string)")[:4]; was "4a3e1b89" (wrong -> gate skipped)
 
 
 class ForwardRequestPayload(BaseModel):
@@ -397,18 +397,24 @@ def _execute_permit(permit):
 
 def _moderate_claim(calldata_hex: str) -> None:
     """Check if createClaim calldata contains blocked content. Raises HTTPException if blocked."""
+    # patch_bundle06_moderation_fail_closed: fail CLOSED. A createClaim whose
+    # content we cannot verify (LLM unavailable) or cannot even decode must be
+    # rejected, not waved through. 503 = could not verify (retry); 400 = violation.
     try:
         selector = calldata_hex[:8]
         if selector.lower() != CREATE_CLAIM_SELECTOR:
             return  # Not a createClaim call, skip moderation
         claim_text = _decode_claim_text(calldata_hex)
         result = check_content(claim_text)
+        if getattr(result, "unavailable", False):
+            raise HTTPException(503, "Moderation temporarily unavailable - please retry shortly.")
         if not result.allowed:
             raise HTTPException(400, f"Content blocked: {result.reason}")
     except HTTPException:
         raise
     except Exception as e:
-        logger.warning(f"Moderation decode failed (allowing): {e}")
+        logger.warning(f"Moderation could not evaluate createClaim (failing closed): {e}")
+        raise HTTPException(503, "Moderation could not evaluate this content - please retry.")
 
 
 @router.get("/api/relay/nonce/{address}")

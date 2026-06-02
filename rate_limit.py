@@ -12,6 +12,7 @@ Uses in-memory sliding windows. No external dependencies (no Redis).
 Suitable for single-process deployment. For multi-process, switch to Redis.
 """
 
+import os
 import time
 import logging
 from collections import defaultdict
@@ -76,6 +77,18 @@ MIN_MM_AVAX_WEI = 50_000_000_000_000_000  # 0.05 AVAX — ~20 relay txs at 25 gw
 # How often to re-check balance (don't check every request)
 BALANCE_CHECK_INTERVAL = 60     # seconds
 
+# patch_bundle06_xff_trusted_proxy (config): how many trusted reverse-
+# proxy hops sit in front of the app. 0 = no proxy (dev) -> ignore
+# X-Forwarded-For and use the socket peer. 1 = one nginx in front
+# (prod) -> trust exactly the right-most XFF entry. Anything beyond the
+# trusted hop count is client-controlled and must never be honored.
+try:
+    TRUSTED_PROXY_HOPS = int(os.getenv("TRUSTED_PROXY_HOPS", "0"))
+except ValueError:
+    TRUSTED_PROXY_HOPS = 0
+if TRUSTED_PROXY_HOPS < 0:
+    TRUSTED_PROXY_HOPS = 0
+
 # AI cost budget: max AI calls per day (across all users)
 AI_DAILY_BUDGET = 500
 AI_DAILY_WINDOW = 86400         # 24 hours
@@ -122,12 +135,28 @@ def check_mm_balance() -> bool:
 # ── Helper to extract client IP ────────────────────────────
 
 def _client_ip(request: Request) -> str:
+    # patch_bundle06_xff_trusted_proxy: X-Forwarded-For is attacker-
+    # controlled. Honor only TRUSTED_PROXY_HOPS proxy hops at the RIGHT
+    # end of the chain.
+    #   hops == 0 (dev, no proxy): ignore XFF entirely, use socket peer.
+    #   hops == 1 (prod behind one nginx): use the right-most XFF entry,
+    #   the client IP our own trusted proxy observed and appended.
+    peer = request.client.host if request.client else "unknown"
+    if TRUSTED_PROXY_HOPS <= 0:
+        return peer
     forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    if request.client:
-        return request.client.host
-    return "unknown"
+    if not forwarded:
+        return peer
+    chain = [p.strip() for p in forwarded.split(",") if p.strip()]
+    if not chain:
+        return peer
+    idx = len(chain) - TRUSTED_PROXY_HOPS
+    if idx < 0:
+        # Chain shorter than the configured trusted-hop count (misconfig
+        # or a spoof attempt): fall back to the socket peer, which a
+        # client cannot forge via request headers.
+        return peer
+    return chain[idx]
 
 
 # ── FastAPI middleware ─────────────────────────────────────
