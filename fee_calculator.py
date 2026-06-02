@@ -131,15 +131,27 @@ def _get_avax_price_usd() -> float:
 
 
 def _get_vsp_price_usd(db: Session) -> float:
-    """Current VSP price from MM reserves/circulating."""
+    """
+    Current VSP price (USD) from chain-derived MM state.
+
+    patch_bundle10c_backend_hardening_fee: read from chain via chain_reader, not from
+    mm_state.usdc_reserves / vsp_circulating. Those columns were
+    dropped in migration 031 (2026-) but the SELECT here had
+    silently fallen back to the 1.30 hardcoded default ever since,
+    so relay fees were priced against a stale VSP price the entire
+    time. Now reads chain state directly, matching _load_mm_state.
+
+    The db parameter is retained for caller compatibility.
+    """
     try:
-        row = db.execute(sql_text(
-            "SELECT usdc_reserves, vsp_circulating FROM mm_state LIMIT 1"
-        )).fetchone()
-        if row and row[1] and row[1] > 0 and row[0]:
-            return row[0] / row[1]
-    except Exception:
-        pass
+        from chain.chain_reader import read_usdc_reserves, read_vsp_circulating
+        usdc_reserves = read_usdc_reserves()
+        vsp_circulating = read_vsp_circulating()
+        if vsp_circulating and vsp_circulating > 0 and usdc_reserves:
+            return usdc_reserves / vsp_circulating
+    except Exception as e:
+        import logging as _lg
+        _lg.getLogger(__name__).warning("VSP price chain read failed: %s; falling back to 1.30", e)
     return 1.30
 
 

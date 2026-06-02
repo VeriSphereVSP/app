@@ -227,6 +227,11 @@ def mm_floor(db: Session = Depends(get_db)):
 _quote_cache = {"data": None, "ts": 0}
 _QUOTE_CACHE_TTL = 5  # seconds
 
+# patch_bundle10c_backend_hardening_mm: /quote is a misleading name (takes no params,
+# returns spot prices only). Added /spot as the documented name;
+# /quote retained as alias for backwards compatibility with the
+# frontend VSPMarketWidget and api/mm.ts callers.
+@router.get("/spot")
 @router.get("/quote")
 def mm_quote(db: Session = Depends(get_db)):
     import time as _t
@@ -539,14 +544,8 @@ def mm_buy(req: MMTradeRequest, db: Session = Depends(get_db)):
                        fee_usdc=fee_usdc)  # patch_bundle04_5_p33_buy_call
 
             # Track trade fee separately from reserves
-            try:
-                db.execute(sql_text(
-                    "UPDATE mm_state SET fees_collected_usdc = "
-                    "COALESCE(fees_collected_usdc, 0) + :fee"
-                ), {"fee": fee_usdc})
-            except Exception:
-                pass
-
+            # patch_bundle10c_backend_hardening_mm_buy_dedup: duplicate UPDATE block removed;
+            # this counter previously double-counted every buy fee.
             try:
                 db.execute(sql_text(
                     "UPDATE mm_state SET fees_collected_usdc = "
@@ -658,14 +657,8 @@ def mm_sell(req: MMTradeRequest, db: Session = Depends(get_db)):
             # mm_state has no live state to update post-031; just touch updated_at.
             _update_mm_state(db)
             # Track trade fee separately
-            try:
-                db.execute(sql_text(
-                    "UPDATE mm_state SET fees_collected_usdc = "
-                    "COALESCE(fees_collected_usdc, 0) + :fee"
-                ), {"fee": fee_usdc})
-            except Exception:
-                pass
-
+            # patch_bundle10c_backend_hardening_mm_sell_dedup: duplicate UPDATE block removed;
+            # this counter previously double-counted every sell fee.
             try:
                 db.execute(sql_text(
                     "UPDATE mm_state SET fees_collected_usdc = "

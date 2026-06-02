@@ -7,6 +7,9 @@ import json
 CHAIN_ID = int(os.getenv("CHAIN_ID", "43113"))
 RPC_URL_READ = os.getenv("RPC_URL_READ", os.getenv("RPC_URL", "https://api.avax-test.network/ext/bc/C/rpc"))
 RPC_URL = os.getenv("RPC_URL", "")
+# patch_bundle10c_backend_hardening_config: an empty RPC_URL on mainnet is fatal — every
+# chain-reading code path silently fails or returns wrong data.
+# Deferred to after NETWORK is computed (see end of file).
 
 # Determine network name
 if CHAIN_ID == 43113:
@@ -15,6 +18,19 @@ elif CHAIN_ID == 43114:
     NETWORK = "mainnet"
 else:
     NETWORK = f"chain-{CHAIN_ID}"
+
+# patch_bundle10c_backend_hardening_config: fail-loud on missing required env when on mainnet.
+# Fuji keeps the convenience fallbacks; mainnet raises RuntimeError on any
+# unset value, so a stale /dev/shm/vsp-resolved.env or a typo can never
+# silently route mainnet traffic through a Fuji address or empty RPC.
+def _require_for_mainnet(name: str, value, fallback_label: str):
+    if NETWORK == "mainnet" and (value is None or value == "" or value == fallback_label):
+        raise RuntimeError(
+            f"config.py: required env var {name} is unset on mainnet "
+            f"(fallback {fallback_label!r} is not acceptable for mainnet); "
+            f"check /dev/shm/vsp-resolved.env and the resolver pipeline."
+        )
+    return value
 
 # Load deployed contract addresses
 DEPLOYMENTS_DIR = Path(__file__).parent / "deployments"
@@ -50,11 +66,28 @@ USDC_ADDRESS = os.getenv("USDC_ADDRESS", "0x5425890298aed601595a70ab815c96711a31
 VSP_ADDRESS = VSP_TOKEN_ADDRESS
 
 # Market maker wallet (reserves — backs outstanding VSP)
-MM_ADDRESS = os.getenv("MM_ADDRESS", "0x744a16c4Fe6B618E29D5Cb05C5a9cBa72175e60a")
+_MM_ADDRESS_FUJI_FALLBACK = "0x744a16c4Fe6B618E29D5Cb05C5a9cBa72175e60a"
+MM_ADDRESS = _require_for_mainnet(
+    "MM_ADDRESS",
+    os.getenv("MM_ADDRESS", _MM_ADDRESS_FUJI_FALLBACK),
+    _MM_ADDRESS_FUJI_FALLBACK,
+)
 MM_PRIVATE_KEY = os.getenv("MM_PRIVATE_KEY", "")
 
 # Treasury wallet (revenue — receives trade fees + relay fees)
-TREASURY_ADDRESS = os.getenv("TREASURY_ADDRESS", MM_ADDRESS)  # fallback to MM if not set
+# patch_bundle10c_backend_hardening_config: explicit TREASURY_ADDRESS required on mainnet.
+# Silently routing fees back to MM in a misconfigured mainnet deploy is
+# the exact footgun this guard exists to prevent.
+_TREASURY_RAW = os.getenv("TREASURY_ADDRESS", "")
+if _TREASURY_RAW:
+    TREASURY_ADDRESS = _TREASURY_RAW
+else:
+    if NETWORK == "mainnet":
+        raise RuntimeError(
+            "config.py: TREASURY_ADDRESS must be set explicitly on mainnet "
+            "(implicit fallback to MM_ADDRESS would silently route fees back to MM)."
+        )
+    TREASURY_ADDRESS = MM_ADDRESS  # Fuji-only convenience
 
 # patch06: virtual reserves — cold-storage addresses whose USDC
 # balances are summed into read_usdc_reserves(). Comma-separated env
@@ -145,3 +178,11 @@ APP_API_BASE = os.getenv("APP_API_BASE", "http://app:8070")
 # constants. The only worker value imported from config is APP_API_BASE
 # above (plus the existing VSP_TOKEN_ADDRESS / USDC_ADDRESS / MM_ADDRESS
 # / TREASURY_ADDRESS).
+
+# patch_bundle10c_backend_hardening_config_eof: late-stage RPC_URL fail-loud on mainnet.
+# (Placed at end of file so NETWORK is already defined.)
+if NETWORK == "mainnet" and not RPC_URL:
+    raise RuntimeError(
+        "config.py: RPC_URL is empty on mainnet. Refusing to start; "
+        "every chain-reading code path would silently fail."
+    )

@@ -491,6 +491,28 @@ def _relay_async_sync(body: RelayRequest, db: Session):
             sig_bytes,
         )
 
+        # patch_bundle06_relay_flow_permit_auth: assert permit owner matches request.from.
+        # An attacker can otherwise attach a victim's outstanding signed permit
+        # to their own relay request, burning the victim's permit nonce slot.
+        # The on-chain ERC20 permit() signature check rejects forged permits
+        # (so this is not a fund-theft path) but the nonce-burn is a real grief.
+        # Check is intentionally OUTSIDE the fee_permit non-fatal try/except
+        # below: an owner-mismatch on either permit must fail loud, not slide
+        # silently through the 'fee permit skip' path.
+        _req_from_lower = req.from_.lower()
+        if body.permit is not None and body.permit.owner.lower() != _req_from_lower:
+            raise HTTPException(
+                400,
+                "permit.owner must match request.from (got "
+                f"{body.permit.owner} vs {req.from_})",
+            )
+        if body.fee_permit is not None and body.fee_permit.owner.lower() != _req_from_lower:
+            raise HTTPException(
+                400,
+                "fee_permit.owner must match request.from (got "
+                f"{body.fee_permit.owner} vs {req.from_})",
+            )
+
         # Permits (gasless pre-grant of allowances)
         if body.permit:
             _execute_permit(body.permit)
@@ -505,17 +527,21 @@ def _relay_async_sync(body: RelayRequest, db: Session):
         # Content moderation gate
         _moderate_claim(calldata_hex)
 
-        # Verify signature
+        # patch_bundle06_relay_flow_verify_failclosed: any exception from verify() now
+        # raises 400. Previously, exception messages lacking 'invalid' or
+        # 'revert' fell through to 'proceeding anyway'. The on-chain re-verify
+        # inside execute() catches forged signatures regardless, so the prior
+        # behavior wasn't a theft path — but it wasted gas on bogus relay
+        # attempts (the eventual execute() call burns up to req.gas + 800k on
+        # a doomed tx) and polluted tx logs with reverts the FE then has to
+        # surface as user-visible failures. Failing closed at verify-time
+        # rejects the user cleanly; the FE retries.
         try:
             is_valid = fwd.functions.verify(request_data).call()
-            if not is_valid:
-                raise HTTPException(400, "Invalid signature")
-        except HTTPException:
-            raise
         except Exception as e:
-            if "invalid" in str(e).lower() or "revert" in str(e).lower():
-                raise HTTPException(400, f"Signature verification failed: {e}")
-            logger.warning("verify() call failed (proceeding anyway): %s", e)
+            raise HTTPException(400, f"Signature verification failed: {e}")
+        if not is_valid:
+            raise HTTPException(400, "Invalid signature")
 
         # createClaim detection — pre-flight duplicate check
         is_create = (

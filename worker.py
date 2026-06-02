@@ -145,9 +145,18 @@ async def main():
     # We just need to keep the asyncio event loop alive so the
     # background tasks scheduled above (dupe_refresh, daily_refresh)
     # can run their initial sleeps and cycles.
+    # patch_bundle10d_compose_hardening_worker: heartbeat-file touch for the compose healthcheck.
+    # 30s cadence; compose healthcheck threshold is 90s. Touching is
+    # cheap and reaches /tmp (tmpfs in slim images), so no I/O concern.
+    from pathlib import Path as _HB_Path
+    _HB_FILE = _HB_Path("/tmp/worker.heartbeat")
     try:
         while True:
-            await asyncio.sleep(3600)
+            try:
+                _HB_FILE.touch()
+            except Exception as _hb_err:
+                print(f"worker heartbeat touch failed: {_hb_err}")
+            await asyncio.sleep(30)
     except asyncio.CancelledError:
         print("Worker shutting down")
 

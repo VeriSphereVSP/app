@@ -493,8 +493,18 @@ def main() -> None:
         run_once(chain, cap_cache, floor_cache, startup_treasury, args.dry_run)
         return
 
+    # patch_bundle10d_compose_hardening_tw: heartbeat-file touch for the compose healthcheck.
+    # Touched at the START of every iteration so the worker is reported
+    # healthy even when run_once raises into the loop_error alert path.
+    # 900s healthcheck threshold accommodates the default 600s interval.
+    from pathlib import Path as _HB_Path
+    _HB_FILE = _HB_Path("/tmp/treasury_worker.heartbeat")
     while True:
         try:
+            try:
+                _HB_FILE.touch()
+            except Exception as _hb_err:
+                logger.warning("treasury heartbeat touch failed: %s", _hb_err)
             run_once(chain, cap_cache, floor_cache, startup_treasury, args.dry_run)
         except SystemExit:
             raise

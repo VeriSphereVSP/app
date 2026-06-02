@@ -245,7 +245,9 @@ def get_user_notifications(
                    cct.claim_text     AS claim_text,
                    cp.content_type    AS post_content_type,
                    cl_from.claim_text AS link_from_text,
-                   cl_to.claim_text   AS link_to_text
+                   cl_to.claim_text   AS link_to_text,
+                   cl_edge.is_challenge AS link_is_challenge
+                   -- patch_link_polarity_in_snippet: see chain_tx SELECT comment.
             FROM tx_log t
             LEFT JOIN chain_claim_text cct       ON cct.post_id     = t.post_id
             LEFT JOIN chain_post       cp        ON cp.post_id      = t.post_id
@@ -268,7 +270,9 @@ def get_user_notifications(
                    cct.claim_text     AS claim_text,
                    cp.content_type    AS post_content_type,
                    cl_from.claim_text AS link_from_text,
-                   cl_to.claim_text   AS link_to_text
+                   cl_to.claim_text   AS link_to_text,
+                   cl_edge.is_challenge AS link_is_challenge
+                   -- patch_link_polarity_in_snippet: see chain_tx SELECT comment.
             FROM tx_log t
             LEFT JOIN chain_claim_text cct       ON cct.post_id     = t.post_id
             LEFT JOIN chain_post       cp        ON cp.post_id      = t.post_id
@@ -318,7 +322,12 @@ def get_user_notifications(
                    ct.indexed_at, cct.claim_text,
                    cp.content_type AS post_content_type,
                    cl_from.claim_text AS link_from_text,
-                   cl_to.claim_text   AS link_to_text
+                   cl_to.claim_text   AS link_to_text,
+                   cl_edge.is_challenge AS link_is_challenge
+                   -- patch_link_polarity_in_snippet: surface link's own polarity for
+                   -- snippet rendering. Distinct from ct.is_challenge
+                   -- which is the ROW's polarity (e.g., for a stake,
+                   -- the staker's stance, not the underlying link's).
             FROM chain_tx ct
             LEFT JOIN chain_claim_text cct       ON cct.post_id     = ct.post_id
             LEFT JOIN chain_post       cp        ON cp.post_id      = ct.post_id
@@ -340,7 +349,12 @@ def get_user_notifications(
                    ct.indexed_at, cct.claim_text,
                    cp.content_type AS post_content_type,
                    cl_from.claim_text AS link_from_text,
-                   cl_to.claim_text   AS link_to_text
+                   cl_to.claim_text   AS link_to_text,
+                   cl_edge.is_challenge AS link_is_challenge
+                   -- patch_link_polarity_in_snippet: surface link's own polarity for
+                   -- snippet rendering. Distinct from ct.is_challenge
+                   -- which is the ROW's polarity (e.g., for a stake,
+                   -- the staker's stance, not the underlying link's).
             FROM chain_tx ct
             LEFT JOIN chain_claim_text cct       ON cct.post_id     = ct.post_id
             LEFT JOIN chain_post       cp        ON cp.post_id      = ct.post_id
@@ -371,10 +385,53 @@ def get_user_notifications(
     # Track tx_hashes claimed by chain_tx so we can skip tx_log dupes.
     chain_tx_hashes = set()
 
+    # patch_notif_link_dedup: pre-scan ct_rows for tx_hashes whose set of events
+    # includes an EdgeAdded. A createLink tx emits BOTH PostCreated (for
+    # the link's own post-row) AND EdgeAdded (for the support/challenge
+    # edge wired to the link's post). Both rows share the same tx_hash,
+    # both pass the is_protocol_event gate, and both get enriched from
+    # tx_log to action_type='link' — producing two identical UI rows
+    # back-to-back. Only EdgeAdded carries the is_challenge boolean,
+    # so it's the row we must keep; PostCreated for the link is
+    # informationally redundant and gets skipped below. createClaim txs
+    # are unaffected (no EdgeAdded → hash not in link_tx_hashes →
+    # PostCreated row emits normally).
+    link_tx_hashes = {
+        (r.tx_hash or "").lower()
+        for r in ct_rows
+        if r.event_name == "EdgeAdded" and r.tx_hash
+    }
+
+    # patch_stake_event_semantics_txlog: fee attribution per tx_hash. The indexer
+    # writes the same per-tx fee_vsp on every chain_tx row that belongs
+    # to a multi-event tx (e.g. a polarity-flip setStake emits both
+    # StakeWithdrawn AND StakeAdded; the indexer pulls fee from the
+    # same fee_summary bucket for both, so both rows carry the full
+    # fee). Pre-scan picks the row with the smallest id (== smallest
+    # log_index = first event in the tx, skipping Patch I drops) as
+    # the fee-bearing row. Other rows show fee_vsp=None.
+    fee_attribution_id = {}
+    for r in ct_rows:
+        h = (r.tx_hash or "").lower()
+        if not h or getattr(r, "fee_vsp", None) is None:
+            continue
+        # Same skip logic as the main loop: don't let a Patch I-dropped
+        # PostCreated row claim the fee for a createLink tx.
+        if r.event_name == "PostCreated" and h in link_tx_hashes:
+            continue
+        if h not in fee_attribution_id or r.id < fee_attribution_id[h]:
+            fee_attribution_id[h] = r.id
+
     # chain_tx first (authoritative timestamp)
     for r in ct_rows:
         h = (r.tx_hash or "").lower()
         chain_tx_hashes.add(h)
+        # patch_notif_link_dedup: skip the redundant PostCreated row for link txs.
+        # The hash is recorded in chain_tx_hashes above so the tx_log
+        # fallback branch below correctly recognizes the tx as
+        # chain-covered and doesn't double-emit.
+        if r.event_name == "PostCreated" and h in link_tx_hashes:
+            continue
         enrich = txlog_by_hash.get(h)
         snippet = None
         ctext = getattr(r, "claim_text", None)
@@ -389,10 +446,13 @@ def get_user_notifications(
         is_protocol_event = r.event_name in (
             "StakeAdded", "StakeWithdrawn", "PostCreated", "EdgeAdded"
         )
+        # patch_stake_event_semantics_txlog: trust r.action_type (the indexer writes
+        # the correct event-specific value: 'stake' for StakeAdded,
+        # 'unstake' for StakeWithdrawn, 'claim' for PostCreated, 'link'
+        # for EdgeAdded). The previous override clobbered StakeWithdrawn
+        # rows in polarity-flip setStake txs, making them render as a
+        # second 'stake' row instead of 'unstake'.
         action_type = r.action_type
-        if is_protocol_event and enrich is not None and enrich.action_type in (
-                "claim","link","stake","unstake"):
-            action_type = enrich.action_type
         # gas_used and error_message: only attach to the canonical
         # protocol-event row (the one the user thinks of as 'the action').
         if is_protocol_event and enrich is not None:
@@ -421,11 +481,20 @@ def get_user_notifications(
             "error_message":   error_message_val,
             "claim_snippet":   snippet,
             "principal_vsp":   float(r.principal_vsp) if getattr(r, "principal_vsp", None) is not None else None,
-            "fee_vsp":         float(r.fee_vsp) if getattr(r, "fee_vsp", None) is not None else None,
+            # patch_stake_event_semantics_txlog: only the first row per tx_hash
+            # carries the fee; see fee_attribution_id pre-scan above.
+            "fee_vsp":         (float(r.fee_vsp)
+                                  if (getattr(r, "fee_vsp", None) is not None
+                                      and fee_attribution_id.get(h) == r.id)
+                                  else None),
             # patch_bundle04_5_p32_link_fields
             "is_link_post":    (getattr(r, "post_content_type", None) == 1),
             "link_from_text":  getattr(r, "link_from_text", None),
             "link_to_text":    getattr(r, "link_to_text", None),
+            # patch_link_polarity_in_snippet: link's own polarity (distinct from row's).
+            "link_is_challenge": (bool(r.link_is_challenge)
+                                   if getattr(r, "link_is_challenge", None) is not None
+                                   else None),
         })
 
     # tx_log rows that did NOT get claimed by chain_tx (e.g. reverts —
@@ -454,6 +523,14 @@ def get_user_notifications(
             "is_link_post":    (getattr(r, "post_content_type", None) == 1),
             "link_from_text":  getattr(r, "link_from_text", None),
             "link_to_text":    getattr(r, "link_to_text", None),
+            # patch_link_polarity_in_snippet: link's own polarity. For reverted createLink,
+            # chain_link won't have a row, so this is None and the
+            # link-snippet branch in the FE doesn't fire (no
+            # link_from_text/link_to_text either). Setting it for
+            # consistency with the chain_tx item shape.
+            "link_is_challenge": (bool(r.link_is_challenge)
+                                   if getattr(r, "link_is_challenge", None) is not None
+                                   else None),
         })
 
     # mm_trade rows. These don't carry a tx_hash today, so they can't

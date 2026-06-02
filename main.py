@@ -40,8 +40,55 @@ from semantic_dedup import router as semantic_dedup_router
 from rate_limit import RateLimitMiddleware, cleanup_rate_limiter
 
 
+# patch_bundle10c_backend_hardening_main: startup CHAIN_ID consistency check.
+# Asserts that web3.eth.chain_id == CHAIN_ID and that CHAIN_ID matches
+# the NETWORK label. Catches operator footguns where mainnet vars are
+# combined with a Fuji RPC URL (or vice versa).
+def _assert_chain_id_consistency():
+    from config import CHAIN_ID, NETWORK, RPC_URL
+    from web3 import Web3
+    import time as _t
+    expected_for_label = {
+        "fuji": 43113,
+        "mainnet": 43114,
+    }
+    if NETWORK in expected_for_label and expected_for_label[NETWORK] != CHAIN_ID:
+        raise RuntimeError(
+            f"CHAIN_ID/NETWORK mismatch: NETWORK={NETWORK!r} expects "
+            f"CHAIN_ID={expected_for_label[NETWORK]} but got {CHAIN_ID}"
+        )
+    if not RPC_URL:
+        print("chain_id check: RPC_URL is empty; skipping live RPC probe (Fuji-only path)")
+        return
+    last_err = None
+    for attempt, backoff in enumerate([1, 2, 4]):
+        try:
+            w3 = Web3(Web3.HTTPProvider(RPC_URL))
+            live = w3.eth.chain_id
+            if live != CHAIN_ID:
+                raise RuntimeError(
+                    f"chain_id mismatch: RPC reports {live} but config says {CHAIN_ID} "
+                    f"(NETWORK={NETWORK!r}). Refusing to start."
+                )
+            print(f"chain_id check: OK (RPC={live} == CHAIN_ID={CHAIN_ID}, NETWORK={NETWORK!r})")
+            return
+        except RuntimeError:
+            raise
+        except Exception as e:
+            last_err = e
+            print(f"chain_id check attempt {attempt+1}/3 failed: {e}; sleeping {backoff}s")
+            _t.sleep(backoff)
+    raise RuntimeError(
+        f"chain_id check: RPC unreachable after 3 attempts (last error: {last_err}). "
+        f"Refusing to start — startup must verify chain identity."
+    )
+
+
 @asynccontextmanager
 async def lifespan(app):
+    # patch_bundle10c_backend_hardening_main: assert chain_id matches CHAIN_ID before any
+    # background tasks start. Crashes the app loud if not.
+    _assert_chain_id_consistency()
     # Background tasks (indexer, article refresh, dupe groups) run in
     # the separate worker service — see worker.py and docker-compose.yml.
     print("API server started (background tasks run in worker service)")

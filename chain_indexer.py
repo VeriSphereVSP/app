@@ -365,7 +365,10 @@ def _record_chain_tx_for_event(db, w3, e, internal_addrs, fee_summary=None):
             amt = float(a.amount) / 1e18 if hasattr(a, "amount") else None
         except Exception:
             amt = None
-        ic = bool(getattr(a, "isChallenge", False))
+        # patch_stake_event_semantics_indexer: StakeAdded event emits `side` (uint8:
+        # 0=support, 1=challenge), not `isChallenge`. The prior getattr
+        # defaulted to False on every stake row.
+        ic = bool(getattr(a, "side", 0) == 1)
         s = (fee_summary or {}).get(txh) or {}
         _insert_chain_tx_row(db, {
             "bn": bn, "txh": txh, "li": li, "be": be,
@@ -381,7 +384,8 @@ def _record_chain_tx_for_event(db, w3, e, internal_addrs, fee_summary=None):
             amt = float(a.amount) / 1e18 if hasattr(a, "amount") else None
         except Exception:
             amt = None
-        ic = bool(getattr(a, "isChallenge", False))
+        # patch_stake_event_semantics_indexer: see StakeAdded comment above.
+        ic = bool(getattr(a, "side", 0) == 1)
         s = (fee_summary or {}).get(txh) or {}
         _insert_chain_tx_row(db, {
             "bn": bn, "txh": txh, "li": li, "be": be,
