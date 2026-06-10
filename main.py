@@ -25,7 +25,7 @@ from sqlalchemy import text
 from sqlalchemy import text as sql_text
 
 from db import get_db
-from config import USDC_ADDRESS, VSP_ADDRESS, FORWARDER_ADDRESS, DIRECT_MM_SIGNING_ENABLED
+from config import USDC_ADDRESS, VSP_ADDRESS, FORWARDER_ADDRESS, DIRECT_MM_SIGNING_ENABLED, CHAIN_ID
 from semantic import compute_one
 from chain.claim_registry import create_claim
 from chain.stake import stake_claim
@@ -37,7 +37,7 @@ from claim_views import router as claim_views_router
 from portfolio_views import router as portfolio_router
 from articles.article_routes import router as article_router
 from semantic_dedup import router as semantic_dedup_router
-from rate_limit import RateLimitMiddleware, cleanup_rate_limiter, _client_ip as _rl_client_ip
+from rate_limit import RateLimitMiddleware, cleanup_rate_limiter, _client_ip as _rl_client_ip, TRUSTED_PROXY_HOPS as _TRUSTED_PROXY_HOPS
 
 
 # patch_bundle10c_backend_hardening_main: startup CHAIN_ID consistency check.
@@ -45,8 +45,9 @@ from rate_limit import RateLimitMiddleware, cleanup_rate_limiter, _client_ip as 
 # the NETWORK label. Catches operator footguns where mainnet vars are
 # combined with a Fuji RPC URL (or vice versa).
 def _assert_chain_id_consistency():
-    from config import CHAIN_ID, NETWORK, RPC_URL
+    from config import CHAIN_ID, NETWORK, RPC_URL, RPC_READ_URLS
     from web3 import Web3
+    from tx_signer import build_w3  # patch_bundle10_rpc_failover_p2
     import time as _t
     expected_for_label = {
         "fuji": 43113,
@@ -63,7 +64,7 @@ def _assert_chain_id_consistency():
     last_err = None
     for attempt, backoff in enumerate([1, 2, 4]):
         try:
-            w3 = Web3(Web3.HTTPProvider(RPC_URL))
+            w3 = build_w3(RPC_READ_URLS, require_connected=False)
             live = w3.eth.chain_id
             if live != CHAIN_ID:
                 raise RuntimeError(
@@ -185,7 +186,7 @@ app.include_router(portfolio_router)
 app.include_router(article_router)
 app.include_router(semantic_dedup_router)
 
-ADDRESSES_PATH = Path("/app/broadcast/Deploy.s.sol/43113/addresses.json")
+ADDRESSES_PATH = Path(f"/app/broadcast/Deploy.s.sol/{CHAIN_ID}/addresses.json")
 
 
 
@@ -194,6 +195,20 @@ import os as _os
 ADMIN_API_KEY = _os.getenv("ADMIN_API_KEY", "")
 # Comma-separated list of allowed IPs. Empty = allow all (but still require key).
 ADMIN_IP_ALLOWLIST = [ip.strip() for ip in _os.getenv("ADMIN_IP_ALLOWLIST", "").split(",") if ip.strip()]
+
+# patch_followup_proxyhops_guard: TRUSTED_PROXY_HOPS (rate_limit) and
+# ADMIN_IP_ALLOWLIST share the _client_ip resolver. Trusting a proxy hop while an
+# admin allowlist is set silently changes which IP the allowlist checks (XFF-
+# derived vs socket peer) — a lockout / spoof risk. Refuse the dangerous combo
+# loudly at startup.
+if _TRUSTED_PROXY_HOPS > 0 and ADMIN_IP_ALLOWLIST:
+    raise RuntimeError(
+        f"Unsafe config: TRUSTED_PROXY_HOPS={_TRUSTED_PROXY_HOPS} with a non-empty "
+        f"ADMIN_IP_ALLOWLIST ({ADMIN_IP_ALLOWLIST}). The admin allowlist and the rate "
+        f"limiter share _client_ip; enabling proxy-hop trust changes which IP the "
+        f"allowlist checks. Clear ADMIN_IP_ALLOWLIST, or set it to the real client "
+        f"IPs and remove this guard deliberately."
+    )
 
 
 def _get_client_ip(request) -> str:

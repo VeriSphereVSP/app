@@ -108,25 +108,23 @@ def get_fee_schedule(db: Session) -> dict:
 _avax_cache = {"price": None, "ts": 0}
 
 def _get_avax_price_usd() -> float:
-    """Current AVAX price in USD. Cached 60s. Falls back to config."""
+    """Current AVAX price in USD. Cached 60s. Delegates to the unified oracle
+    (Chainlink AVAX/USD primary → CoinGecko → config fallback) so relay-fee
+    pricing and MM pricing share one AVAX source. patch_bundle08_oracle_avax_unify."""
     import time as _time
-    from config import AVAX_PRICE_USD
     now = _time.time()
     if _avax_cache["price"] and now - _avax_cache["ts"] < 60:
         return _avax_cache["price"]
     try:
-        import requests as _req
-        r = _req.get(
-            "https://api.coingecko.com/api/v3/simple/price"
-            "?ids=avalanche-2&vs_currencies=usd", timeout=3)
-        if r.ok:
-            price = r.json().get("avalanche-2", {}).get("usd")
-            if price and price > 0:
-                _avax_cache["price"] = price
-                _avax_cache["ts"] = now
-                return price
+        from mm.oracle import get_avax_price_usd as _oracle_avax
+        price = _oracle_avax()
+        if price and price > 0:
+            _avax_cache["price"] = price
+            _avax_cache["ts"] = now
+            return price
     except Exception:
         pass
+    from config import AVAX_PRICE_USD
     return AVAX_PRICE_USD
 
 

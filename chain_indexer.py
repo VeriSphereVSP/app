@@ -41,6 +41,8 @@ from sqlalchemy import text as sql_text
 from sqlalchemy.orm import Session
 
 from db import get_session_factory
+from tx_signer import build_w3  # patch_bundle10_rpc_failover_p2
+from config import RPC_READ_URLS
 from config import (
     RPC_URL,
     POST_REGISTRY_ADDRESS,
@@ -85,7 +87,7 @@ _w3 = None
 def _get_w3():
     global _w3
     if _w3 is None:
-        _w3 = Web3(Web3.HTTPProvider(RPC_URL))
+        _w3 = build_w3(RPC_READ_URLS, require_connected=False)
     return _w3
 
 

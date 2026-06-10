@@ -18,6 +18,16 @@ from web3 import Web3
 
 from db import get_db
 from sqlalchemy.orm import Session
+
+# patch_ondemand_index_throttle: the on-demand backfill in portfolio_fast scans
+# ALL posts via serial RPC; for an address that stays empty it re-ran on every
+# load ('forever to load', esp. when switching accounts). It only needs to run
+# once to backfill history — the 15s background indexer keeps new stakes fresh —
+# so throttle it per address. Env-tunable; 0 disables the throttle.
+import os as _os
+import time as _time
+_ONDEMAND_INDEX_TTL = int(_os.getenv("ONDEMAND_INDEX_TTL", "600"))  # seconds
+_ondemand_index_seen: dict = {}
 from mm_wallet import w3
 from config import PROTOCOL_VIEWS_ADDRESS, POST_REGISTRY_ADDRESS
 from chain.abi import PROTOCOL_VIEWS_ABI, POST_REGISTRY_ABI
@@ -76,15 +86,24 @@ def portfolio_fast(address: str, db: Session = Depends(get_db)):
     ), {"addr": address.lower()}).fetchone()
 
     if not has_data:
-        # On-demand: index all posts for this user
-        try:
-            from chain_indexer import index_post
-            posts = db.execute(sql_text("SELECT post_id FROM chain_post")).fetchall()
-            for row in posts:
-                index_post(db, row[0], user_addresses=[address])
-        except Exception as e:
-            import logging
-            logging.getLogger(__name__).warning("On-demand user index failed: %s", e)
+        # patch_ondemand_index_throttle: backfill at most once per address per TTL.
+        _addr_l = address.lower()
+        if _ONDEMAND_INDEX_TTL <= 0 or (_time.time() - _ondemand_index_seen.get(_addr_l, 0.0)) >= _ONDEMAND_INDEX_TTL:
+            # On-demand: index all posts for this user
+            try:
+                from chain_indexer import index_post
+                posts = db.execute(sql_text("SELECT post_id FROM chain_post")).fetchall()
+                for row in posts:
+                    index_post(db, row[0], user_addresses=[address])
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).warning("On-demand user index failed: %s", e)
+            finally:
+                # record the attempt regardless of outcome so an empty (or RPC-
+                # failing) address isn't re-scanned on every load; bound the cache.
+                if len(_ondemand_index_seen) > 5000:
+                    _ondemand_index_seen.clear()
+                _ondemand_index_seen[_addr_l] = _time.time()
     
     positions = get_user_positions(db, address)
     # PATCH: filter ghost lots (burned-to-zero positions that still exist in DB)

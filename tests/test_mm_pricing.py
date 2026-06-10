@@ -220,6 +220,55 @@ class TestFloorPrice:
     def test_zero_reserves(self):
         assert get_floor_price(0, 5000) == 0.0
 
+# ────────────────────────────────────────────────────────────
+# Reserve-aware buyback dampening (patch_bundle11_reserve_dampening)
+# ────────────────────────────────────────────────────────────
+
+class TestReserveDampening:
+    def test_full_drain_pays_reserves(self):
+        R, S = 10_000.0, 5000
+        fill = compute_sell_fill(S, float(S), R, float(S))
+        # case U: draining the whole supply pays out exactly the reserves
+        assert abs(fill.total_usd - R) < R * 1e-3
+
+    @pytest.mark.parametrize("qty", [1.0, 100.0, 1000.0, 4999.0, 5000.0])
+    def test_solvency_never_exceeds_reserves(self, qty):
+        R, S = 8000.0, 5000
+        fill = compute_sell_fill(S, min(qty, float(S)), R, float(S))
+        assert fill.total_usd <= R + 1e-6
+
+    def test_case_H_matches_undamped_curve(self):
+        from mm.mm_pricing import _integrate_sell_proceeds
+        R, S = 10_000_000.0, 1000  # reserves >> C_full -> k == 1
+        fill = compute_sell_fill(S, 500.0, R, float(S))
+        undamped = _integrate_sell_proceeds(
+            float(S), 500.0, MOCK_GOLD, DEFAULT_UNIT_AU, DEFAULT_HALF_SPREAD,
+            R, float(S),
+        )
+        assert abs(fill.total_usd - undamped) < undamped * 1e-6
+
+    def test_larger_order_lower_avg_price(self):
+        R, S = 10_000.0, 5000
+        small = compute_sell_fill(S, 100.0, R, float(S))
+        large = compute_sell_fill(S, 2000.0, R, float(S))
+        assert large.avg_price_usd < small.avg_price_usd
+
+    def test_split_equals_single_path_independent(self):
+        R, S = 20_000.0, 8000
+        single = compute_sell_fill(S, 4000.0, R, float(S))
+        f1 = compute_sell_fill(S, 2000.0, R, float(S))
+        R2, S2 = R - f1.total_usd, S - 2000
+        f2 = compute_sell_fill(S2, 2000.0, R2, float(S2))
+        # k invariant under selling at the dampened rate -> split == single
+        # (up to trapezoidal discretization).
+        assert abs((f1.total_usd + f2.total_usd) - single.total_usd) < single.total_usd * 0.02
+
+    def test_last_unit_pays_positive(self):
+        R, S = 5_000.0, 4000
+        fill = compute_sell_fill(S, float(S), R, float(S))
+        assert fill.total_usd > 0
+
+
 
 # ────────────────────────────────────────────────────────────
 # Spot quote
@@ -232,7 +281,13 @@ class TestSpotQuote:
 
     def test_floor_included(self):
         q = get_spot_quote(100, 100_000, 50_000)
-        assert abs(q.floor_price_usd - 2.0) < 0.001
+        # patch_bundle11_reserve_dampening: exponent-robust. floor == min(
+        # reserve_floor, spot sell). The prior literal 2.0 assumed
+        # MM_PRICE_EXPONENT=3; at the live 2.5 the curve sell sits below
+        # reserve_floor, so the floor correctly caps at the curve.
+        reserve_floor = 100_000 / 50_000
+        assert q.floor_price_usd <= reserve_floor + 1e-9
+        assert abs(q.floor_price_usd - min(reserve_floor, q.sell_price_usd)) < 1e-9
 
     def test_negative_net_vsp_uses_reserve_curve(self):
         q = get_spot_quote(-500, 100_000, 50_000)

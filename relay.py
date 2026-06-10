@@ -16,9 +16,9 @@ from web3.logs import DISCARD
 
 from config import FORWARDER_ADDRESS, POST_REGISTRY_ADDRESS
 from db import get_db
-from mm_wallet import w3, sign_and_send, TxRevertedError
+from relay_wallet import w3, account as _relay_account, sign_and_send, TxRevertedError  # patch_bundle10_relay_key_separation
 from fee_calculator import compute_relay_fee, is_fee_exempt
-from config import VSP_ADDRESS, MM_ADDRESS as FEE_WALLET
+from config import VSP_ADDRESS  # patch_bundle10_relay_key_separation: dropped unused MM fee-wallet alias
 from moderation import check_content
 from rate_limit import relay_rate_limit
 
@@ -362,7 +362,7 @@ def _execute_permit(permit):
         "type": "function",
     }]
     contract = w3.eth.contract(address=token_addr, abi=permit_abi)
-    mm_addr = Web3.to_checksum_address(__import__("config").MM_ADDRESS)
+    relayer_addr = _relay_account.address  # patch_bundle10_relay_key_separation: relay/gas-payer = dedicated relay EOA, not MM
 
     # Debug: log permit details
     logger.info("Executing permit: token=%s owner=%s spender=%s value=%d deadline=%d v=%d",
@@ -372,7 +372,7 @@ def _execute_permit(permit):
     try:
         contract.functions.permit(
             owner_addr, spender_addr, value, permit.deadline, permit.v, r_bytes, s_bytes,
-        ).call({"from": mm_addr})
+        ).call({"from": relayer_addr})
     except Exception as static_err:
         logger.warning("Permit static call failed: %s", static_err)
         try:
@@ -385,7 +385,7 @@ def _execute_permit(permit):
 
     tx = contract.functions.permit(
         owner_addr, spender_addr, value, permit.deadline, permit.v, r_bytes, s_bytes,
-    ).build_transaction({"from": mm_addr, "gas": 120_000})
+    ).build_transaction({"from": relayer_addr, "gas": 120_000})
 
     tx_hash = sign_and_send(tx)
     receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=30)
@@ -600,8 +600,7 @@ def _relay_async_sync(body: RelayRequest, db: Session):
 
         # Build, sign, submit
         tx = fwd.functions.execute(request_data).build_transaction({
-            "from": w3.eth.default_account or Web3.to_checksum_address(
-                __import__("config").MM_ADDRESS),
+            "from": _relay_account.address,  # patch_bundle10_relay_key_separation
             "value": req.value,
             "gas":   req.gas + 800_000,
         })

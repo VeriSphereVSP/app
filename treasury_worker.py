@@ -88,6 +88,7 @@ from config import (  # noqa: E402
     USDC_ADDRESS,
     MM_ADDRESS,
     TREASURY_ADDRESS,
+    COLD_RESERVE_ADDRESS,  # patch_bundle11_cold_reserve
     APP_API_BASE,  # added by the Part 2b config edit (default http://localhost:8070)
 )
 
@@ -143,6 +144,13 @@ def alert(kind: str, message: str, **fields) -> None:
             f.write(line + "\n")
     except Exception as e:
         logger.error("alert: could not write alert log %s: %s", ALERT_LOG_PATH, e)
+    # patch_bundle08_alert_sink: also fan out to the notifier (webhook/telegram/
+    # email). No-op if no channel is configured; never blocks the alert path.
+    try:
+        import notify
+        notify.send_alert(kind, message, **fields)
+    except Exception as e:
+        logger.warning("alert: sink delivery failed: %s", e)
 
 
 # ─────────────────────── on-chain reads (wei precision) ───────────────────────
@@ -317,7 +325,7 @@ def compute_usdc_bands(target_vsp: float, floor_price: float) -> dict:
 # ─────────────────────── one iteration ───────────────────────
 
 def run_once(chain: Chain, cap_cache: TtlCache, floor_cache: TtlCache,
-             startup_treasury: str, dry_run: bool) -> None:
+             startup_sweep_dest: str, dry_run: bool) -> None:
     master = env_bool("MM_TREASURY_AUTOMATION_ENABLED", False)
     if not master:
         logger.info("heartbeat: automation disabled at master switch")
@@ -358,26 +366,27 @@ def run_once(chain: Chain, cap_cache: TtlCache, floor_cache: TtlCache,
             floor_price = None
         if floor_price is not None:
             usdc_bands = compute_usdc_bands(bands["target_vsp"], floor_price)
-            if mm_usdc > usdc_bands["usdc_hot_max_micro"]:
+            if mm_usdc > usdc_bands["usdc_hot_max_micro"] and startup_sweep_dest:  # patch_bundle11_cold_reserve
                 # destination guard (lesson: refuse if changed since startup)
-                current_treasury = os.getenv("TREASURY_ADDRESS", TREASURY_ADDRESS)
-                if current_treasury.lower() != startup_treasury.lower():
+                # patch_bundle11_cold_reserve: guard the cold-custody dest
+                current_dest = os.getenv("VSP_COLD_RESERVE_ADDRESS", COLD_RESERVE_ADDRESS).strip()
+                if current_dest.lower() != startup_sweep_dest.lower():
                     alert("destination_mismatch",
-                          "TREASURY_ADDRESS changed since startup; exiting",
-                          startup=startup_treasury, current=current_treasury)
+                          "VSP_COLD_RESERVE_ADDRESS changed since startup; exiting",
+                          startup=startup_sweep_dest, current=current_dest)
                     sys.exit(1)
                 excess = mm_usdc - usdc_bands["usdc_target_micro"]
                 amount = min(excess, sweep_cap_micro)
                 if amount > 0:
                     if dry_run:
                         alert("dry_run_sweep",
-                              f"would sweep {amount / MICRO:.2f} USDC -> {startup_treasury}",
+                              f"would sweep {amount / MICRO:.2f} USDC -> {startup_sweep_dest}",
                               amount_usdc=amount / MICRO, floor=floor_price,
                               usdc_target=usdc_bands["usdc_target_usd"])
                     else:
                         try:
-                            tx = chain.transfer_usdc(startup_treasury, amount)
-                            alert("sweep", f"swept {amount / MICRO:.2f} USDC -> TREASURY",
+                            tx = chain.transfer_usdc(startup_sweep_dest, amount)
+                            alert("sweep", f"swept {amount / MICRO:.2f} USDC -> COLD_RESERVE",
                                   amount_usdc=amount / MICRO, tx=tx,
                                   floor=floor_price,
                                   usdc_target=usdc_bands["usdc_target_usd"])
@@ -450,6 +459,72 @@ def run_once(chain: Chain, cap_cache: TtlCache, floor_cache: TtlCache,
                     alert("burn_failed", f"burn failed: {e}")
 
 
+# ─────────────────────── reserves audit (G-37) ───────────────────────
+# patch_bundle08_reserves_audit: read-only health check run EVERY loop,
+# independent of the automation switches (monitoring != automation). Alerts when
+# the MM hot wallet's VSP or USDC fall below a safety fraction of the worker's
+# own target bands — so a low-liquidity condition surfaces even when sweep/mint
+# are disabled (the B1 manual-ops default, where run_once early-returns and emits
+# nothing). The low-USDC alert is genuinely new: run_once only ever alerted on
+# HIGH usdc (sweep), never low. Per-condition throttle avoids log spam.
+# NOTE: the "hot + cold drift from expected" half of G-37 is intentionally NOT
+# here — it needs an agreed "expected total" baseline (high-water-mark or
+# configured) that doesn't exist yet; tracked as a follow-up.
+MM_VSP_LOW_ALERT_FRAC = env_float("MM_VSP_LOW_ALERT_FRAC", 0.5)    # of VSP target
+MM_USDC_LOW_ALERT_FRAC = env_float("MM_USDC_LOW_ALERT_FRAC", 0.5)  # of USDC target
+RESERVES_ALERT_MIN_INTERVAL = env_int("MM_RESERVES_ALERT_MIN_INTERVAL", 3600)
+_last_reserves_alert: dict = {}
+
+
+def _throttled_alert(kind: str, message: str, **fields) -> None:
+    now = time.time()
+    if now - _last_reserves_alert.get(kind, 0.0) >= RESERVES_ALERT_MIN_INTERVAL:
+        _last_reserves_alert[kind] = now
+        alert(kind, message, **fields)
+
+
+def audit_reserves(chain: "Chain", cap_cache: "TtlCache", floor_cache: "TtlCache") -> None:
+    """Read-only MM reserves health check (G-37). Never signs; never raises into
+    the loop. Alerts (throttled) when hot VSP/USDC are below safety thresholds."""
+    try:
+        mm_vsp = chain.mm_vsp_wei()
+        mm_usdc = chain.mm_usdc_micro()
+        cap_wei = cap_cache.get(chain.vsp_max_allowed_wei)
+    except Exception as e:
+        _throttled_alert("reserves_audit_rpc_error", f"reserves read failed: {e}")
+        return
+
+    bands = compute_vsp_bands(cap_wei)
+    vsp_low_wei = int(MM_VSP_LOW_ALERT_FRAC * bands["target_wei"])
+    if mm_vsp < vsp_low_wei:
+        _throttled_alert(
+            "mm_vsp_low",
+            f"MM hot VSP {mm_vsp / WEI:.4f} below low threshold {vsp_low_wei / WEI:.4f} "
+            f"({MM_VSP_LOW_ALERT_FRAC:.0%} of target {bands['target_vsp']:.2f})",
+            mm_vsp=mm_vsp / WEI, threshold_vsp=vsp_low_wei / WEI,
+            target_vsp=bands["target_vsp"],
+        )
+
+    # USDC low check needs floor price to derive the target; skip gracefully if down.
+    try:
+        floor_price = floor_cache.get(read_floor_price)
+    except Exception as e:
+        _throttled_alert("reserves_audit_floor_unavailable",
+                         f"USDC audit skipped: floor read failed: {e}")
+        return
+    usdc_bands = compute_usdc_bands(bands["target_vsp"], floor_price)
+    usdc_low_micro = int(MM_USDC_LOW_ALERT_FRAC * usdc_bands["usdc_target_micro"])
+    if mm_usdc < usdc_low_micro:
+        _throttled_alert(
+            "mm_usdc_low",
+            f"MM hot USDC {mm_usdc / MICRO:.2f} below low threshold "
+            f"{usdc_low_micro / MICRO:.2f} ({MM_USDC_LOW_ALERT_FRAC:.0%} of target "
+            f"{usdc_bands['usdc_target_usd']:.2f}); may not cover sells",
+            mm_usdc=mm_usdc / MICRO, threshold_usdc=usdc_low_micro / MICRO,
+            target_usdc=usdc_bands["usdc_target_usd"],
+        )
+
+
 # ─────────────────────── main ───────────────────────
 
 def main() -> None:
@@ -471,11 +546,16 @@ def main() -> None:
         # Fail loud: a bad key or RPC means the container should not pretend to run.
         sys.exit(1)
 
-    startup_treasury = os.getenv("TREASURY_ADDRESS", TREASURY_ADDRESS)
-    if not startup_treasury or startup_treasury.lower() == MM_ADDRESS.lower():
-        alert("config_error",
-              "TREASURY_ADDRESS unset or equals MM_ADDRESS; sweeps would be a no-op/self-send",
-              treasury=startup_treasury, mm=MM_ADDRESS)
+    # patch_bundle11_cold_reserve: USDC sweeps target the dedicated cold
+    # custody address (VSP_COLD_RESERVE_ADDRESS), segregated from the fee
+    # sink. config.py fail-fasts if it equals MM or TREASURY_ADDRESS, so
+    # here we only handle the unset case: empty -> sweeps disabled (excess
+    # stays in hot MM, still floor-backing).
+    startup_sweep_dest = COLD_RESERVE_ADDRESS
+    if not startup_sweep_dest:
+        alert("config_warn",
+              "VSP_COLD_RESERVE_ADDRESS unset; USDC sweeps DISABLED (excess stays in hot MM)",
+              mm=MM_ADDRESS)
         # Not fatal (mint/burn still work), but loudly flagged.
 
     interval = env_int("MM_TREASURY_INTERVAL_SEC", 600)
@@ -486,11 +566,12 @@ def main() -> None:
 
     logger.info(
         "config: interval=%ss cap_ttl=%ss floor_ttl=%ss treasury=%s worker=%s",
-        interval, cap_ttl, floor_ttl, startup_treasury, chain.tw.account.address,
+        interval, cap_ttl, floor_ttl, startup_sweep_dest, chain.tw.account.address,
     )
 
     if args.once:
-        run_once(chain, cap_cache, floor_cache, startup_treasury, args.dry_run)
+        run_once(chain, cap_cache, floor_cache, startup_sweep_dest, args.dry_run)
+        audit_reserves(chain, cap_cache, floor_cache)  # patch_bundle08_reserves_audit
         return
 
     # patch_bundle10d_compose_hardening_tw: heartbeat-file touch for the compose healthcheck.
@@ -505,11 +586,17 @@ def main() -> None:
                 _HB_FILE.touch()
             except Exception as _hb_err:
                 logger.warning("treasury heartbeat touch failed: %s", _hb_err)
-            run_once(chain, cap_cache, floor_cache, startup_treasury, args.dry_run)
+            run_once(chain, cap_cache, floor_cache, startup_sweep_dest, args.dry_run)
         except SystemExit:
             raise
         except Exception as e:
             alert("loop_error", f"unhandled error in iteration: {e}")
+        # patch_bundle08_reserves_audit: reserves health check runs every loop
+        # regardless of whether run_once succeeded or the action switches are on.
+        try:
+            audit_reserves(chain, cap_cache, floor_cache)
+        except Exception as e:
+            alert("reserves_audit_error", f"reserves audit failed: {e}")
         time.sleep(interval)
 
 

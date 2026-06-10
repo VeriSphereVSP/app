@@ -11,7 +11,8 @@ import json
 import logging
 from pathlib import Path
 from web3 import Web3
-from config import STAKE_ENGINE_ADDRESS, SCORE_ENGINE_ADDRESS, RPC_URL
+from config import STAKE_ENGINE_ADDRESS, SCORE_ENGINE_ADDRESS, RPC_URL, RPC_READ_URLS
+from tx_signer import build_w3  # patch_bundle10_rpc_failover_p2
 
 # Lazy-loaded
 _stake_rate_policy = None
@@ -130,7 +131,7 @@ SCORE_ENGINE_ABI = _load_abi("ScoreEngine") or [
 def _get_w3():
     global _w3
     if _w3 is None:
-        _w3 = Web3(Web3.HTTPProvider(RPC_URL))
+        _w3 = build_w3(RPC_READ_URLS, require_connected=False)
     return _w3
 
 

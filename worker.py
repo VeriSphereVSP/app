@@ -22,6 +22,63 @@ logging.basicConfig(
 # Ensure app directory is in path
 sys.path.insert(0, os.path.dirname(__file__))
 
+logger = logging.getLogger(__name__)
+
+# patch_bundle08_idle_tx_alert: surface orphaned "idle in transaction" sessions
+# BEFORE the postgres idle_in_transaction_session_timeout (Bundle 3, 5min)
+# reaps them — so the offending connection is still attached and its last query
+# is visible, making the leak source diagnosable. Companion to that timeout, not
+# a replacement. Thresholds env-tunable.
+IDLE_TX_ALERT_THRESHOLD_SEC = int(os.getenv("IDLE_TX_ALERT_THRESHOLD_SEC", "60"))
+IDLE_TX_ALERT_INTERVAL_SEC = int(os.getenv("IDLE_TX_ALERT_INTERVAL_SEC", "60"))
+
+
+def check_idle_in_transaction(threshold_sec: int = IDLE_TX_ALERT_THRESHOLD_SEC):
+    """Read-only scan of pg_stat_activity for sessions stuck 'idle in transaction'
+    longer than threshold_sec. Emits one structured ALERT per offender and
+    returns the offending rows. Opens AND closes its own connection within the
+    call — it must never hold a transaction across the monitor's sleep, or it
+    would become the very leak it is meant to detect. (Same-role sessions show
+    full query text; other roles may show empty query — fine, the leak we care
+    about is app/worker, same role.)"""
+    from db import get_engine
+    from sqlalchemy import text
+    sql = text(
+        """
+        SELECT pid,
+               EXTRACT(EPOCH FROM (now() - state_change)) AS idle_seconds,
+               coalesce(usename, '')           AS usename,
+               coalesce(application_name, '')  AS application_name,
+               left(coalesce(query, ''), 200)  AS last_query
+        FROM pg_stat_activity
+        WHERE state = 'idle in transaction'
+          AND state_change IS NOT NULL
+          AND EXTRACT(EPOCH FROM (now() - state_change)) > :thr
+        ORDER BY idle_seconds DESC
+        """
+    )
+    eng = get_engine()
+    with eng.connect() as conn:
+        rows = list(conn.execute(sql, {"thr": float(threshold_sec)}))
+    for r in rows:
+        logger.warning(
+            "ALERT idle_in_transaction: pid=%s idle=%.0fs user=%s app=%s last_query=%r",
+            r.pid, r.idle_seconds, r.usename, r.application_name, r.last_query,
+        )
+        # patch_bundle08_alert_sink: fan out to the notifier (no-op if unconfigured).
+        try:
+            import notify
+            notify.send_alert(
+                "idle_in_transaction",
+                f"pid {r.pid} idle in transaction {r.idle_seconds:.0f}s",
+                pid=r.pid, idle_seconds=round(r.idle_seconds, 0),
+                app=r.application_name,
+            )
+        except Exception:
+            pass
+    return rows
+
+
 async def main():
     print("=== Verisphere Background Worker ===")
 
@@ -139,6 +196,48 @@ async def main():
 
     asyncio.create_task(_daily_refresh())
     print("Article refresh scheduled")
+
+    # patch_bundle08_idle_tx_alert: periodic idle-in-transaction monitor.
+    async def _idle_tx_monitor():
+        await asyncio.sleep(45)  # initial delay; let startup transactions settle
+        print(
+            f"Idle-in-transaction monitor started "
+            f"(threshold={IDLE_TX_ALERT_THRESHOLD_SEC}s, interval={IDLE_TX_ALERT_INTERVAL_SEC}s)"
+        )
+        while True:
+            try:
+                check_idle_in_transaction(IDLE_TX_ALERT_THRESHOLD_SEC)
+            except Exception as e:
+                print(f"idle-tx monitor error: {e}")
+            await asyncio.sleep(IDLE_TX_ALERT_INTERVAL_SEC)
+
+    asyncio.create_task(_idle_tx_monitor())
+    print("Idle-in-transaction monitor scheduled")
+
+    # patch_bundle08_timelock_watcher: poll the on-chain TimelockController for
+    # governance events (scheduled/executed/cancelled calls, role + min-delay
+    # changes) and fan them out via notify.send_alert. Read-only; no-ops cleanly
+    # until a TimelockController address is present in deployments AND governance
+    # is moved onto it (Bundle 12). Mirrors the idle-tx monitor's task shape.
+    import timelock_watcher as _tlw
+
+    async def _timelock_watcher():
+        await asyncio.sleep(50)  # initial delay; let chain/db settle past startup
+        if _tlw.TIMELOCK_ADDRESS:
+            print(f"Timelock watcher started (timelock={_tlw.TIMELOCK_ADDRESS}, "
+                  f"interval={_tlw.TIMELOCK_WATCH_INTERVAL_SEC}s)")
+        else:
+            print("Timelock watcher: no TimelockController in deployments - "
+                  "watcher idle (expected on Fuji pre-Bundle-12)")
+        while True:
+            try:
+                _tlw.poll_once()
+            except Exception as e:
+                print(f"timelock watcher error: {e}")
+            await asyncio.sleep(_tlw.TIMELOCK_WATCH_INTERVAL_SEC)
+
+    asyncio.create_task(_timelock_watcher())
+    print("Timelock watcher scheduled")
 
     # patch04b: keep-alive loop. The main indexer runs in a native
     # thread via start_indexer() and doesn't need to be awaited.

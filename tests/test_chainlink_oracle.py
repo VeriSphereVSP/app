@@ -24,7 +24,8 @@ def _clear_oracle_state():
 
 
 def _mock_chainlink_contract(*, answer=None, updated_at=None, decimals=8,
-                             latest_raises=None, decimals_raises=None):
+                             latest_raises=None, decimals_raises=None,
+                             round_id=1, answered_in_round=1):
     """Build a mock aggregator contract.
 
     answer: int256 returned by latestRoundData (in raw units, not scaled).
@@ -32,6 +33,7 @@ def _mock_chainlink_contract(*, answer=None, updated_at=None, decimals=8,
     decimals: int returned by decimals().
     latest_raises: exception to raise on latestRoundData() call.
     decimals_raises: exception to raise on decimals() call.
+    round_id / answered_in_round: for staleness-guard tests.
     """
     contract = MagicMock()
 
@@ -46,11 +48,11 @@ def _mock_chainlink_contract(*, answer=None, updated_at=None, decimals=8,
         ts = updated_at if updated_at is not None else int(time.time())
         ans = answer if answer is not None else 0
         contract.functions.latestRoundData.return_value.call.return_value = (
-            1,         # roundId
-            ans,       # answer
-            ts,        # startedAt
-            ts,        # updatedAt
-            1,         # answeredInRound
+            round_id,          # roundId
+            ans,               # answer
+            ts,                # startedAt
+            ts,                # updatedAt
+            answered_in_round, # answeredInRound
         )
     return contract
 
@@ -249,3 +251,124 @@ def test_chainlink_rpc_is_independent():
     # Default URL should NOT be Fuji.
     assert "avax-test.network" not in oracle.CHAINLINK_RPC_URL or \
            oracle.CHAINLINK_RPC_URL != "https://api.avax-test.network/ext/bc/C/rpc"
+
+
+# ─── patch_bundle08_oracle_hardening: stale-round guards (gold) ──────
+
+def test_chainlink_answered_in_round_stale_rejected():
+    """answeredInRound < roundId (stuck/carried-over answer) → None."""
+    from mm import oracle
+    mock = _mock_chainlink_contract(
+        answer=4565_44000000, updated_at=int(time.time()) - 60, decimals=8,
+        round_id=100, answered_in_round=99,
+    )
+    with patch.object(oracle, "_get_chainlink_contract", return_value=mock):
+        assert oracle._gold_from_chainlink() is None
+
+
+def test_chainlink_updated_at_zero_rejected():
+    """updatedAt == 0 (round never completed) → None."""
+    from mm import oracle
+    mock = _mock_chainlink_contract(answer=4565_44000000, updated_at=0, decimals=8)
+    with patch.object(oracle, "_get_chainlink_contract", return_value=mock):
+        assert oracle._gold_from_chainlink() is None
+
+
+def test_chainlink_fresh_round_accepted():
+    """answeredInRound >= roundId and updatedAt != 0 → accepted."""
+    from mm import oracle
+    mock = _mock_chainlink_contract(
+        answer=4565_44000000, updated_at=int(time.time()) - 60, decimals=8,
+        round_id=100, answered_in_round=100,
+    )
+    with patch.object(oracle, "_get_chainlink_contract", return_value=mock):
+        assert oracle._gold_from_chainlink() == pytest.approx(4565.44)
+
+
+# ─── patch_bundle08_oracle_hardening: approaching-cap alert (gold) ───
+
+def test_gold_approaching_cap_alert_fires_once():
+    from mm import oracle
+    oracle._last_gold_alert_ts = 0.0
+    # 17000 is >= 0.8 * 20000 = 16000 and < 20000 (valid)
+    mock = _mock_chainlink_contract(
+        answer=17000_00000000, updated_at=int(time.time()) - 60, decimals=8)
+    with patch.object(oracle, "_get_chainlink_contract", return_value=mock):
+        with patch.object(oracle, "_alert") as m_alert:
+            p1 = oracle.get_gold_price_usd_per_oz()
+            oracle.invalidate_xau_cache()
+            p2 = oracle.get_gold_price_usd_per_oz()
+    assert p1 == pytest.approx(17000.0)
+    assert p2 == pytest.approx(17000.0)
+    # throttled: at most one alert within the interval despite two reads
+    assert m_alert.call_count == 1
+    assert m_alert.call_args[0][0] == "gold_price_watch_level"
+
+
+def test_gold_below_threshold_no_alert():
+    from mm import oracle
+    oracle._last_gold_alert_ts = 0.0
+    mock = _mock_chainlink_contract(
+        answer=4565_44000000, updated_at=int(time.time()) - 60, decimals=8)
+    with patch.object(oracle, "_get_chainlink_contract", return_value=mock):
+        with patch.object(oracle, "_alert") as m_alert:
+            oracle.get_gold_price_usd_per_oz()
+    assert m_alert.call_count == 0
+
+
+# ─── patch_bundle08_oracle_hardening: AVAX/USD resolution ───────────
+
+def test_avax_chainlink_primary():
+    from mm import oracle
+    mock = _mock_chainlink_contract(
+        answer=35_00000000, updated_at=int(time.time()) - 30, decimals=8)
+    with patch.object(oracle, "_get_avax_chainlink_contract", return_value=mock):
+        assert oracle.get_avax_price_usd() == pytest.approx(35.0)
+
+
+def test_avax_chainlink_stale_falls_through_to_coingecko():
+    from mm import oracle
+    mock = _mock_chainlink_contract(
+        answer=35_00000000, updated_at=int(time.time()) - 60, decimals=8,
+        round_id=100, answered_in_round=99,  # stale → None
+    )
+    with patch.object(oracle, "_get_avax_chainlink_contract", return_value=mock):
+        with patch.object(oracle, "_avax_from_coingecko", return_value=42.0):
+            assert oracle.get_avax_price_usd() == pytest.approx(42.0)
+
+
+def test_avax_all_sources_fail_uses_config_fallback():
+    from mm import oracle
+    with patch.object(oracle, "_avax_from_chainlink", return_value=None):
+        with patch.object(oracle, "_avax_from_coingecko", return_value=None):
+            price = oracle.get_avax_price_usd()
+    # falls back to config.AVAX_PRICE_USD (20.0) or the hardcoded 20.0
+    assert price == pytest.approx(20.0)
+
+
+def test_avax_out_of_bounds_rejected():
+    from mm import oracle
+    mock = _mock_chainlink_contract(
+        answer=5000_00000000, updated_at=int(time.time()) - 30, decimals=8)  # $5000 > MAX_AVAX_PRICE
+    with patch.object(oracle, "_get_avax_chainlink_contract", return_value=mock):
+        assert oracle._avax_from_chainlink() is None
+
+
+# ─── patch_bundle08_oracle_cap_config: raised gold cap ($50k default) ────
+
+def test_gold_within_raised_cap_accepted():
+    """$45k would have been rejected under the old $20k cap; now valid (<$50k)."""
+    from mm import oracle
+    mock = _mock_chainlink_contract(
+        answer=45000_00000000, updated_at=int(time.time()) - 60, decimals=8)
+    with patch.object(oracle, "_get_chainlink_contract", return_value=mock):
+        assert oracle._gold_from_chainlink() == pytest.approx(45000.0)
+
+
+def test_gold_above_raised_cap_rejected():
+    """Still fail-closed above the (raised) MAX_GOLD_PRICE default of $50k."""
+    from mm import oracle
+    mock = _mock_chainlink_contract(
+        answer=55000_00000000, updated_at=int(time.time()) - 60, decimals=8)
+    with patch.object(oracle, "_get_chainlink_contract", return_value=mock):
+        assert oracle._gold_from_chainlink() is None

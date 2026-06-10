@@ -25,6 +25,20 @@ from starlette.responses import Response, JSONResponse
 
 logger = logging.getLogger(__name__)
 
+# patch_followup_limiter_logvis: ensure limiter warnings reach docker logs
+# regardless of how uvicorn configures logging. The module logger gets its own
+# stdout StreamHandler (idempotent) and stops propagating, so a 429 / abuse
+# event is always greppable in `docker compose logs` — the observability gap
+# that hid the 2026-06-05 shared-bucket 429s for days.
+import sys as _vsp_sys
+if not any(getattr(_h, "_vsp_logvis", False) for _h in logger.handlers):
+    _vsp_h = logging.StreamHandler(_vsp_sys.stdout)
+    _vsp_h.setFormatter(logging.Formatter("%(asctime)s %(name)s %(levelname)s %(message)s"))
+    _vsp_h._vsp_logvis = True
+    logger.addHandler(_vsp_h)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+
 
 # ── Sliding window counter ─────────────────────────────────
 
@@ -61,8 +75,18 @@ _limiter = SlidingWindow()
 # ── Configuration ──────────────────────────────────────────
 
 # General API rate limits (per IP)
-GENERAL_RATE_LIMIT = 120        # requests per window
-GENERAL_RATE_WINDOW = 60        # seconds
+# patch_ratelimit_general_env: env-overridable so a single-origin deployment
+# (e.g. the dev box, where all browser traffic reaches the app from the one
+# Vite-proxy container IP, making this per-IP cap behave as a shared global
+# bucket) can raise the ceiling without a code change. Defaults unchanged, so
+# prod (real per-client IPs behind nginx) keeps 120/60s.
+def _int_env(_name, _default):
+    try:
+        return int(os.getenv(_name, str(_default)))
+    except ValueError:
+        return _default
+GENERAL_RATE_LIMIT = _int_env("GENERAL_RATE_LIMIT", 120)    # requests per window
+GENERAL_RATE_WINDOW = _int_env("GENERAL_RATE_WINDOW", 60)   # seconds
 
 # Relay rate limits (per user address)
 RELAY_RATE_LIMIT = 60           # relay txs per window

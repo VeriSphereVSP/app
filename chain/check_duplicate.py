@@ -7,7 +7,8 @@ This is O(1) — uses the contract's internal hash mapping, no iteration.
 
 import logging
 from web3 import Web3
-from config import POST_REGISTRY_ADDRESS, RPC_URL
+from config import POST_REGISTRY_ADDRESS, RPC_URL, RPC_READ_URLS
+from tx_signer import build_w3  # patch_bundle10_rpc_failover_p2
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +31,7 @@ _contract = None
 def _get_contract():
     global _w3, _contract
     if _contract is None:
-        _w3 = Web3(Web3.HTTPProvider(RPC_URL))
+        _w3 = build_w3(RPC_READ_URLS, require_connected=False)
         _contract = _w3.eth.contract(
             address=Web3.to_checksum_address(POST_REGISTRY_ADDRESS),
             abi=_CREATE_CLAIM_ABI,

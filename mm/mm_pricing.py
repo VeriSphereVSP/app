@@ -228,6 +228,39 @@ def _sell_price_at(
         return reserve_p * (1 - half_spread)
 
 
+def _coverage_ratio(
+    net_vsp: float,
+    usdc_reserves: float,
+    gold_usd: float,
+    unit_au: float,
+    half_spread: float,
+    vsp_circulating: float,
+) -> float:
+    """patch_bundle11_reserve_dampening: buyback reserve-coverage ratio k.
+
+    k = min(1, R / C_full(n)) where C_full(n) is the curve cost to buy back
+    the ENTIRE circulating supply (integral of the sell curve from 0..n).
+    Buyback prices are the supply curve scaled by k, so the MM stays solvent
+    in aggregate for any liquidation (draining everything pays exactly R).
+    k is invariant as holders sell -> path-independent / splitting-resistant.
+
+    net_vsp <= 0 (nothing circulating, or the legacy reserve branch) returns
+    1.0: no extra dampening, continuous with the n -> 0+ limit where
+    C_full -> 0 and R / C_full -> inf (clamped to 1).
+    """
+    if usdc_reserves <= 0:
+        return 0.0
+    if net_vsp <= 0:
+        return 1.0
+    c_full = _integrate_sell_proceeds(
+        net_vsp, net_vsp, gold_usd, unit_au, half_spread,
+        usdc_reserves, vsp_circulating,
+    )
+    if c_full <= 0:
+        return 1.0
+    return min(1.0, usdc_reserves / c_full)
+
+
 # ────────────────────────────────────────────────────────────
 # Public interface
 # ────────────────────────────────────────────────────────────
@@ -280,7 +313,9 @@ def get_spot_quote(
         mid = unit_au * gold * 0.01
 
     buy = mid * (1 + half_spread)
-    sell_p = mid * (1 - half_spread)
+    # patch_bundle11_reserve_dampening: spot buyback quote scaled by k.
+    _k_spot = _coverage_ratio(n, usdc_reserves, gold, unit_au, half_spread, vsp_circulating)
+    sell_p = mid * (1 - half_spread) * _k_spot
 
     # Floor semantics: the maximum buyback price Verisphere can guarantee
     # if a holder liquidates back to the MM. That is min(reserve_floor,
@@ -351,7 +386,14 @@ def compute_sell_fill(
         usdc_reserves, vsp_circulating,
     )
 
-    # Safety: never pay out more than reserves
+    # patch_bundle11_reserve_dampening: scale buyback proceeds by the reserve
+    # coverage ratio k = min(1, R / C_full(n)) so the MM stays solvent in
+    # aggregate for the quoted price (Decision 2026-06-10).
+    _k = _coverage_ratio(n, usdc_reserves, gold, unit_au, half_spread, vsp_circulating)
+    total_proceeds *= _k
+
+    # Safety: never pay out more than reserves (belt-and-suspenders; with
+    # dampening total_proceeds <= reserves already holds).
     total_proceeds = min(total_proceeds, usdc_reserves)
 
     avg_price = total_proceeds / qty_vsp if qty_vsp > 0 else 0.0
@@ -385,6 +427,9 @@ def get_floor_price(
         # would bypass test fixtures patching mm.mm_pricing's name.
         gold_usd = get_gold_price_usd_per_oz()
     reserve_floor = usdc_reserves / vsp_circulating if vsp_circulating > 0 else 0.0
-    sell_price = _base_price(net_vsp, gold_usd, unit_au) * (1 - half_spread)
+    # patch_bundle11_reserve_dampening: dampen the marginal sell by k so the
+    # floor reconciles with the reserve-aware buyback.
+    _k_floor = _coverage_ratio(net_vsp, usdc_reserves, gold_usd, unit_au, half_spread, vsp_circulating)
+    sell_price = _base_price(net_vsp, gold_usd, unit_au) * (1 - half_spread) * _k_floor
     # See get_spot_quote: floor = max guaranteed buyback, never above curve.
     return min(reserve_floor, sell_price)

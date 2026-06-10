@@ -19,6 +19,35 @@ elif CHAIN_ID == 43114:
 else:
     NETWORK = f"chain-{CHAIN_ID}"
 
+# patch_bundle10_rpc_failover: ordered RPC endpoint lists (primary + network public
+# fallback). build_w3() fails over across these on transport errors. A single-element
+# list behaves exactly as before. An explicit comma-separated override (RPC_URLS /
+# RPC_URLS_READ) wins over the derived [primary, public] default.
+_PUBLIC_RPC = {
+    "fuji": "https://api.avax-test.network/ext/bc/C/rpc",
+    "mainnet": "https://api.avax.network/ext/bc/C/rpc",
+}
+
+
+def _rpc_failover_list(override_env, primary, *extra_fallbacks):
+    _raw = os.getenv(override_env, "")
+    if _raw.strip():
+        return [u.strip() for u in _raw.split(",") if u.strip()]
+    _cands = [primary] + list(extra_fallbacks)
+    _pub = _PUBLIC_RPC.get(NETWORK)
+    if _pub:
+        _cands.append(_pub)
+    # dedup preserving order, drop empties
+    return [u for u in dict.fromkeys(_cands) if u]
+
+
+# Reads prefer their own endpoint (RPC_URL_READ -- often the public endpoint, to keep
+# high-volume reads off paid-provider quota) but fall back to the signing endpoint
+# (RPC_URL) and then the network public endpoint, so a read-endpoint outage still has
+# somewhere to go. On Fuji this yields RPC_READ_URLS = [public, Alchemy].
+RPC_WRITE_URLS = _rpc_failover_list("RPC_URLS", RPC_URL)
+RPC_READ_URLS = _rpc_failover_list("RPC_URLS_READ", RPC_URL_READ, RPC_URL)
+
 # patch_bundle06_direct_mm_signing_lockdown: the direct MM-key-signing
 # endpoints (/api/claims/stake, /api/claims/unstake, /api/links/create)
 # sign on-chain txs with the MM hot wallet and carry NO counterparty
@@ -31,6 +60,15 @@ DIRECT_MM_SIGNING_ENABLED = (
     and os.getenv("ALLOW_DIRECT_MM_SIGNING", "0").strip().lower()
     in ("1", "true", "yes", "on")
 )
+
+# patch_followup_service_token: shared-secret gate for the MM money endpoints
+# (/api/mm/buy,/sell,/transfer,/execute-permit). OFF by default (token unset) so
+# dev/Fuji are unaffected. In prod set SERVICE_API_TOKEN in
+# env/secrets.<network>.enc.yaml (SOPS); Caddy injects it for browser traffic and
+# the batch tool sends it. When set, the four endpoints require a matching
+# X-Service-Token header.
+SERVICE_API_TOKEN = os.getenv("SERVICE_API_TOKEN", "").strip()
+REQUIRE_SERVICE_TOKEN = bool(SERVICE_API_TOKEN)
 
 # patch_bundle10c_backend_hardening_config: fail-loud on missing required env when on mainnet.
 # Fuji keeps the convenience fallbacks; mainnet raises RuntimeError on any
@@ -102,6 +140,22 @@ else:
         )
     TREASURY_ADDRESS = MM_ADDRESS  # Fuji-only convenience
 
+# patch_bundle11_cold_reserve: dedicated cold-custody sweep destination,
+# segregated from the fee sink (TREASURY_ADDRESS). Swept USDC stays
+# floor-backing, so this address is auto-folded into COLD_SAFE_ADDRESSES
+# below. Default empty -> no sweep (worker skips). Must differ from MM
+# and the fee sink; mismatches fail-fast here.
+COLD_RESERVE_ADDRESS = os.getenv("VSP_COLD_RESERVE_ADDRESS", "").strip()
+if COLD_RESERVE_ADDRESS:
+    _crl = COLD_RESERVE_ADDRESS.lower()
+    if not (COLD_RESERVE_ADDRESS.startswith("0x") and len(COLD_RESERVE_ADDRESS) == 42):
+        raise RuntimeError(f"config.py: VSP_COLD_RESERVE_ADDRESS malformed: {COLD_RESERVE_ADDRESS!r}")
+    if _crl == MM_ADDRESS.lower():
+        raise RuntimeError("config.py: VSP_COLD_RESERVE_ADDRESS must differ from MM_ADDRESS (sweep would be a self-send).")
+    if _crl == TREASURY_ADDRESS.lower():
+        raise RuntimeError("config.py: VSP_COLD_RESERVE_ADDRESS must differ from TREASURY_ADDRESS (cold reserves must be segregated from the fee sink).")
+
+
 # patch06: virtual reserves — cold-storage addresses whose USDC
 # balances are summed into read_usdc_reserves(). Comma-separated env
 # var, whitespace-tolerant. Empty/unset → behaves as before
@@ -138,6 +192,14 @@ COLD_SAFE_ADDRESSES = _parse_cold_safe_addresses(
     os.getenv("COLD_SAFE_ADDRESSES", "")
 )
 
+# patch_bundle11_cold_reserve_foldin: the cold-custody sweep destination
+# is always counted as floor-backing reserve. Fold it in if not listed.
+if COLD_RESERVE_ADDRESS and COLD_RESERVE_ADDRESS.lower() not in {
+    _a.lower() for _a in COLD_SAFE_ADDRESSES
+}:
+    COLD_SAFE_ADDRESSES.append(COLD_RESERVE_ADDRESS)
+
+
 # Database
 DB_USER = os.getenv("DB_USER", "verisphere")
 DB_PASS = os.getenv("DB_PASS", "")
@@ -148,7 +210,11 @@ DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 
 # OpenAI
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+# patch_bundle11_remove_dead_openai_model: removed the dead OPENAI_MODEL constant
+# (nothing imported config.OPENAI_MODEL). The live LLM selection is LLM_PROVIDER /
+# LLM_MODEL, read in llm_provider.py and set to anthropic / claude-haiku-4-5-* in
+# env/common.env. OPENAI_API_KEY is kept: OpenAI is still the embeddings provider
+# (env/common.env: EMBEDDINGS_PROVIDER=openai).
 
 # Embeddings
 EMBEDDINGS_PROVIDER = os.getenv("EMBEDDINGS_PROVIDER", "openai")

@@ -8,8 +8,8 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, HTTPException, Depends
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, HTTPException, Depends, Header
+from pydantic import BaseModel, Field, AliasChoices, ConfigDict
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 sql_text = text  # alias: legacy code in this file uses both names
@@ -17,7 +17,7 @@ sql_text = text  # alias: legacy code in this file uses both names
 from db import get_db
 from fee_calculator import compute_fee as calc_fee
 from mm.erc20 import allowance, transfer, transfer_from
-from config import USDC_ADDRESS, VSP_ADDRESS, MM_ADDRESS, TREASURY_ADDRESS
+from config import USDC_ADDRESS, VSP_ADDRESS, MM_ADDRESS, TREASURY_ADDRESS, SERVICE_API_TOKEN, REQUIRE_SERVICE_TOKEN
 from mm.mm_pricing import (
     get_spot_quote,
     compute_buy_fill,
@@ -28,6 +28,8 @@ from mm.mm_pricing import (
 )
 
 import logging
+import os
+import hmac  # patch_followup_service_token_guard
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +43,30 @@ from chain.chain_reader import (
 )
 
 router = APIRouter(prefix="/api/mm", tags=["market-maker"])
+
+# patch_followup_service_token_guard: require X-Service-Token on the MM money
+# endpoints when SERVICE_API_TOKEN is configured (prod). No-op when unset (dev).
+def require_service_token(x_service_token: str | None = Header(default=None)):
+    if not REQUIRE_SERVICE_TOKEN:
+        return
+    if not x_service_token or not hmac.compare_digest(x_service_token, SERVICE_API_TOKEN):
+        raise HTTPException(status_code=401, detail="service token required")
+
+
+# patch_bundle06_mm_sell_slippage_floor: server-side guard against a degenerate
+# sell minimum. `min_total_usdc` on the sell side is the *minimum* NET proceeds
+# the user will accept (gross - fee); Pydantic only enforces gt=0, so a broken
+# FE or a direct-API caller can send a near-zero value that passes the
+# `net < min` check with no real floor. We reject any sell whose stated minimum
+# is below this fraction of the freshly-quoted NET fill (patch_g34_sell_net_guard
+# moved this from gross to net). Loose default (0.80) catches fat-finger/
+# degenerate values without rejecting normal sells (the FE sends ~0.99*net
+# preview). NOTE: this compares against the execution-time net, so tightening
+# toward 0.95 also makes
+# a sharp *favorable* price move (fill rises far above the user's fixed minimum)
+# trip the floor — harmless (the FE re-quotes and retries at the better price),
+# but the reason to keep it loose for B1.
+MM_SELL_SLIPPAGE_FLOOR_FRAC = float(os.getenv("MM_SELL_SLIPPAGE_FLOOR_FRAC", "0.80"))
 
 
 # ────────────────────────────────────────────────────────────
@@ -324,10 +350,25 @@ class PermitFields(BaseModel):
     value: int  # Approved amount in token smallest unit
 
 
-class MMTradeRequest(BaseModel):
+class MMBuyRequest(BaseModel):  # patch_g34_model_split (was MMTradeRequest)
     user_address: str
     qty_vsp: float = Field(..., gt=0)
-    max_total_usdc: float = Field(..., gt=0)
+    max_total_usdc: float = Field(..., gt=0)  # all-in USDC ceiling (gross + fee)
+    permit: PermitFields | None = None  # Optional — if provided, MM executes permit first
+
+
+class MMSellRequest(BaseModel):  # patch_g34_model_split
+    # G-34: the sell limit is the *minimum* NET proceeds the user will
+    # accept (gross - fee == what they receive). Renamed from the
+    # misnamed max_total_usdc; the old name is accepted as a transition
+    # alias so the frontend and backend need not deploy atomically.
+    model_config = ConfigDict(populate_by_name=True)
+    user_address: str
+    qty_vsp: float = Field(..., gt=0)
+    min_total_usdc: float = Field(
+        ..., gt=0,
+        validation_alias=AliasChoices("min_total_usdc", "max_total_usdc"),
+    )
     permit: PermitFields | None = None  # Optional — if provided, MM executes permit first
 
 
@@ -453,8 +494,8 @@ def preview_sell(qty_vsp: float, db: Session = Depends(get_db)):
         "breakdown": fee["breakdown"],
     }
 
-@router.post("/buy")
-def mm_buy(req: MMTradeRequest, db: Session = Depends(get_db)):
+@router.post("/buy", dependencies=[Depends(require_service_token)])
+def mm_buy(req: MMBuyRequest, db: Session = Depends(get_db)):
     """
     Buy VSP with USDC.
     If permit is provided, MM executes USDC.permit() first (gasless for user).
@@ -469,8 +510,17 @@ def mm_buy(req: MMTradeRequest, db: Session = Depends(get_db)):
                 net_vsp, req.qty_vsp, usdc_reserves, vsp_circulating, unit_au, half_spread,
             )
 
-            if fill.total_usd > req.max_total_usdc:
-                raise HTTPException(400, f"Fill cost {fill.total_usd:.6f} USDC exceeds max {req.max_total_usdc:.6f}")
+            # patch_g34_buy_allin_guard: fee is additive on buy (user pays
+            # gross + fee), so the slippage cap the FE sends (all-in total *
+            # buffer) must be enforced against the all-in cost, not the gross
+            # fill. Compute the fee here, up front, so the guard compares like
+            # for like. (Was `fill.total_usd > req.max_total_usdc` — loose by
+            # exactly one fee.)
+            fee_info = calc_fee(db, "buy", req.qty_vsp)
+            fee_usdc = fee_info["fee_vsp"] * fill.avg_price_usd
+            total_usdc_with_fee = fill.total_usd + fee_usdc
+            if total_usdc_with_fee > req.max_total_usdc:
+                raise HTTPException(400, f"All-in cost {total_usdc_with_fee:.6f} USDC (incl. {fee_usdc:.6f} fee) exceeds max {req.max_total_usdc:.6f}")
             # patch_bundle04_6_mm_buy_balance_guard: read MM's live VSP balance BEFORE any
             # on-chain transfer. mm_buy is a three-leg flow (USDC reserves
             # in, USDC fee in, VSP out); if the third leg reverts because MM
@@ -488,11 +538,18 @@ def mm_buy(req: MMTradeRequest, db: Session = Depends(get_db)):
                 )
 
             usdc_micro = int(fill.total_usd * 1_000_000)
+            # patch_buy_permit_allin: both transfer_from legs (reserves to MM,
+            # fee to treasury) draw on the user's USDC allowance to MM, so the
+            # permit/allowance must cover the ALL-IN amount (gross + fee), not
+            # just the gross reserves. Was `< usdc_micro` (gross): a permit
+            # signed for exactly gross passed, then reverted on the fee leg
+            # on-chain. needed_micro mirrors reserves_micro + fee_micro exactly.
+            needed_micro = usdc_micro + int(fee_usdc * 1_000_000)
 
             # Execute permit if provided
             if req.permit:
-                if req.permit.value < usdc_micro:
-                    raise HTTPException(400, f"Permit value {req.permit.value} < needed {usdc_micro}")
+                if req.permit.value < needed_micro:
+                    raise HTTPException(400, f"Permit value {req.permit.value} < needed {needed_micro} (all-in: gross {usdc_micro} + fee {int(fee_usdc * 1_000_000)})")
                 _execute_permit(
                     USDC_ADDRESS, req.user_address, MM_ADDRESS,
                     req.permit.value, req.permit.deadline,
@@ -500,14 +557,11 @@ def mm_buy(req: MMTradeRequest, db: Session = Depends(get_db)):
                 )
             else:
                 # Legacy: check existing allowance
-                if allowance(USDC_ADDRESS, req.user_address, MM_ADDRESS) < usdc_micro:
+                if allowance(USDC_ADDRESS, req.user_address, MM_ADDRESS) < needed_micro:
                     raise HTTPException(400, "USDC allowance too low — provide a permit signature")
 
 
-            # Calculate fee (additive: added to USDC cost, user receives full qty)
-            fee_info = calc_fee(db, "buy", req.qty_vsp)
-            fee_usdc = fee_info["fee_vsp"] * fill.avg_price_usd
-            total_usdc_with_fee = fill.total_usd + fee_usdc
+            # Fee + all-in total already computed above (patch_g34_buy_allin_guard).
             # Split: reserves to MM, fee to treasury
             reserves_micro = int(fill.total_usd * 1_000_000)
             fee_micro = int(fee_usdc * 1_000_000)
@@ -569,8 +623,8 @@ def mm_buy(req: MMTradeRequest, db: Session = Depends(get_db)):
         raise HTTPException(500, f"Failed to buy VSP: {e}")
 
 
-@router.post("/sell")
-def mm_sell(req: MMTradeRequest, db: Session = Depends(get_db)):
+@router.post("/sell", dependencies=[Depends(require_service_token)])
+def mm_sell(req: MMSellRequest, db: Session = Depends(get_db)):
     """
     Sell VSP for USDC.
     If permit is provided, MM executes VSP.permit() first (gasless for user).
@@ -585,8 +639,32 @@ def mm_sell(req: MMTradeRequest, db: Session = Depends(get_db)):
                 net_vsp, req.qty_vsp, usdc_reserves, vsp_circulating, unit_au, half_spread,
             )
 
-            if fill.total_usd < req.max_total_usdc:
-                raise HTTPException(400, f"Fill proceeds {fill.total_usd:.6f} USDC below minimum {req.max_total_usdc:.6f}")
+            # patch_g34_sell_net_guard: the user's minimum applies to NET
+            # proceeds (gross - fee) — what they actually receive and what the
+            # FE quotes as "you receive". Compute the fee up front so both the
+            # degenerate-minimum floor and the user's stated minimum compare on
+            # net. (Was: both compared req.max_total_usdc to the gross fill,
+            # under-protecting the user by exactly one fee.)
+            fee_info = calc_fee(db, "sell", req.qty_vsp)
+            fee_usdc = fee_info["fee_vsp"] * fill.avg_price_usd
+            net_usdc = fill.total_usd - fee_usdc
+            if net_usdc <= 0:
+                raise HTTPException(400, "Trade too small to cover fees")
+
+            # patch_bundle06_mm_sell_slippage_floor (retained, now net-based):
+            # reject a degenerate minimum (near-zero min_total_usdc) before the
+            # user's stated-minimum check.
+            _sell_floor = MM_SELL_SLIPPAGE_FLOOR_FRAC * net_usdc
+            if req.min_total_usdc < _sell_floor:
+                raise HTTPException(
+                    400,
+                    f"Sell minimum {req.min_total_usdc:.6f} USDC is below the slippage "
+                    f"floor {_sell_floor:.6f} ({MM_SELL_SLIPPAGE_FLOOR_FRAC:.0%} of net "
+                    f"{net_usdc:.6f} USDC); refresh the quote and retry",
+                )
+
+            if net_usdc < req.min_total_usdc:
+                raise HTTPException(400, f"Net proceeds {net_usdc:.6f} USDC below minimum {req.min_total_usdc:.6f}")
 
             if fill.total_usd > usdc_reserves:
                 raise HTTPException(400, "Insufficient USDC reserves to fill this sell order")
@@ -596,10 +674,9 @@ def mm_sell(req: MMTradeRequest, db: Session = Depends(get_db)):
             # formal-reserves-too-low case; this read is hot-wallet ONLY
             # and uncached, catching the case where reserves are formally
             # sufficient (cold safes hold the difference) but the hot
-            # wallet currently can't pay out. fee_usdc isn't computed yet
-            # at this point so we guard against fill.total_usd (gross);
-            # the net after-fee amount is strictly smaller, so a gross
-            # check is conservative and correct.
+            # wallet currently can't pay out. We guard against fill.total_usd
+            # (gross) because total USDC leaving MM == net (to user) + fee (to
+            # treasury) == gross; gross is the real outflow, not a stale value.
             try:
                 mm_usdc_balance = read_usdc_balance_of_mm()
             except Exception as e:
@@ -626,12 +703,7 @@ def mm_sell(req: MMTradeRequest, db: Session = Depends(get_db)):
                 if allowance(VSP_ADDRESS, req.user_address, MM_ADDRESS) < vsp_wei:
                     raise HTTPException(400, "VSP allowance too low — provide a permit signature")
 
-            # Calculate fee (subtracted from USDC proceeds)
-            fee_info = calc_fee(db, "sell", req.qty_vsp)
-            fee_usdc = fee_info["fee_vsp"] * fill.avg_price_usd
-            net_usdc = fill.total_usd - fee_usdc
-            if net_usdc <= 0:
-                raise HTTPException(400, "Trade too small to cover fees")
+            # Fee + net already computed above (patch_g34_sell_net_guard).
 
             # Execute on-chain transfers
             _sell_vsp_tx_hash = transfer_from(VSP_ADDRESS, req.user_address, MM_ADDRESS, vsp_wei)  # patch_bundle04_5_p21_mm_sell_tx_hash
@@ -702,7 +774,7 @@ class ExecutePermitRequest(BaseModel):
     r: str
     s: str
 
-@router.post("/execute-permit")
+@router.post("/execute-permit", dependencies=[Depends(require_service_token)])
 def mm_execute_permit(req: ExecutePermitRequest, db: Session = Depends(get_db)):
     """Execute an ERC-2612 permit. MM wallet pays gas.
     Used by batch tool to set VSPToken allowances without going through the relay."""
@@ -725,7 +797,7 @@ class TransferRequest(BaseModel):
     amount_vsp: float
     permit: PermitFields
 
-@router.post("/transfer")
+@router.post("/transfer", dependencies=[Depends(require_service_token)])
 def mm_transfer(req: TransferRequest, db: Session = Depends(get_db)):
     """Transfer VSP between wallets. MM executes the transfer using a permit.
     This avoids routing through the forwarder (VSPToken doesn't trust it)."""
