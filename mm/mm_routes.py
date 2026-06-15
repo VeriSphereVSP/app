@@ -797,32 +797,20 @@ class TransferRequest(BaseModel):
     amount_vsp: float
     permit: PermitFields
 
-@router.post("/transfer", dependencies=[Depends(require_service_token)])
-def mm_transfer(req: TransferRequest, db: Session = Depends(get_db)):
-    """Transfer VSP between wallets. MM executes the transfer using a permit.
-    This avoids routing through the forwarder (VSPToken doesn't trust it)."""
-    from web3 import Web3
-    from_addr = Web3.to_checksum_address(req.from_address)
-    to_addr = Web3.to_checksum_address(req.to_address)
-    amount_wei = int(req.amount_vsp * 10**18)
+@router.post("/transfer")
+def mm_transfer():
+    # DEPRECATED 2026-06-11 (410 Gone): wallet-to-wallet VSP transfer is not a
+    # Verisphere protocol operation. VSP is a standard ERC-20 -- move it directly
+    # from a wallet. The MM no longer brokers transfers; the old
+    # permit -> transferFrom -> transfer flow (and its post-on-chain 500) is gone.
+    raise HTTPException(
+        status_code=410,
+        detail=(
+            "Endpoint removed: VSP transfers are not a Verisphere operation. "
+            "VSP is a standard ERC-20 token; transfer it directly from your wallet."
+        ),
+    )
 
-    # Execute the permit (grants MM allowance to transferFrom)
-    if req.permit:
-        _execute_permit(
-            VSP_ADDRESS, from_addr, MM_ADDRESS,
-            req.permit.value, req.permit.deadline,
-            req.permit.v, req.permit.r, req.permit.s,
-        )
-
-    # Check allowance
-    if allowance(VSP_ADDRESS, from_addr, MM_ADDRESS) < amount_wei:
-        raise HTTPException(400, "VSP allowance too low for transfer")
-
-    # MM does transferFrom(sender, MM) then transfer(MM, recipient)
-    transfer_from(VSP_ADDRESS, from_addr, MM_ADDRESS, amount_wei)
-    transfer(VSP_ADDRESS, to_addr, amount_wei)
-
-    return {"ok": True, "from": from_addr, "to": to_addr, "amount_vsp": req.amount_vsp}
 
 @router.get("/fee-summary")
 def fee_summary(db: Session = Depends(get_db)):
