@@ -1,6 +1,7 @@
 # app/main.py
 # patch_bundle03_logging: ensure logger.info from relay.py, article_routes.py,
 # etc. is visible in 'docker compose logs app'. Mirrors worker.py.
+import os  # patch_bundle12_docs_gate
 import logging as _bundle03_logging
 import sys as _bundle03_sys
 _bundle03_logging.basicConfig(
@@ -172,7 +173,15 @@ async def lifespan(app):
 
 from chain_indexer import start_indexer
 
-app = FastAPI(title="VeriSphere App API", version="0.1.0", lifespan=lifespan)
+_expose_docs = os.getenv("EXPOSE_API_DOCS", "").strip().lower() in ("1", "true", "yes")  # patch_bundle12_docs_gate
+app = FastAPI(  # patch_bundle12_docs_gate
+    title="VeriSphere App API",
+    version="0.1.0",
+    lifespan=lifespan,
+    docs_url="/docs" if _expose_docs else None,
+    redoc_url="/redoc" if _expose_docs else None,
+    openapi_url="/openapi.json" if _expose_docs else None,
+)
 
 
 app.add_middleware(RateLimitMiddleware)
