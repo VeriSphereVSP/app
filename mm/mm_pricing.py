@@ -44,7 +44,7 @@ DEFAULT_HALF_SPREAD = 0.0025   # 0.25% half-spread → 0.5% round trip
 # Controls the steepness of the supply curve:
 #   price(n) = log10(n + 10) ** _PRICE_EXPONENT * unit_au * gold_usd
 #
-# Default is 3 (cubed) — the launch value. Set MM_PRICE_EXPONENT in
+# Default is 2.5 — the live launch value (matches env/common.env). Set MM_PRICE_EXPONENT in
 # the environment to override; any positive rational ≤ 10 works.
 # Useful for A/B and rollback. The variable is read once at module
 # import, so changes require an app restart.
@@ -53,7 +53,7 @@ DEFAULT_HALF_SPREAD = 0.0025   # 0.25% half-spread → 0.5% round trip
 # exponent — that branch uses the constant-product reserve model,
 # not the supply curve.
 
-_PRICE_EXPONENT = float(os.getenv("MM_PRICE_EXPONENT", "3"))
+_PRICE_EXPONENT = float(os.getenv("MM_PRICE_EXPONENT", "2.5"))
 if not (0.0 < _PRICE_EXPONENT <= 10.0):
     raise ValueError(
         f"MM_PRICE_EXPONENT must be in (0, 10]; got {_PRICE_EXPONENT!r}"
@@ -83,7 +83,7 @@ def _base_price(n: float, gold_usd: float, unit_au: float) -> float:
 
     For n >= 0: log-power supply curve anchored to gold.
         price = log10(n + 10) ** _PRICE_EXPONENT * unit_au * gold_usd
-        (default _PRICE_EXPONENT = 3; configurable via env)
+        (default _PRICE_EXPONENT = 2.5; configurable via env)
 
     For n < 0: reserve distribution curve.
         Handled separately in _reserve_price().
