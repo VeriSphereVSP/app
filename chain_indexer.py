@@ -1162,6 +1162,63 @@ def _check_indexer_lag(db, tx_block: int, tx_log_id: int) -> None:
         logger.debug("_check_indexer_lag failed: %s", e)
 
 
+def _log_relay_gas(db, row, receipt):
+    """patch_wire_relay_fee_log: persist the relay's AVAX gas burn for one resolved
+    tx into relay_fee_log. Best-effort: never raises into the resolver. gas cost is
+    authoritative here; fee_charged_vsp is filled later by a JOIN on chain_tx.fee_vsp
+    (written on a different pass), so it is left NULL at write time."""
+    try:
+        gas_used = int(receipt.gasUsed)
+        # patch_fix_relay_gas_price_zero: read effectiveGasPrice robustly. On this web3
+        # version the receipt is an AttributeDict whose key is reached via [] not getattr,
+        # so getattr returned None and the old code defaulted to 0 -> zero cost. Try dict
+        # access, then attr, then FALL BACK to the tx's gas price. Never default to 0.
+        egp = None
+        try:
+            egp = receipt["effectiveGasPrice"]
+        except (KeyError, TypeError):
+            egp = getattr(receipt, "effectiveGasPrice", None)
+        if egp is None:
+            try:
+                from tx_signer import build_w3
+                _w3 = build_w3()
+                tx = _w3.eth.get_transaction(receipt["transactionHash"] if "transactionHash" in receipt
+                                             else getattr(receipt, "transactionHash", row.tx_hash))
+                egp = tx.get("gasPrice") if hasattr(tx, "get") else getattr(tx, "gasPrice", None)
+            except Exception:
+                egp = None
+        egp = int(egp) if egp is not None else 0
+        if egp == 0:
+            logger.warning("relay_fee_log: effectiveGasPrice unresolved for %s; gas cost will be 0",
+                           getattr(row, "tx_hash", "?"))
+        gas_price_gwei = float(egp) / 1e9
+        gas_cost_avax = (gas_used * float(egp)) / 1e18
+        try:
+            from mm.oracle import get_avax_price_usd as _avax
+            avax_usd = _avax() or 0.0
+        except Exception:
+            from config import AVAX_PRICE_USD as avax_usd
+        gas_cost_usd = gas_cost_avax * float(avax_usd)
+        db.execute(sql_text(
+            "INSERT INTO relay_fee_log "
+            "(tx_hash, user_address, gas_used, gas_price_gwei, gas_cost_avax, "
+            " gas_cost_usd, tx_type) "
+            "VALUES (:h, :u, :gu, :gp, :ca, :cu, :tt)"
+        ), {
+            "h": row.tx_hash,
+            "u": (row.user_address if getattr(row, "user_address", None) else "unknown"),
+            "gu": gas_used,
+            "gp": round(gas_price_gwei, 4),
+            "ca": gas_cost_avax,
+            "cu": gas_cost_usd,
+            "tt": getattr(row, "action_type", None),
+        })
+        # caller commits as part of its existing db.commit()
+    except Exception as e:
+        logger.warning("relay_fee_log write skipped for %s: %s",
+                       getattr(row, "tx_hash", "?"), e)
+
+
 def resolve_pending_txs(db):
     """Resolve pending tx_log rows by fetching their receipts. Called from the
     indexer poll loop after poll_events_atomic. No-op if nothing's pending."""
@@ -1208,6 +1265,7 @@ def resolve_pending_txs(db):
                 db.commit()
                 logger.info("tx_log %d: confirmed %s block=%d post_id=%s",
                             row.id, row.tx_hash, receipt.blockNumber, post_id)
+                _log_relay_gas(db, row, receipt); db.commit()  # patch_wire_relay_fee_log
                 # patch_bundle04_p2: indexer-lag alert. The watcher resolves
                 # by receipt-hash and can be ahead of the event indexer
                 # briefly; only warn on sustained lag.
@@ -1223,6 +1281,7 @@ def resolve_pending_txs(db):
                 db.commit()
                 logger.info("tx_log %d: reverted %s block=%d",
                             row.id, row.tx_hash, receipt.blockNumber)
+                _log_relay_gas(db, row, receipt); db.commit()  # patch_wire_relay_fee_log
         except Exception as e:
             logger.warning("resolve_pending_txs: failed to resolve row %d: %s", row.id, e)
             try: db.rollback()

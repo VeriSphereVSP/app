@@ -579,7 +579,7 @@ def main() -> None:
     # healthy even when run_once raises into the loop_error alert path.
     # 900s healthcheck threshold accommodates the default 600s interval.
     from pathlib import Path as _HB_Path
-    _HB_FILE = _HB_Path("/tmp/treasury_worker.heartbeat")
+    _HB_FILE = _HB_Path("/heartbeats/treasury_worker.heartbeat")  # patch_tw_heartbeat_shared_volume
     while True:
         try:
             try:
