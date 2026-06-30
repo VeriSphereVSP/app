@@ -239,6 +239,23 @@ async def main():
     asyncio.create_task(_timelock_watcher())
     print("Timelock watcher scheduled")
 
+    # patch_wire_balance_sampler_loop: periodic balance/economics/health sampler.
+    # Was previously only ever run manually -> dashboard went stale unattended.
+    # try/except INSIDE the loop so one bad sample can't silently kill the task.
+    async def _balance_sampler():
+        await asyncio.sleep(45)  # initial delay; let startup settle
+        import os as _os
+        import balance_sampler as _bs
+        interval = int(_os.getenv("BALANCE_SAMPLE_INTERVAL_SEC", "300"))
+        while True:
+            try:
+                _bs.sample_balances_once()
+            except Exception as e:
+                print(f"balance-sampler error: {e}", flush=True)
+            await asyncio.sleep(interval)
+    asyncio.create_task(_balance_sampler())
+    print("balance sampler scheduled", flush=True)
+
     # patch04b: keep-alive loop. The main indexer runs in a native
     # thread via start_indexer() and doesn't need to be awaited.
     # We just need to keep the asyncio event loop alive so the
