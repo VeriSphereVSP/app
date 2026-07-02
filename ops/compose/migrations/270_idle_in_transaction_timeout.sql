@@ -1,0 +1,34 @@
+-- 270_idle_in_transaction_timeout.sql
+--
+-- Backstop for idle-in-transaction sessions.
+--
+-- Several embed()/LLM code paths (article_store build_and_cache_response
+-- per-item fallback loops, dupe_groups._llm_verify_equivalent,
+-- derived_state_worker) make a network call to OpenAI while a transaction
+-- opened by a preceding SELECT is still held. Under a slow or failing
+-- OpenAI endpoint the transaction sits idle for the duration of the network
+-- wait (observed: 265s during an insufficient_quota outage), which fires the
+-- vsp_alerts_bot idle_in_transaction alert and blocks autovacuum on the
+-- touched tables.
+--
+-- This sets a role-level cap so Postgres itself aborts any transaction that
+-- stays idle (open, not executing) longer than 30s. Healthy work is well
+-- under this — a batched embed_batch() of ~8 sentences completes in low
+-- single-digit seconds — so this only ever kills genuinely-stuck sessions.
+-- The application already rolls back and retries these paths, so an aborted
+-- idle txn surfaces as a caught, retryable exception (same handling as the
+-- 429s did), not data loss.
+--
+-- NOTE: this is a backstop, not the root fix. The structural fix (moving the
+-- embed()/complete() network calls outside open transactions across the
+-- ~34 embed sites in article_store.py) is deferred as post-launch cleanup.
+--
+-- CAVEAT: ALTER ROLE ... SET applies to NEW sessions only. Existing pooled
+-- connections keep the old (unset) behaviour until they reconnect. Bounce
+-- the app/worker containers, or let the pool cycle, for it to take full
+-- effect immediately.
+--
+-- Active transactions (e.g. running migrations under engine.begin()) are
+-- never "idle" and are unaffected by this timeout.
+
+ALTER ROLE verisphere SET idle_in_transaction_session_timeout = '30s';
