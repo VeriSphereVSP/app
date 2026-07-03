@@ -272,130 +272,151 @@ def is_claim_relevant_to_article(
 
 
 def index_existing_claims_into_article(db: Session, article_id: int):
-    """Find on-chain claims that belong in an article and overlay them.
+    """unified-sole-authority injection: group_topic drives injection + hiding.
 
-    # Collect all post_ids already in this article to prevent duplicates
-    existing_pids = set()
-    _rows = db.execute(sql_text(
-        "SELECT DISTINCT s.post_id FROM article_sentence s "
-        "JOIN article_section sec ON s.section_id = sec.section_id "
-        "WHERE sec.article_id = :a AND s.post_id IS NOT NULL"
-    ), {"a": article_id}).fetchall()
-    for (_pid,) in _rows:
-        existing_pids.add(_pid)
-
-
-    Two modes:
-    1. OVERLAY: If an article sentence semantically matches an on-chain claim,
-       link the sentence to the claim's post_id.
-    2. INSERT: If no matching sentence exists but the claim is topically relevant,
-       insert it into the best section.
+    Resets is_hidden (idempotent), groups claims+sentences via the unified
+    module, injects each visible canonical claim (overlay onto a grouped
+    sentence or insert), hides non-canonical sentence members, then weeds prose
+    sentences that are >= WEED_THRESHOLD similar to a kept claim (claim-priority).
     """
+    import os
     from articles.article_store import insert_sentence, update_sentence_post_id
+    GROUP_THRESHOLD = float(os.getenv("VSP_GROUP_THRESHOLD", "0.95"))
+    WEED_THRESHOLD = float(os.getenv("VSP_WEED_THRESHOLD", "0.78"))
 
-    claims = db.execute(sql_text(
-        "SELECT claim_id, claim_text, post_id FROM claim "
-        "WHERE post_id IS NOT NULL ORDER BY post_id"
-    )).fetchall()
+    # resolve topic_key for this article
+    row = db.execute(sql_text(
+        "SELECT topic_key FROM topic_article WHERE article_id = :a"
+    ), {"a": article_id}).fetchone()
+    if not row:
+        logger.info("index: no topic_article for %d", article_id)
+        return
+    topic_key = row[0]
 
-    if not claims:
-        logger.info("No on-chain claims to index")
+    # ── reset is_hidden for this article's sentences (idempotent baseline) ──
+    db.execute(sql_text(
+        "UPDATE article_sentence SET is_hidden = FALSE WHERE section_id IN "
+        "(SELECT section_id FROM article_section WHERE article_id = :a)"
+    ), {"a": article_id})
+    db.commit()
+
+    # ── Stage A: unified grouping (claims + sentences) ──
+    try:
+        from unified_grouping_db import group_topic, make_similar
+        from unified_grouping import KIND_CLAIM, KIND_SENTENCE
+        import unified_grouping as _ug
+        _ug.HIGH_THRESHOLD = GROUP_THRESHOLD  # honor config grouping bar
+        groups = group_topic(db, topic_key)
+    except Exception as e:
+        logger.warning("unified grouping failed for article %d (%s); leaving as-is", article_id, e)
         return
 
-    # Compute the article's summary embedding ONCE for reuse across all
-    # candidate-claim relevance checks below.
-    article_vec = _article_summary_embedding(db, article_id)
-
-    sentences = db.execute(sql_text(
-        "SELECT s.sentence_id, s.text, s.post_id, sec.section_id "
-        "FROM article_sentence s "
-        "JOIN article_section sec ON s.section_id = sec.section_id "
-        "WHERE sec.article_id = :a "
-        "ORDER BY sec.sort_order, s.sort_order"
+    # index existing article sentences by sentence_id for overlay/hide
+    sent_rows = db.execute(sql_text(
+        "SELECT s.sentence_id, s.text, s.post_id, s.section_id "
+        "FROM article_sentence s JOIN article_section sec ON s.section_id = sec.section_id "
+        "WHERE sec.article_id = :a"
     ), {"a": article_id}).fetchall()
+    sent_by_id = {r[0]: {"text": r[1], "post_id": r[2], "section_id": r[3]} for r in sent_rows}
 
-    existing_texts = {r[1].lower().strip() for r in sentences}
-    existing_pids = {r[2] for r in sentences if r[2] is not None}
-
+    hide_ids = set()
+    kept_claim_sids = []   # (sentence_id) of sentences carrying a claim post_id
     indexed_count = 0
 
-    for cid, ctext, pid in claims:
-        ctext_key = ctext.lower().strip()
-
-        if pid in existing_pids:
+    for g in groups:
+        if not g.visible:
+            # whole group hidden -> hide any of its sentence members present
+            for m in g.members:
+                if m.kind == KIND_SENTENCE and m.id in sent_by_id:
+                    hide_ids.add(m.id)
             continue
 
-        # Strategy 1: OVERLAY — find a sentence that semantically matches this claim
-        overlaid = False
-        for sent_id, sent_text, sent_pid, sec_id in sentences:
-            if sent_pid is not None:
-                continue
-            try:
-                matches = find_all_onchain_matches(db, sent_text, top_k=3)
-                for m in matches:
-                    if m["post_id"] == pid and m["similarity"] >= OVERLAY_THRESHOLD:
-                        update_sentence_post_id(db, sent_id, pid)
-                        existing_pids.add(pid)
+        canon = g.canonical
+        # sentence members of this group (present in the article)
+        sent_members = [m for m in g.members if m.kind == KIND_SENTENCE and m.id in sent_by_id]
+
+        if canon.kind == KIND_CLAIM:
+            # find a grouped sentence to overlay the claim onto; else insert
+            target_sid = None
+            for m in sent_members:
+                if sent_by_id[m.id]["post_id"] is None:
+                    target_sid = m.id
+                    break
+            if target_sid is not None:
+                update_sentence_post_id(db, target_sid, canon.id)
+                kept_claim_sids.append(target_sid)
+                indexed_count += 1
+                # hide the OTHER sentence members (grouped dupes)
+                for m in sent_members:
+                    if m.id != target_sid:
+                        hide_ids.add(m.id)
+            else:
+                # no grouped sentence present -> insert the claim into best section
+                try:
+                    from articles.claim_indexer import find_best_section
+                    sec_id = find_best_section(db, article_id, canon.text)
+                    if sec_id is not None:
+                        last = db.execute(sql_text(
+                            "SELECT sentence_id FROM article_sentence WHERE section_id = :s "
+                            "ORDER BY sort_order DESC LIMIT 1"
+                        ), {"s": sec_id}).fetchone()
+                        new_sid = insert_sentence(db, sec_id, last[0] if last else None, canon.text)
+                        update_sentence_post_id(db, new_sid, canon.id)
+                        kept_claim_sids.append(new_sid)
                         indexed_count += 1
-                        overlaid = True
-                        logger.info(
-                            "Overlaid claim post_id=%d onto sentence %d (sim=%.3f): '%s' <-> '%s'",
-                            pid, sent_id, m["similarity"], ctext[:40], sent_text[:40],
-                        )
-                        break
-            except Exception as e:
-                logger.debug("Semantic overlay check failed for sent %d: %s", sent_id, e)
-            if overlaid:
-                break
+                except Exception as e:
+                    logger.warning("insert claim %s failed: %s", canon.id, e)
+                # hide all grouped sentence members (they dup the now-injected claim)
+                for m in sent_members:
+                    hide_ids.add(m.id)
+        else:
+            # sentence-only group: keep canonical sentence, hide the rest
+            ck = canon.id
+            for m in sent_members:
+                if m.id != ck:
+                    hide_ids.add(m.id)
 
-        if overlaid:
-            continue
+    # ── Stage B: claim-priority weeding (prose >= WEED_THRESHOLD to a kept claim) ──
+    try:
+        similar = make_similar()
+        # embeddings for kept-claim sentences + candidate prose sentences
+        def _emb(sid):
+            r = db.execute(sql_text(
+                "SELECT embedding::text FROM article_sentence WHERE sentence_id = :s"
+            ), {"s": sid}).fetchone()
+            if not r or not r[0]:
+                return None
+            v = r[0].strip()
+            return [float(x) for x in v[1:-1].split(",")] if v.startswith("[") else None
+        claim_vecs = [(sid, _emb(sid)) for sid in kept_claim_sids]
+        claim_vecs = [(sid, v) for sid, v in claim_vecs if v is not None]
+        for sid, info in sent_by_id.items():
+            if info["post_id"] is not None or sid in hide_ids:
+                continue  # skip claim-linked or already-hidden
+            pv = _emb(sid)
+            if pv is None:
+                continue
+            for csid, cv in claim_vecs:
+                if csid == sid:
+                    continue
+                if float(similar(pv, cv)) >= WEED_THRESHOLD:
+                    hide_ids.add(sid)
+                    break
+    except Exception as e:
+        logger.warning("weeding pass failed for article %d: %s", article_id, e)
 
-        # Strategy 2: Exact text match already in article but not linked
-        if ctext_key in existing_texts:
-            try:
-                unlinked = db.execute(sql_text(
-                    "SELECT s.sentence_id FROM article_sentence s "
-                    "JOIN article_section sec ON s.section_id = sec.section_id "
-                    "WHERE sec.article_id = :a AND LOWER(TRIM(s.text)) = :t "
-                    "AND s.post_id IS NULL LIMIT 1"
-                ), {"a": article_id, "t": ctext_key}).fetchone()
-                if unlinked:
-                    update_sentence_post_id(db, unlinked[0], pid)
-                    existing_pids.add(pid)
-                    indexed_count += 1
-                    logger.info("Linked existing sentence %d to claim post_id=%d '%s'",
-                                unlinked[0], pid, ctext[:40])
-            except Exception as e:
-                logger.warning("Failed to link existing sentence to post_id=%d: %s", pid, e)
-            continue
-
-        # Strategy 3: INSERT — claim is relevant but no matching sentence exists
-        if not is_claim_relevant_to_article(db, article_id, ctext, article_vec=article_vec):
-            continue
-
-        sec_id = find_best_section(db, article_id, ctext)
-        if sec_id is None:
-            continue
-
-        last_sent = db.execute(sql_text(
-            "SELECT sentence_id FROM article_sentence "
-            "WHERE section_id = :s ORDER BY sort_order DESC LIMIT 1"
-        ), {"s": sec_id}).fetchone()
-
-        after_id = last_sent[0] if last_sent else None
+    # ── apply hides once ──
+    if hide_ids:
         try:
-            new_sid = insert_sentence(db, sec_id, after_id, ctext)
-            update_sentence_post_id(db, new_sid, pid)
-            existing_texts.add(ctext_key)
-            existing_pids.add(pid)
-            indexed_count += 1
-            logger.info("Inserted on-chain claim post_id=%d '%s' into article %d section %d",
-                        pid, ctext[:40], article_id, sec_id)
+            db.execute(sql_text(
+                "UPDATE article_sentence SET is_hidden = TRUE WHERE sentence_id = ANY(:ids)"
+            ), {"ids": list(hide_ids)})
         except Exception as e:
-            logger.warning("Failed to index claim post_id=%d: %s", pid, e)
+            logger.warning("apply hides failed: %s", e)
+    db.commit()
 
-    logger.info("Indexed %d on-chain claims into article %d", indexed_count, article_id)
+    logger.info("unified inject: article %d — injected %d claims, hid %d sentences",
+                article_id, indexed_count, len(hide_ids))
 
 
 def cross_index_claim_into_all_articles(db: Session, claim_text: str, post_id: int):

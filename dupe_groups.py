@@ -23,9 +23,11 @@ from sqlalchemy import text as sql_text
 logger = logging.getLogger(__name__)
 
 # patch05: LLM-verified dedup
-# Three-band similarity decision: >=HIGH bundles directly,
-# [LOW, HIGH) asks the LLM for verification, <LOW skips.
-HIGH_THRESHOLD = 0.85   # cosine similarity for direct bundling (no LLM call)
+# Three-band similarity decision: >=HIGH (0.95) bundles directly,
+# [LOW, HIGH) = [0.65, 0.95) asks the LLM for verification, <LOW skips.
+# HIGH is deliberately tight (near-identical text only) so semantically
+# opposite claims that share vocabulary get LLM-checked, not auto-merged.
+HIGH_THRESHOLD = 0.95   # cosine similarity for direct bundling (no LLM call); raised 0.85->0.95 so opposites-with-shared-vocabulary (~0.91) fall into the LLM-verify band instead of auto-bundling
 LOW_THRESHOLD  = 0.65   # cosine similarity floor for LLM verification
 DUPE_THRESHOLD = HIGH_THRESHOLD  # legacy alias; preserved for any external callers
 

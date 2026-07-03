@@ -256,19 +256,15 @@ def _rebalance_sort_orders(db: Session, section_id: int):
     db.commit()
 
 def refresh_article(db: Session, topic: str) -> bool:
-    """Refresh an article by generating new content and merging it with existing.
+    """Refresh an article: regenerate prose and REPLACE, preserving claim links.
 
-    Preserves all existing sentences (and their on-chain claim links).
-    Only adds new sentences that don't already exist.
-    Returns True if new content was added.
+    Single-source-of-truth refactor. Previously this APPENDED new sentences on
+    every call (accumulating unbounded near-dup prose). Now it replaces the
+    pure-prose sentences with a fresh generation while preserving sentences that
+    carry an on-chain claim link (post_id IS NOT NULL). Dedup is delegated to the
+    unified grouping module (the sole dedup authority), not done inline here.
 
-    Merge strategy:
-      - For each section in the new generation:
-        1. If a matching section (by heading) exists, add new sentences to it
-        2. If no matching section, create a new section
-      - A sentence is "new" if no existing sentence in the article has
-        similar text (fuzzy match by normalized lowercase comparison)
-      - Existing sentences are never deleted or modified
+    Returns True if the article was regenerated.
     """
     from articles.article_gen import generate_article
     from articles.claim_indexer import index_existing_claims_into_article
@@ -277,7 +273,6 @@ def refresh_article(db: Session, topic: str) -> bool:
     article = get_article(db, topic)
     if not article:
         return False
-
     article_id = article["article_id"]
 
     # Generate fresh content
@@ -286,6 +281,7 @@ def refresh_article(db: Session, topic: str) -> bool:
     except Exception as e:
         logger.warning("Article refresh generation failed for '%s': %s", topic, e)
         return False
+
     # Validate: reject if the generated title doesn't match the topic
     gen_title = (fresh.get("title") or "").lower().strip()
     topic_lower = topic.lower().strip()
@@ -293,208 +289,68 @@ def refresh_article(db: Session, topic: str) -> bool:
         logger.warning("Refresh rejected: generated '%s' but expected '%s'", fresh.get("title"), topic)
         return False
 
-    # Build index of existing sentences for dedup
-    existing_texts = set()
-    existing_post_ids = set()
-    for sec in article["sections"]:
-        for sent in sec["sentences"]:
-            existing_texts.add(sent["text"].lower().strip())
-            if sent.get("post_id") is not None:
-                existing_post_ids.add(sent["post_id"])
+    # ── REPLACE, preserving claim-linked sentences ──
+    # Delete only pure-prose sentences (post_id IS NULL). Claim-linked sentences
+    # carry on-chain identity and are preserved; the fresh prose replaces the
+    # rest, so the article cannot accumulate.
+    db.execute(sql_text(
+        "DELETE FROM article_sentence WHERE section_id IN "
+        "(SELECT section_id FROM article_section WHERE article_id = :a) "
+        "AND post_id IS NULL"
+    ), {"a": article_id})
 
-    # Pre-compute embeddings of existing sentences for semantic dedup during refresh
-    _refresh_embeddings = []
-    try:
-        from embedding import embed_batch
-        _existing_texts_list = [t for t in existing_texts if t.strip()]
-        if _existing_texts_list:
-            _refresh_embeddings = embed_batch(list(_existing_texts_list))
-    except Exception as _emb_err:
-        import logging as _lg
-        _lg.getLogger(__name__).debug("Refresh embedding precompute failed: %s", _emb_err)
-
-    # Build index of existing sections (normalized heading -> section_id)
+    # Map existing (kept) sections by normalized heading so we reuse them.
     existing_sections = {}
-    for sec in article["sections"]:
-        h = sec["heading"].lower().strip()
-        existing_sections[h] = sec["section_id"]
-
-    # ── Batch-precompute existing-heading embeddings ONCE (patch06).
-    # The fuzzy-heading match below used to call embed(existing_h)
-    # inside a nested loop, re-embedding the same headings on every
-    # fresh section. Compute them once upfront.
-    _existing_heading_vecs = {}  # normalized heading -> vec
-    try:
-        from embedding import embed_batch as _eb
-        _heading_keys = list(existing_sections.keys())
-        if _heading_keys:
-            _heading_vec_list = _eb(_heading_keys)
-            _existing_heading_vecs = dict(zip(_heading_keys, _heading_vec_list))
-    except Exception as _he:
-        import logging as _lg
-        _lg.getLogger(__name__).debug("Existing-heading embed precompute failed: %s", _he)
-
-    # ── Batch-precompute fresh-sentence embeddings ONCE (patch06).
-    # Was: per-fresh-sentence embed() inside the nested loop. Now one
-    # batched call. Indexed by (fresh_sec_idx, fresh_sent_idx).
-    _fresh_sentence_vecs = {}  # (fs_idx, ss_idx) -> vec
-    try:
-        from embedding import embed_batch as _eb2
-        _fresh_keys = []
-        _fresh_texts = []
-        for _fs_idx, _fs in enumerate(fresh.get("sections", [])):
-            for _ss_idx, _stext in enumerate(_fs.get("sentences", [])):
-                _t = str(_stext).strip()
-                if _t:
-                    _fresh_keys.append((_fs_idx, _ss_idx))
-                    _fresh_texts.append(_t)
-        if _fresh_texts:
-            _fresh_vec_list = _eb2(_fresh_texts)
-            _fresh_sentence_vecs = dict(zip(_fresh_keys, _fresh_vec_list))
-    except Exception as _fe:
-        import logging as _lg
-        _lg.getLogger(__name__).debug("Fresh-sentence embed precompute failed: %s", _fe)
-
-    # ── Batch-precompute fresh-heading embeddings ONCE (patch06) ──
-    _fresh_heading_vecs = {}  # heading_key -> vec
-    try:
-        from embedding import embed_batch as _eb3
-        _fhk = []
-        _fht = []
-        for _fs in fresh.get("sections", []):
-            _hk = (_fs.get("heading") or "").lower().strip()
-            if _hk and _hk not in _fresh_heading_vecs and _hk not in _fhk:
-                _fhk.append(_hk)
-                _fht.append(_hk)
-        if _fht:
-            _fhv = _eb3(_fht)
-            _fresh_heading_vecs = dict(zip(_fhk, _fhv))
-    except Exception as _the:
-        import logging as _lg
-        _lg.getLogger(__name__).debug("Fresh-heading embed precompute failed: %s", _the)
+    for (sec_id, heading) in db.execute(sql_text(
+        "SELECT section_id, heading FROM article_section WHERE article_id = :a"
+    ), {"a": article_id}).fetchall():
+        existing_sections[(heading or "").lower().strip()] = sec_id
 
     added = 0
-
-    for _fs_idx, fresh_sec in enumerate(fresh.get("sections", [])):
+    for fresh_sec in fresh.get("sections", []):
         heading = fresh_sec.get("heading", "")
-        heading_key = heading.lower().strip()
-        new_sents = []
-
-        for _ss_idx, sent_text in enumerate(fresh_sec.get("sentences", [])):
-            text = str(sent_text).strip()
-            if not text:
-                continue
-            norm = text.lower().strip()
-            # Check for near-duplicates: exact match, containment, or semantic similarity
-            is_dup = False
-            for existing in existing_texts:
-                if norm == existing or norm in existing or existing in norm:
-                    is_dup = True
-                    break
-            # Semantic check using precomputed vectors (patch06).
-            if not is_dup and _refresh_embeddings:
-                try:
-                    from similarity import cosine_similarity
-                    new_vec = _fresh_sentence_vecs.get((_fs_idx, _ss_idx))
-                    if new_vec is None:
-                        # Fallback if precompute missed this entry.
-                        from embedding import embed
-                        new_vec = embed(text)
-                    for evec in _refresh_embeddings:
-                        if cosine_similarity(new_vec, evec) >= 0.80:
-                            is_dup = True
-                            break
-                except Exception:
-                    pass
-            if not is_dup:
-                new_sents.append(text)
-
-        if not new_sents:
-            continue
-
-        # Find or create the section (fuzzy match to avoid duplicates)
-        matched_section = None
-        if heading_key in existing_sections:
-            matched_section = existing_sections[heading_key]
-        else:
-            # Try fuzzy heading match using precomputed vectors (patch06).
-            try:
-                from similarity import cosine_similarity
-                h_vec = _fresh_heading_vecs.get(heading_key)
-                if h_vec is None:
-                    from embedding import embed
-                    h_vec = embed(heading_key)
-                best_sim = 0.0
-                for existing_h, sec_id in existing_sections.items():
-                    e_vec = _existing_heading_vecs.get(existing_h)
-                    if e_vec is None:
-                        from embedding import embed
-                        e_vec = embed(existing_h)
-                    sim = cosine_similarity(h_vec, e_vec)
-                    if sim > best_sim:
-                        best_sim = sim
-                        matched_section = sec_id
-                if best_sim < 0.75:
-                    matched_section = None
-            except Exception:
-                pass
-            if not matched_section:
-                # Word overlap fallback
-                h_words = set(heading_key.split()) - {"and", "the", "of", "in", "a", "an"}
-                for existing_h, sec_id in existing_sections.items():
-                    e_words = set(existing_h.split()) - {"and", "the", "of", "in", "a", "an"}
-                    overlap = len(h_words & e_words)
-                    min_len = min(len(h_words), len(e_words))
-                    if min_len > 0 and overlap / min_len >= 0.5 and overlap >= 2:
-                        matched_section = sec_id
-                        break
-        if matched_section:
-            section_id = matched_section
-        else:
-            # Create new section at the end
+        hk = heading.lower().strip()
+        sec_id = existing_sections.get(hk)
+        if sec_id is None:
             max_order = db.execute(sql_text(
                 "SELECT COALESCE(MAX(sort_order), 0) FROM article_section WHERE article_id = :a"
             ), {"a": article_id}).fetchone()[0]
-
             row = db.execute(sql_text(
                 "INSERT INTO article_section (article_id, heading, sort_order) "
                 "VALUES (:a, :h, :so) RETURNING section_id"
             ), {"a": article_id, "h": heading, "so": max_order + 100}).fetchone()
-            section_id = row[0]
-            existing_sections[heading_key] = section_id
-            logger.info("Created new section '%s' for refresh of '%s'", heading, topic)
+            sec_id = row[0]
+            existing_sections[hk] = sec_id
 
-        # Get the last sort_order in this section
+        # append fresh prose after any preserved (claim-linked) sentences
         last = db.execute(sql_text(
             "SELECT MAX(sort_order) FROM article_sentence WHERE section_id = :s"
-        ), {"s": section_id}).fetchone()
+        ), {"s": sec_id}).fetchone()
         sort_order = (last[0] or 0) + 100
-
-        # Insert new sentences at the end of the section
-        for text in new_sents:
+        for sent_text in fresh_sec.get("sentences", []):
+            t = str(sent_text).strip()
+            if not t:
+                continue
             db.execute(sql_text(
                 "INSERT INTO article_sentence (section_id, sort_order, text) "
                 "VALUES (:s, :so, :t)"
-            ), {"s": section_id, "so": sort_order, "t": text})
-            existing_texts.add(text.lower().strip())
+            ), {"s": sec_id, "so": sort_order, "t": t})
             sort_order += 100
             added += 1
 
-    # Update timestamps
     db.execute(sql_text(
         "UPDATE topic_article SET last_refreshed_at = NOW(), updated_at = NOW() "
         "WHERE article_id = :a"
     ), {"a": article_id})
     db.commit()
 
-    if added > 0:
-        logger.info("Refreshed article '%s': added %d new sentences", topic, added)
-        # Re-index existing on-chain claims into the refreshed article
-        try:
-            index_existing_claims_into_article(db, article_id)
-        except Exception as e:
-            logger.warning("Post-refresh claim indexing failed: %s", e)
+    # Re-index on-chain claims into the refreshed article (unchanged).
+    try:
+        index_existing_claims_into_article(db, article_id)
+    except Exception as e:
+        logger.warning("Post-refresh claim indexing failed: %s", e)
 
+    logger.info("Refreshed article '%s': replaced prose with %d fresh sentences", topic, added)
     return added > 0
 
 
@@ -714,330 +570,11 @@ def build_and_cache_response(db_or_factory, topic_key: str):
                 } for r in sents],
             }
 
-        # ── Step 2: Find on-chain claims for this topic ──
-        # Claims associated via article_sentence.post_id OR via topic detection
-        onchain_pids = set()
-        for sec in sections.values():
-            for s in sec["sentences"]:
-                if s["post_id"] is not None:
-                    onchain_pids.add(s["post_id"])
-
-        # Also find claims tagged with this topic but not yet in the article
-        topic_claims = db.execute(sql_text(
-            "SELECT ct.post_id, ct.claim_text, ct.dupe_group_id "
-            "FROM chain_claim_text ct "
-            "JOIN claim c ON c.post_id = ct.post_id "
-            "WHERE LOWER(c.topic) = :t AND ct.post_id IS NOT NULL"
-        ), {"t": key}).fetchall()
-        for r in topic_claims:
-            onchain_pids.add(r[0])
-
-        # Build master claims from dupe groups
-        # master_claims: [{post_id, text, group_id, member_pids, support, challenge, vs}]
-        master_claims = []
-        seen_groups = set()
-        seen_pids = set()
-
-        for pid in onchain_pids:
-            if pid in seen_pids:
-                continue
-            # Check dupe group
-            dg = db.execute(sql_text(
-                "SELECT ct.dupe_group_id, g.canonical_post_id, g.canonical_text, "
-                "       g.total_support, g.total_challenge, g.aggregate_vs, g.member_count "
-                "FROM chain_claim_text ct "
-                "LEFT JOIN claim_dupe_group g ON ct.dupe_group_id = g.group_id "
-                "WHERE ct.post_id = :pid"
-            ), {"pid": pid}).fetchone()
-
-            if dg and dg[0] and dg[0] not in seen_groups and dg[6] and dg[6] > 1:
-                # Multi-member group: use canonical as master
-                group_id = dg[0]
-                seen_groups.add(group_id)
-                # Get all member pids
-                members = db.execute(sql_text(
-                    "SELECT post_id FROM chain_claim_text WHERE dupe_group_id = :gid"
-                ), {"gid": group_id}).fetchall()
-                member_pids = [m[0] for m in members]
-                for mp in member_pids:
-                    seen_pids.add(mp)
-                master_claims.append({
-                    "post_id": dg[1],  # canonical
-                    "text": dg[2],
-                    "group_id": group_id,
-                    "member_pids": member_pids,
-                    "member_count": dg[6],
-                    "support": dg[3] or 0,
-                    "challenge": dg[4] or 0,
-                    "vs": dg[5] or 0,
-                })
-            else:
-                # Singleton or no group
-                seen_pids.add(pid)
-                info = db.execute(sql_text(
-                    "SELECT ct.claim_text, COALESCE(p.support_total,0), "
-                    "       COALESCE(p.challenge_total,0), COALESCE(p.effective_vs,0) "
-                    "FROM chain_claim_text ct "
-                    "LEFT JOIN chain_post p ON ct.post_id = p.post_id "
-                    "WHERE ct.post_id = :pid"
-                ), {"pid": pid}).fetchone()
-                if info:
-                    master_claims.append({
-                        "post_id": pid,
-                        "text": info[0],
-                        "group_id": dg[0] if dg else None,
-                        "member_pids": [pid],
-                        "member_count": 1,
-                        "support": info[1],
-                        "challenge": info[2],
-                        "vs": info[3],
-                    })
-
-        # ── Step 3: For each master, hide similar off-chain, ensure placed ──
-        #
-        # Performance: master_vec and sent_vec are computed ONCE in batched
-        # embed_batch() calls and reused across the master loop. Off-chain
-        # sentence embeddings are cached in article_sentence.embedding so
-        # subsequent rebuilds usually need zero embedding network calls.
-        # Mirrors the persist_dedup() caching pattern. See patch06.
-        try:
-            from embedding import embed, embed_batch
-            from similarity import cosine_similarity
-        except ImportError:
-            embed = None
-            embed_batch = None
-            cosine_similarity = None
-
-        SIMILARITY_THRESHOLD = 0.80
-
-        # Helpers shared with persist_dedup() — pgvector text-format I/O.
-        def _parse_pgvec(s):
-            if s is None:
-                return None
-            s = s.strip()
-            if not s.startswith("[") or not s.endswith("]"):
-                return None
-            try:
-                return [float(x) for x in s[1:-1].split(",")]
-            except (ValueError, TypeError):
-                return None
-
-        def _fmt_pgvec(v):
-            return "[" + ",".join(repr(float(x)) for x in v) + "]"
-
-        # Build sentence_vec_by_id: { sentence_id: list[float] } for every
-        # off-chain sentence in this article. Reads cached embeddings;
-        # batches a single embed_batch() call for any that are missing.
-        sentence_vec_by_id = {}
-        if embed_batch and cosine_similarity:
-            try:
-                rows = db.execute(sql_text(
-                    "SELECT s.sentence_id, s.text, s.embedding::text "
-                    "FROM article_sentence s "
-                    "JOIN article_section sec ON s.section_id = sec.section_id "
-                    "WHERE sec.article_id = :a "
-                    "  AND s.post_id IS NULL "
-                    "  AND s.is_hidden = FALSE"
-                ), {"a": article_id}).fetchall()
-
-                cached = []
-                missing = []
-                for sid, txt, emb_text in rows:
-                    parsed = _parse_pgvec(emb_text)
-                    if parsed is not None:
-                        sentence_vec_by_id[int(sid)] = parsed
-                        cached.append(int(sid))
-                    else:
-                        missing.append((int(sid), str(txt)))
-
-                if missing:
-                    logger.info(
-                        "build_and_cache_response: embedding %d new off-chain sentence(s) for article %d (%d cached)",
-                        len(missing), article_id, len(cached),
-                    )
-                    try:
-                        new_vecs = embed_batch([t for _, t in missing])
-                        for (sid, _t), vec in zip(missing, new_vecs):
-                            sentence_vec_by_id[sid] = vec
-                            try:
-                                db.execute(sql_text(
-                                    "UPDATE article_sentence "
-                                    "SET embedding = (:v)::vector "
-                                    "WHERE sentence_id = :sid"
-                                ), {"v": _fmt_pgvec(vec), "sid": sid})
-                            except Exception as ue:
-                                logger.warning(
-                                    "build_and_cache_response: failed to persist sentence embedding sid=%d: %s",
-                                    sid, ue,
-                                )
-                                db.rollback()
-                        try:
-                            db.commit()
-                        except Exception as ce:
-                            logger.warning(
-                                "build_and_cache_response: commit of cached embeddings failed: %s", ce,
-                            )
-                            db.rollback()
-                    except Exception as be:
-                        # Fallback: per-sentence embed() if batched call failed.
-                        logger.warning(
-                            "build_and_cache_response: embed_batch failed (%s); falling back to per-sentence embed()",
-                            be,
-                        )
-                        if embed:
-                            for sid, t in missing:
-                                try:
-                                    sentence_vec_by_id[sid] = embed(t)
-                                except Exception:
-                                    pass
-            except Exception as e:
-                logger.debug(
-                    "build_and_cache_response: sentence-vec preload failed (%s); per-master embed() fallback active",
-                    e,
-                )
-
-        # Batch-embed all master texts. master_vec_by_pid is in-memory only
-        # (masters are derived from current on-chain state, not cached).
-        master_vec_by_pid = {}
-        if embed_batch and master_claims:
-            try:
-                texts = [m["text"] for m in master_claims]
-                vecs = embed_batch(texts)
-                for m, v in zip(master_claims, vecs):
-                    master_vec_by_pid[int(m["post_id"])] = v
-            except Exception as e:
-                logger.warning(
-                    "build_and_cache_response: batched master embedding failed (%s); falling back to per-master embed()",
-                    e,
-                )
-
-        # Precompute section vectors ONCE for find_best_section reuse
-        # across all unplaced masters in this rebuild. Section content
-        # doesn't change between iterations.
-        section_vec_by_id = {}
-        if embed_batch and sections:
-            try:
-                section_texts_in_order = []
-                section_ids_in_order = []
-                for sec_id, sec_data in sections.items():
-                    sec_text = sec_data["heading"] + ". " + " ".join(
-                        s["text"] for s in sec_data["sentences"][:8]
-                    )
-                    section_ids_in_order.append(sec_id)
-                    section_texts_in_order.append(sec_text)
-                if section_texts_in_order:
-                    sec_vecs = embed_batch(section_texts_in_order)
-                    for sid, v in zip(section_ids_in_order, sec_vecs):
-                        section_vec_by_id[sid] = v
-            except Exception as e:
-                logger.debug(
-                    "build_and_cache_response: section-vec preload failed (%s); find_best_section will self-embed",
-                    e,
-                )
-
-        to_hide_ids = []  # batched UPDATE at the end
-
-        for master in master_claims:
-            mpid = master["post_id"]
-            mtext = master["text"]
-
-            # Check if master is already in the article
-            already_placed = False
-            for sec in sections.values():
-                for s in sec["sentences"]:
-                    if s["post_id"] == mpid:
-                        already_placed = True
-                        break
-                    # Also check if any group member is placed
-                    if s["post_id"] in master["member_pids"]:
-                        already_placed = True
-                        break
-                if already_placed:
-                    break
-
-            # Hide off-chain sentences similar to this master.
-            if cosine_similarity:
-                master_vec = master_vec_by_pid.get(int(mpid))
-                # Per-master fallback if the batched call failed or this
-                # master wasn't included for some reason.
-                if master_vec is None and embed:
-                    try:
-                        master_vec = embed(mtext)
-                    except Exception as e:
-                        logger.debug("Master embedding failed for pid=%d: %s", mpid, e)
-                        master_vec = None
-
-                if master_vec is not None:
-                    for sec in sections.values():
-                        for s in sec["sentences"]:
-                            if s["post_id"] is not None:
-                                continue  # Don't hide on-chain
-                            if s.get("_hidden"):
-                                continue  # Already marked hidden by an earlier master
-                            sid = int(s["sentence_id"])
-                            sent_vec = sentence_vec_by_id.get(sid)
-                            # Per-sentence fallback if the preload missed
-                            # this sentence (e.g. preload was disabled).
-                            if sent_vec is None and embed:
-                                try:
-                                    sent_vec = embed(s["text"])
-                                    sentence_vec_by_id[sid] = sent_vec
-                                except Exception:
-                                    continue
-                            if sent_vec is None:
-                                continue
-                            try:
-                                sim = cosine_similarity(master_vec, sent_vec)
-                            except Exception:
-                                continue
-                            if sim >= SIMILARITY_THRESHOLD:
-                                to_hide_ids.append(sid)
-                                s["_hidden"] = True
-                                logger.debug(
-                                    "Hid off-chain sid=%d (sim=%.2f to master %d)",
-                                    sid, sim, mpid,
-                                )
-
-            # Insert master if not already placed.
-            if not already_placed:
-                from articles.claim_indexer import find_best_section
-                sec_id = find_best_section(
-                    db, article_id, mtext,
-                    section_vec_by_id=section_vec_by_id or None,
-                    claim_vec=master_vec_by_pid.get(int(mpid)),
-                )
-                if sec_id and sec_id in sections:
-                    max_so = max((s["sort_order"] for s in sections[sec_id]["sentences"]), default=0)
-                    new_sid = insert_sentence(db, sec_id, None, mtext)
-                    update_sentence_post_id(db, new_sid, mpid)
-                    sections[sec_id]["sentences"].append({
-                        "sentence_id": new_sid, "sort_order": max_so + 100,
-                        "text": mtext, "post_id": mpid,
-                    })
-                    logger.info("Placed master claim %d in section %d", mpid, sec_id)
-
-        # Single batched UPDATE for hidden sentences (one short write
-        # transaction instead of one per hidden sentence inside the loop).
-        if to_hide_ids:
-            try:
-                # De-duplicate in case multiple masters flagged the same sentence.
-                unique_ids = sorted(set(to_hide_ids))
-                db.execute(sql_text(
-                    "UPDATE article_sentence "
-                    "SET is_hidden = TRUE "
-                    "WHERE sentence_id = ANY(:ids)"
-                ), {"ids": unique_ids})
-                logger.info(
-                    "build_and_cache_response: hid %d off-chain sentence(s) in article %d",
-                    len(unique_ids), article_id,
-                )
-            except Exception as e:
-                logger.warning(
-                    "build_and_cache_response: batched is_hidden UPDATE failed: %s", e,
-                )
-                db.rollback()
-
-        db.commit()
+        # ── Steps 2-3 SKIPPED (unified-sole-authority: skip legacy overlay) ──
+        # index_existing_claims_into_article (unified grouping) is now the sole
+        # authority for claim injection + hiding. Step 1 loaded is_hidden=FALSE
+        # sentences (which it curated); Step 4 renders them directly.
+        pass
 
         # ── Step 4: Rebuild article dict with cleaned data ──
         # Remove hidden sentences and empty sections
@@ -1069,18 +606,26 @@ def build_and_cache_response(db_or_factory, topic_key: str):
                     s["stake_challenge"] = 0
                     s["verity_score"] = 0
 
-                # Add dupe group info for frontend rollup
+                # Add dupe group info for frontend rollup. Emit the canonical
+                # post id + group aggregates so the frontend can (a) keep the
+                # CANONICAL as the group's representative (not first-seen) and
+                # (b) place the whole group by its AGGREGATE stake/VS.
                 if pid and s.get("post_id"):
                     dg_row = db.execute(sql_text(
-                        "SELECT ct.dupe_group_id, g.member_count "
+                        "SELECT ct.dupe_group_id, g.member_count, g.canonical_post_id, "
+                        "       g.total_support, g.total_challenge, g.aggregate_vs "
                         "FROM chain_claim_text ct "
                         "LEFT JOIN claim_dupe_group g ON ct.dupe_group_id = g.group_id "
                         "WHERE ct.post_id = :pid"
                     ), {"pid": pid}).fetchone()
                     if dg_row and dg_row[0]:
                         s["dupe_group_id"] = dg_row[0]
+                        s["dupe_canonical_post_id"] = dg_row[2]
                         if dg_row[1] and dg_row[1] > 1:
                             s["dupe_count"] = dg_row[1]
+                            s["dupe_agg_support"] = dg_row[3] or 0
+                            s["dupe_agg_challenge"] = dg_row[4] or 0
+                            s["dupe_agg_vs"] = dg_row[5] or 0
 
             # Content moderation
             try:
@@ -1294,10 +839,10 @@ def apply_new_post(db_or_factory, post_id: int, claim_text: str):
 
 
 def persist_dedup(db, article_id: int):
-    """Run dedup using batched embeddings and persist decisions via is_hidden.
-    
-    Embeddings cached in article_sentence.embedding (pgvector vector(1536)).
-    Each sentence is embedded at most once across all dedup runs."""
+    """persist_dedup: retired. Unified grouping (index_existing_claims_into_article)
+    is the sole dedup/hide authority now. Kept as a no-op so existing callers
+    (worker.py, main.py) don't break."""
+    return
     import logging
     from sqlalchemy import text as sql_text
     logger = logging.getLogger(__name__)
