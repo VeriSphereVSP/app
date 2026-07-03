@@ -50,13 +50,17 @@ def load_items_for_topic(db: Session, topic_key: str) -> List[Item]:
     ), {"t": topic_key.lower()}).fetchall()
 
     for pid, ctext, emb_txt, support, challenge, vs in claim_rows:
-        items.append(Item(
+        it = Item(
             kind=KIND_CLAIM, id=int(pid), text=ctext or "",
             embedding=_parse_pgvector(emb_txt),
             stake=float(support or 0.0) + float(challenge or 0.0),
             vs=float(vs or 0.0),
             post_id=int(pid),
-        ))
+        )
+        # keep the support/challenge split for claim_dupe_group aggregation
+        it._support = float(support or 0.0)
+        it._challenge = float(challenge or 0.0)
+        items.append(it)
 
     # Sentences for this topic's article (include hidden=FALSE only for display;
     # hidden rows are handled by the store's own dedup, not shown here).
@@ -198,3 +202,71 @@ def _llm_text_verdict(text_a: str, text_b: str, sim: float):
 def group_topic(db: Session, topic_key: str) -> List[Group]:
     items = load_items_for_topic(db, topic_key)
     return group_items(items, similar=make_similar(), equivalent=make_equivalent(db))
+
+
+def load_claims_for_topic(db: Session, topic_key: str) -> List[Item]:
+    """Claims only (no sentences) for a topic — for claim_dupe_group grouping."""
+    return [it for it in load_items_for_topic(db, topic_key) if it.kind == KIND_CLAIM]
+
+
+def group_claims_for_topic(db: Session, topic_key: str) -> List[Group]:
+    """Group ONLY the on-chain claims of a topic (claims-only), so the result
+    maps 1:1 to claim_dupe_group. Uses the same similar/equivalent as everything
+    else, guaranteeing the Claims view matches the Article view."""
+    claims = load_claims_for_topic(db, topic_key)
+    return group_items(claims, similar=make_similar(), equivalent=make_equivalent(db))
+
+
+def rebuild_claim_dupe_groups(db: Session) -> int:
+    """SINGLE SOURCE OF TRUTH: rebuild the claim_dupe_group table from the unified
+    grouping engine (per-topic, claims-only). Both the Claims view (reads
+    claim_dupe_group) and the Article view (reads group_topic) now derive from the
+    same grouping logic + thresholds. Idempotent: fully rebuilds each run.
+
+    Returns the number of groups written.
+    """
+    import os
+    group_threshold = float(os.getenv("VSP_GROUP_THRESHOLD", "0.95"))
+    import unified_grouping as _ug
+    _ug.HIGH_THRESHOLD = group_threshold
+
+    # enumerate topics that have on-chain claims
+    topics = [r[0] for r in db.execute(sql_text(
+        "SELECT DISTINCT LOWER(c.topic) FROM claim c "
+        "JOIN chain_claim_text ct ON ct.claim_text = c.claim_text "
+        "WHERE c.topic IS NOT NULL AND ct.post_id IS NOT NULL"
+    )).fetchall()]
+
+    # clear existing grouping (rebuild cleanly, idempotent)
+    db.execute(sql_text("UPDATE chain_claim_text SET dupe_group_id = NULL"))
+    db.execute(sql_text("DELETE FROM claim_dupe_group"))
+    db.commit()
+
+    written = 0
+    for topic in topics:
+        groups = group_claims_for_topic(db, topic)
+        for g in groups:
+            members = [m for m in g.members if m.kind == KIND_CLAIM]
+            if not members:
+                continue
+            canonical = g.canonical if g.canonical.kind == KIND_CLAIM else members[0]
+            total_support = sum(getattr(m, "_support", 0.0) for m in members)
+            total_challenge = sum(getattr(m, "_challenge", 0.0) for m in members)
+            agg_vs = g.agg_vs if g.claim_anchored else 0.0
+            row = db.execute(sql_text(
+                "INSERT INTO claim_dupe_group "
+                "(canonical_post_id, canonical_text, member_count, "
+                " total_support, total_challenge, aggregate_vs) "
+                "VALUES (:pid, :txt, :mc, :sup, :chal, :vs) RETURNING group_id"
+            ), {
+                "pid": canonical.id, "txt": canonical.text, "mc": len(members),
+                "sup": total_support, "chal": total_challenge, "vs": agg_vs,
+            }).fetchone()
+            gid = row[0]
+            for m in members:
+                db.execute(sql_text(
+                    "UPDATE chain_claim_text SET dupe_group_id = :gid WHERE post_id = :pid"
+                ), {"gid": gid, "pid": m.id})
+            written += 1
+    db.commit()
+    return written

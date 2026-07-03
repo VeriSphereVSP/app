@@ -412,54 +412,18 @@ def get_dupe_group(db: Session, post_id: int) -> Optional[Dict[str, Any]]:
 
 
 def refresh_all_groups(db: Session):
-    """Refresh stats for all groups + reassociate singletons. Run periodically."""
-    groups = db.execute(sql_text(
-        "SELECT group_id FROM claim_dupe_group"
-    )).fetchall()
-    for (gid,) in groups:
-        try:
-            _refresh_group_stats(db, gid)
-        except Exception as e:
-            logger.warning("Failed to refresh group %d: %s", gid, e)
-    db.commit()
+    """Rebuild claim dupe-groups from the UNIFIED grouping engine.
 
-    # patch05: widen candidate window to LOW_THRESHOLD; gate via
-    # _should_bundle. Note we now pull both texts for the LLM call.
-    widest_dist = 1.0 - LOW_THRESHOLD
-    singletons = db.execute(sql_text(
-        "SELECT g.group_id, g.canonical_post_id, "
-        "       (SELECT claim_text FROM chain_claim_text WHERE post_id = g.canonical_post_id) "
-        "FROM claim_dupe_group g WHERE g.member_count = 1"
-    )).fetchall()
-
-    for sg_id, sg_pid, sg_text in singletons:
-        try:
-            match = db.execute(sql_text(
-                "SELECT g.group_id, g.canonical_post_id, "
-                "       (c.embedding <=> (SELECT embedding FROM chain_claim_text WHERE post_id = :pid)) as dist, "
-                "       c.claim_text "
-                "FROM claim_dupe_group g "
-                "JOIN chain_claim_text c ON c.post_id = g.canonical_post_id "
-                "WHERE g.group_id != :sg AND g.member_count > 0 "
-                "AND c.embedding IS NOT NULL "
-                "ORDER BY dist ASC LIMIT 1"
-            ), {"pid": sg_pid, "sg": sg_id}).fetchone()
-
-            if match and match[2] is not None and match[2] <= widest_dist \
-                    and _should_bundle(db, sg_pid, sg_text or "",
-                                        match[1], match[3] or "", match[2]):
-                target_gid = match[0]
-                # Move singleton into the target group
-                db.execute(sql_text(
-                    "UPDATE chain_claim_text SET dupe_group_id = :tgid WHERE post_id = :pid"
-                ), {"tgid": target_gid, "pid": sg_pid})
-                # Delete the empty singleton group
-                db.execute(sql_text(
-                    "DELETE FROM claim_dupe_group WHERE group_id = :sg"
-                ), {"sg": sg_id})
-                _refresh_group_stats(db, target_gid)
-                logger.info("Singleton post_id=%d merged into group %d (dist=%.3f)",
-                            sg_pid, target_gid, match[2])
-        except Exception as e:
-            logger.debug("Singleton reassociation failed for post %d: %s", sg_pid, e)
-    db.commit()
+    unify-claim-groups: delegate to unified engine. The Claims view reads
+    claim_dupe_group and the Article view reads group_topic; both now derive
+    from unified_grouping with one threshold set (VSP_GROUP_THRESHOLD), so the
+    two contexts show identical groupings. Per-topic, deterministic, idempotent.
+    """
+    try:
+        from unified_grouping_db import rebuild_claim_dupe_groups
+        n = rebuild_claim_dupe_groups(db)
+        logger.info("refresh_all_groups (unified): rebuilt %d claim groups", n)
+    except Exception as e:
+        logger.warning("unified claim-group rebuild failed: %s", e)
+        # do NOT fall back to legacy logic — leaving groups as-is is safer than
+        # a divergent second authority recomputing them differently.
