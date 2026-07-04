@@ -295,7 +295,7 @@ def index_existing_claims_into_article(db: Session, article_id: int):
 
     # ── reset is_hidden for this article's sentences (idempotent baseline) ──
     db.execute(sql_text(
-        "UPDATE article_sentence SET is_hidden = FALSE WHERE section_id IN "
+        "UPDATE article_sentence SET is_hidden = FALSE, post_id = NULL WHERE section_id IN "
         "(SELECT section_id FROM article_section WHERE article_id = :a)"
     ), {"a": article_id})
     db.commit()
@@ -406,6 +406,13 @@ def index_existing_claims_into_article(db: Session, article_id: int):
         logger.warning("weeding pass failed for article %d: %s", article_id, e)
 
     # ── apply hides once ──
+    # patch_inject_idem_guard: never hide a sentence that carries a claim
+    # post_id. After the reset (edit 1) clears post_ids, a freshly re-linked
+    # canonical carrier has post_id=None in sent_by_id and can match the
+    # weeding pass; kept_claim_sids is the authoritative carrier set, so drop
+    # those ids from hide_ids before applying. (idempotent: guarded by marker.)
+    hide_ids -= set(kept_claim_sids)
+
     if hide_ids:
         try:
             db.execute(sql_text(
