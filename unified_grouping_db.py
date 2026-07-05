@@ -217,11 +217,43 @@ def group_claims_for_topic(db: Session, topic_key: str) -> List[Group]:
     return group_items(claims, similar=make_similar(), equivalent=make_equivalent(db))
 
 
+def load_all_claims(db: Session) -> List[Item]:
+    """ALL on-chain claims (claims-only), TOPIC-INDEPENDENT — for global dupe grouping.
+
+    patch_group_global: dupe identity is a pure function of the immutable claim set;
+    topic (a fallible, LLM-assigned attribute) must NOT gate whether two claims are the
+    same assertion. Bridges directly on chain_claim_text (post_id + text + embedding) so
+    even claims lacking a `claim` row participate. Stake/VS from chain_post.
+    """
+    rows = db.execute(sql_text(
+        "SELECT ct.post_id, ct.claim_text, ct.embedding::text, "
+        "       p.support_total, p.challenge_total, p.effective_vs "
+        "FROM chain_claim_text ct "
+        "JOIN chain_post p ON p.post_id = ct.post_id "
+        "WHERE ct.post_id IS NOT NULL AND ct.embedding IS NOT NULL"
+    )).fetchall()
+    items: List[Item] = []
+    for pid, ctext, emb_txt, support, challenge, vs in rows:
+        it = Item(
+            kind=KIND_CLAIM, id=int(pid), text=ctext or "",
+            embedding=_parse_pgvector(emb_txt),
+            stake=float(support or 0.0) + float(challenge or 0.0),
+            vs=float(vs or 0.0), post_id=int(pid),
+        )
+        it._support = float(support or 0.0)
+        it._challenge = float(challenge or 0.0)
+        items.append(it)
+    return items
+
+
 def rebuild_claim_dupe_groups(db: Session) -> int:
-    """SINGLE SOURCE OF TRUTH: rebuild the claim_dupe_group table from the unified
-    grouping engine (per-topic, claims-only). Both the Claims view (reads
-    claim_dupe_group) and the Article view (reads group_topic) now derive from the
-    same grouping logic + thresholds. Idempotent: fully rebuilds each run.
+    """SINGLE SOURCE OF TRUTH: rebuild claim_dupe_group GLOBALLY (topic-independent).
+
+    patch_group_global: grouping is ONE global pass over ALL claims — never scoped or
+    sharded by topic — so it matches the incremental assign_to_group (also global) and
+    the periodic path can no longer disagree with the per-claim path. Kept as an explicit
+    repair/backfill tool; steady-state maintenance is the non-destructive straggler sweep.
+    Idempotent.
 
     Returns the number of groups written.
     """
@@ -230,43 +262,39 @@ def rebuild_claim_dupe_groups(db: Session) -> int:
     import unified_grouping as _ug
     _ug.HIGH_THRESHOLD = group_threshold
 
-    # enumerate topics that have on-chain claims
-    topics = [r[0] for r in db.execute(sql_text(
-        "SELECT DISTINCT LOWER(c.topic) FROM claim c "
-        "JOIN chain_claim_text ct ON ct.claim_text = c.claim_text "
-        "WHERE c.topic IS NOT NULL AND ct.post_id IS NOT NULL"
-    )).fetchall()]
-
     # clear existing grouping (rebuild cleanly, idempotent)
     db.execute(sql_text("UPDATE chain_claim_text SET dupe_group_id = NULL"))
     db.execute(sql_text("DELETE FROM claim_dupe_group"))
     db.commit()
 
+    # ONE global pass — no topic enumeration.
+    claims = load_all_claims(db)
+    groups = group_items(claims, similar=make_similar(), equivalent=make_equivalent(db))
+
     written = 0
-    for topic in topics:
-        groups = group_claims_for_topic(db, topic)
-        for g in groups:
-            members = [m for m in g.members if m.kind == KIND_CLAIM]
-            if not members:
-                continue
-            canonical = g.canonical if g.canonical.kind == KIND_CLAIM else members[0]
-            total_support = sum(getattr(m, "_support", 0.0) for m in members)
-            total_challenge = sum(getattr(m, "_challenge", 0.0) for m in members)
-            agg_vs = g.agg_vs if g.claim_anchored else 0.0
-            row = db.execute(sql_text(
-                "INSERT INTO claim_dupe_group "
-                "(canonical_post_id, canonical_text, member_count, "
-                " total_support, total_challenge, aggregate_vs) "
-                "VALUES (:pid, :txt, :mc, :sup, :chal, :vs) RETURNING group_id"
-            ), {
-                "pid": canonical.id, "txt": canonical.text, "mc": len(members),
-                "sup": total_support, "chal": total_challenge, "vs": agg_vs,
-            }).fetchone()
-            gid = row[0]
-            for m in members:
-                db.execute(sql_text(
-                    "UPDATE chain_claim_text SET dupe_group_id = :gid WHERE post_id = :pid"
-                ), {"gid": gid, "pid": m.id})
-            written += 1
+    for g in groups:
+        members = [m for m in g.members if m.kind == KIND_CLAIM]
+        if not members:
+            continue
+        canonical = g.canonical if g.canonical.kind == KIND_CLAIM else members[0]
+        total_support = sum(getattr(m, "_support", 0.0) for m in members)
+        total_challenge = sum(getattr(m, "_challenge", 0.0) for m in members)
+        agg_vs = g.agg_vs if g.claim_anchored else 0.0
+        row = db.execute(sql_text(
+            "INSERT INTO claim_dupe_group "
+            "(canonical_post_id, canonical_text, member_count, "
+            " total_support, total_challenge, aggregate_vs) "
+            "VALUES (:pid, :txt, :mc, :sup, :chal, :vs) RETURNING group_id"
+        ), {
+            "pid": canonical.id, "txt": canonical.text, "mc": len(members),
+            "sup": total_support, "chal": total_challenge, "vs": agg_vs,
+        }).fetchone()
+        gid = row[0]
+        for m in members:
+            db.execute(sql_text(
+                "UPDATE chain_claim_text SET dupe_group_id = :gid WHERE post_id = :pid"
+            ), {"gid": gid, "pid": m.id})
+        written += 1
     db.commit()
     return written
+

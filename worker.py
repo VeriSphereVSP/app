@@ -113,10 +113,10 @@ async def main():
         while True:
             try:
                 from db import get_session_factory
-                from dupe_groups import refresh_all_groups
+                from dupe_groups import sweep_unassigned_groups  # patch_group_global: non-destructive sweep
                 sess = get_session_factory()()
                 try:
-                    refresh_all_groups(sess)
+                    sweep_unassigned_groups(sess)
                 finally:
                     sess.close()
             except Exception as e:

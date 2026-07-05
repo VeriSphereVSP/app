@@ -411,6 +411,31 @@ def get_dupe_group(db: Session, post_id: int) -> Optional[Dict[str, Any]]:
     }
 
 
+def sweep_unassigned_groups(db: Session) -> int:
+    """patch_group_global: non-destructive periodic maintenance. Assign ONLY claims that
+    are embedded but ungrouped (dupe_group_id IS NULL) via assign_to_group (global,
+    incremental). NEVER deletes or re-shards existing groups — this replaces the old
+    destructive per-topic rebuild on the worker's timer, and catches claims that missed
+    incremental assignment (e.g. embedding was null at creation during an outage).
+
+    Returns the number of claims newly assigned.
+    """
+    rows = db.execute(sql_text(
+        "SELECT post_id FROM chain_claim_text "
+        "WHERE embedding IS NOT NULL AND dupe_group_id IS NULL ORDER BY post_id"
+    )).fetchall()
+    n = 0
+    for (pid,) in rows:
+        try:
+            if assign_to_group(db, pid):
+                n += 1
+        except Exception as e:
+            logger.warning("sweep_unassigned_groups: assign failed for post %d: %s", pid, e)
+    if n:
+        logger.info("sweep_unassigned_groups: assigned %d previously-ungrouped claim(s)", n)
+    return n
+
+
 def refresh_all_groups(db: Session):
     """Rebuild claim dupe-groups from the UNIFIED grouping engine.
 
