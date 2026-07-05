@@ -271,6 +271,54 @@ def is_claim_relevant_to_article(
     return False
 
 
+def _ensure_sentence_embeddings(db: Session, article_id: int) -> int:
+    """patch_crosslane_embed: ensure every VISIBLE sentence in the article has an
+    embedding BEFORE grouping/weeding read them. Without this, group_topic cannot overlay
+    a claim onto its matching prose sentence (so the claim is INSERTED as a duplicate) and
+    the Stage-B weeding pass is inert (claim_vecs empty). Replaces the retired persist_dedup
+    embed backfill. Claim sentences reuse the authoritative chain_claim_text embedding
+    (matched by text — reset-independent, no API call); prose is embed_batch'd. Idempotent:
+    fills only NULL embeddings. Returns the count that were missing."""
+    missing = db.execute(sql_text(
+        "SELECT s.sentence_id FROM article_sentence s "
+        "JOIN article_section sec ON s.section_id = sec.section_id "
+        "WHERE sec.article_id = :a AND s.is_hidden = FALSE AND s.embedding IS NULL"
+    ), {"a": article_id}).fetchall()
+    if not missing:
+        return 0
+    # (1) reuse chain_claim_text embeddings for sentences whose text is a known claim
+    db.execute(sql_text(
+        "UPDATE article_sentence AS s SET embedding = ct.embedding "
+        "FROM chain_claim_text ct, article_section sec "
+        "WHERE s.section_id = sec.section_id AND sec.article_id = :a "
+        "AND s.embedding IS NULL AND ct.claim_text = s.text AND ct.embedding IS NOT NULL"
+    ), {"a": article_id})
+    db.commit()
+    # (2) embed the remainder (prose) via the batch embedder
+    rem = db.execute(sql_text(
+        "SELECT s.sentence_id, s.text FROM article_sentence s "
+        "JOIN article_section sec ON s.section_id = sec.section_id "
+        "WHERE sec.article_id = :a AND s.is_hidden = FALSE AND s.embedding IS NULL "
+        "AND s.text IS NOT NULL AND btrim(s.text) <> ''"
+    ), {"a": article_id}).fetchall()
+    reused = len(missing) - len(rem)
+    if rem:
+        try:
+            from embedding import embed_batch
+            vecs = embed_batch([t for _, t in rem])
+            for (sid, _), vec in zip(rem, vecs):
+                db.execute(sql_text(
+                    "UPDATE article_sentence SET embedding = (:v)::vector WHERE sentence_id = :sid"
+                ), {"v": "[" + ",".join(repr(float(x)) for x in vec) + "]", "sid": sid})
+            db.commit()
+        except Exception as e:
+            logger.warning("_ensure_sentence_embeddings: prose embed failed for article %d: %s", article_id, e)
+            db.rollback()
+    logger.info("_ensure_sentence_embeddings: article %d — %d reused from chain_claim_text, %d embedded",
+                article_id, reused, len(rem))
+    return len(missing)
+
+
 def index_existing_claims_into_article(db: Session, article_id: int):
     """unified-sole-authority injection: group_topic drives injection + hiding.
 
@@ -299,6 +347,9 @@ def index_existing_claims_into_article(db: Session, article_id: int):
         "(SELECT section_id FROM article_section WHERE article_id = :a)"
     ), {"a": article_id})
     db.commit()
+
+    # ── patch_crosslane_embed: embed sentences before grouping/weeding read them ──
+    _ensure_sentence_embeddings(db, article_id)
 
     # ── Stage A: unified grouping (claims + sentences) ──
     try:
