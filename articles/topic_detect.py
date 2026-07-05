@@ -45,6 +45,45 @@ def detect_topic(claim_text: str) -> Optional[str]:
         return None
 
 
+def snap_topic(db: Session, post_id: int, threshold: float = None):
+    """Cluster-then-label: return the topic of the nearest ALREADY-topiced claim
+    if the new claim (post_id) is >= threshold cosine-similar to it, else None.
+
+    The grouping engine is scoped per-topic, so near-identical claims MUST share a
+    topic to be compared. Rather than classify each claim independently (which let
+    'Climate' and 'Climate Change' split two 0.98-similar claims), a new claim
+    inherits its nearest neighbour's topic. The new claim's embedding is already in
+    chain_claim_text by the time this runs (embed_claim precedes topic detection in
+    the derived-state worker). Read-only. patch_topic_snap.
+
+    Threshold via VSP_TOPIC_SNAP_THRESHOLD (default 0.95, matching the group bar).
+    """
+    import os as _os
+    if threshold is None:
+        threshold = float(_os.getenv("VSP_TOPIC_SNAP_THRESHOLD", "0.95"))
+    try:
+        row = db.execute(sql_text(
+            "SELECT c.topic, (ctn.embedding <=> cto.embedding) AS dist "
+            "FROM chain_claim_text ctn "
+            "JOIN chain_claim_text cto ON cto.post_id <> ctn.post_id "
+            "JOIN claim c ON c.claim_text = cto.claim_text "
+            "WHERE ctn.post_id = :pid "
+            "  AND ctn.embedding IS NOT NULL AND cto.embedding IS NOT NULL "
+            "  AND c.topic IS NOT NULL AND btrim(c.topic) <> '' "
+            "ORDER BY dist ASC LIMIT 1"
+        ), {"pid": post_id}).fetchone()
+    except Exception as e:
+        logger.warning("snap_topic query failed for post %d: %s", post_id, e)
+        return None
+    if row and row[1] is not None:
+        sim = 1.0 - float(row[1])
+        if sim >= threshold:
+            logger.info("topic snap: post %d inherits topic %r (cosine %.4f >= %.2f)",
+                        post_id, row[0], sim, threshold)
+            return row[0]
+    return None
+
+
 def ensure_article_for_claim(db: Session, claim_text: str, post_id: int, topic: str):
     """Ensure an article exists for the topic and the claim is in it.
     If the article doesn't exist, generates it in a background thread.

@@ -61,13 +61,17 @@ def _do_derived_state(db: Session, post_id: int, queue_kind: str) -> None:
     # ── Topic detection + article skeleton ─────────────────────────
     try:
         from semantic import ensure_claim
-        from articles.topic_detect import detect_topic, ensure_article_for_claim
+        from articles.topic_detect import detect_topic, ensure_article_for_claim, snap_topic  # patch_topic_snap
         cid = ensure_claim(db, claim_text)
         existing = db.execute(sql_text(
             "SELECT topic FROM claim WHERE claim_id = :c"
         ), {"c": cid}).fetchone()
         if not existing or not existing[0]:
-            topic = detect_topic(claim_text)
+            # patch_topic_snap: cluster-then-label. Inherit the topic of a
+            # near-identical existing claim (cosine >= VSP_TOPIC_SNAP_THRESHOLD)
+            # so near-duplicate claims share a topic and can group; fall back to
+            # the LLM classifier only when there is no strong neighbour.
+            topic = snap_topic(db, post_id) or detect_topic(claim_text)
             if topic:
                 db.execute(sql_text(
                     "UPDATE claim SET topic = :t WHERE claim_id = :c"
