@@ -184,7 +184,32 @@ app = FastAPI(  # patch_bundle12_docs_gate
 )
 
 
+# patch_public_hardening: path-scoped permissive CORS for registered public endpoints
+from starlette.middleware.base import BaseHTTPMiddleware as _PubBHM
+from starlette.responses import Response as _PubResp
+import rate_limit as _pub_rl
+
+
+class PublicCORSMiddleware(_PubBHM):
+    """Add permissive CORS to exactly the paths in rate_limit.PUBLIC_CORS_PATHS
+    (browser-extension access). Handles OPTIONS preflight and adds headers to
+    success AND error responses. Leaves all other endpoints same-origin-only."""
+    async def dispatch(self, request, call_next):
+        if request.url.path in _pub_rl.PUBLIC_CORS_PATHS:
+            if request.method == "OPTIONS":
+                resp = _PubResp(status_code=204)
+            else:
+                resp = await call_next(request)
+            resp.headers["Access-Control-Allow-Origin"] = "*"
+            resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+            resp.headers["Access-Control-Allow-Headers"] = "Content-Type, X-API-Key"
+            resp.headers["Access-Control-Max-Age"] = "86400"
+            return resp
+        return await call_next(request)
+
+
 app.add_middleware(RateLimitMiddleware)
+app.add_middleware(PublicCORSMiddleware)  # outermost: wraps rate-limit 429s too
 
 app.include_router(relay_router)
 app.include_router(notifications_router)

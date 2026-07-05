@@ -30,6 +30,7 @@ from db import get_db
 from embedding import embed, embed_batch
 from similarity import cosine_similarity
 from config import EMBEDDINGS_PROVIDER
+from rate_limit import public_endpoint  # patch_public_hardening
 
 logger = logging.getLogger(__name__)
 
@@ -199,18 +200,36 @@ def _mb_to_pgvector(emb) -> str:
     return "[" + ",".join(repr(float(x)) for x in emb) + "]"
 
 
-@router.post("/match-batch")
-def match_batch(body: dict, request: Request, db: Session = Depends(get_db)) -> Dict[str, Any]:
-    """Batch semantic match. Given a list of sentences, return those that have a
-    matching on-chain claim (embedding cosine >= threshold), with the matching
-    post_ids and the dupe-group canonical (for rollup). Read-only — does not create
-    or cache anything.
+def _mb_collapse(matches):
+    """Collapse dupe-group members to ONE match per group (its canonical), keeping the
+    best similarity in the group. Solo claims (no group) pass through. patch_public_hardening."""
+    best = {}
+    order = []
+    for m in matches:
+        gid = m.get("dupe_group_id")
+        canon = m.get("dupe_canonical_post_id")
+        key = ("g", gid) if gid is not None else ("s", m["post_id"])
+        rep = dict(m)
+        if gid is not None and canon is not None:
+            rep["post_id"] = canon
+        if key not in best:
+            best[key] = rep
+            order.append(key)
+        elif m["similarity"] > best[key]["similarity"]:
+            best[key] = rep
+    return [best[k] for k in order]
 
-    Body: {"sentences": [str, ...], "threshold": float=0.85, "top_k": int=3}
-    Response: {"results": [{"index", "sentence", "matches": [{"post_id", "claim_text",
-      "dupe_group_id", "dupe_canonical_post_id", "similarity"}]}], "by_sentence":
-      {sentence: [post_id, ...]}, "threshold", "provider", "matched", "total_input"}
-    Only sentences with >= 1 match appear in results / by_sentence.
+
+@router.post("/match-batch")
+@public_endpoint("/api/claims/match-batch", cost_tier="ai_batch")
+def match_batch(body: dict, request: Request, db: Session = Depends(get_db)) -> Dict[str, Any]:
+    """Batch semantic match. Given sentences, return those with a matching on-chain claim
+    (embedding cosine >= threshold), with matching post_ids + dupe-group canonical.
+    Read-only. Public (CORS + ai_batch sentence budget). Dormant X-API-Key via
+    VSP_MATCH_API_KEYS.
+
+    Body: {"sentences": [str,...], "threshold": float=0.85, "top_k": int=3, "collapse": bool=true}
+    collapse=true (default): one match per dupe group (the canonical). collapse=false: raw members.
     """
     if not _mb_authorized(request):
         raise HTTPException(401, "Invalid or missing X-API-Key")
@@ -239,11 +258,12 @@ def match_batch(body: dict, request: Request, db: Session = Depends(get_db)) -> 
         top_k = min(max(int(body.get("top_k", 3)), 1), 20)
     except (TypeError, ValueError):
         raise HTTPException(400, "top_k must be an integer")
+    collapse = bool(body.get("collapse", True))
 
     provider = EMBEDDINGS_PROVIDER or "stub"
     if provider == "stub":
         return {"results": [], "by_sentence": {}, "threshold": threshold, "provider": "stub",
-                "matched": 0, "total_input": len(clean),
+                "collapse": collapse, "matched": 0, "total_input": len(clean),
                 "note": "Semantic match disabled (stub embeddings)."}
 
     idx_nonempty = [i for i, s in enumerate(clean) if s]
@@ -254,6 +274,7 @@ def match_batch(body: dict, request: Request, db: Session = Depends(get_db)) -> 
         raise HTTPException(503, "Embedding service unavailable")
 
     maxdist = 1.0 - threshold
+    fetch = min(50, max(top_k * 5, top_k))
     results = []
     by_sentence: Dict[str, List[int]] = {}
     for local_i, orig_i in enumerate(idx_nonempty):
@@ -265,15 +286,19 @@ def match_batch(body: dict, request: Request, db: Session = Depends(get_db)) -> 
             "LEFT JOIN claim_dupe_group g ON ct.dupe_group_id = g.group_id "
             "WHERE ct.embedding IS NOT NULL AND (ct.embedding <=> (:q)::vector) <= :maxdist "
             "ORDER BY ct.embedding <=> (:q)::vector LIMIT :k"
-        ), {"q": qv, "maxdist": maxdist, "k": top_k}).fetchall()
+        ), {"q": qv, "maxdist": maxdist, "k": fetch}).fetchall()
         if not rows:
             continue
         matches = [{
             "post_id": r[0], "claim_text": r[1], "dupe_group_id": r[2],
             "dupe_canonical_post_id": r[3], "similarity": round(float(r[4]), 4),
         } for r in rows]
+        if collapse:
+            matches = _mb_collapse(matches)
+        matches = matches[:top_k]
         results.append({"index": orig_i, "sentence": clean[orig_i], "matches": matches})
         by_sentence[clean[orig_i]] = [m["post_id"] for m in matches]
 
     return {"results": results, "by_sentence": by_sentence, "threshold": threshold,
-            "provider": provider, "matched": len(results), "total_input": len(clean)}
+            "provider": provider, "collapse": collapse, "matched": len(results),
+            "total_input": len(clean)}

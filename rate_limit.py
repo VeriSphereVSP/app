@@ -48,6 +48,7 @@ class SlidingWindow:
     def __init__(self):
         # key -> list of timestamps
         self._hits: dict[str, list[float]] = defaultdict(list)
+        self._weighted: dict[str, list] = defaultdict(list)  # patch_public_hardening
 
     def check(self, key: str, max_hits: int, window_seconds: int) -> tuple[bool, int]:
         """Returns (allowed, remaining). Prunes expired entries."""
@@ -61,12 +62,28 @@ class SlidingWindow:
         hits.append(now)
         return True, max_hits - len(hits)
 
+    def check_weighted(self, key: str, weight: int, max_units: int, window_seconds: int) -> tuple[bool, int]:
+        """Meter UNITS (e.g. sentences), not calls. A single call consumes `weight`
+        units. Returns (allowed, remaining_units). patch_public_hardening."""
+        now = time.time()
+        cutoff = now - window_seconds
+        entries = self._weighted[key]
+        entries[:] = [(t, w) for (t, w) in entries if t > cutoff]
+        used = sum(w for _, w in entries)
+        if used + weight > max_units:
+            return False, max(0, max_units - used)
+        entries.append((now, weight))
+        return True, max_units - used - weight
+
     def cleanup(self, max_age: int = 3600):
         """Remove keys with no recent hits. Call periodically."""
         now = time.time()
         dead = [k for k, v in self._hits.items() if not v or v[-1] < now - max_age]
         for k in dead:
             del self._hits[k]
+        deadw = [k for k, v in self._weighted.items() if not v or v[-1][0] < now - max_age]
+        for k in deadw:
+            del self._weighted[k]
 
 
 _limiter = SlidingWindow()
@@ -116,6 +133,16 @@ if TRUSTED_PROXY_HOPS < 0:
 # AI cost budget: max AI calls per day (across all users)
 AI_DAILY_BUDGET = 500
 AI_DAILY_WINDOW = 86400         # 24 hours
+
+# patch_public_hardening: per-SENTENCE (embedding) cost tier — metering embeddings, not
+# calls, is the real denial-of-wallet lever for batch endpoints. Env-tunable.
+AI_BATCH_SENT_LIMIT = _int_env("VSP_AI_BATCH_SENT_LIMIT", 500)     # sentences per window, per IP
+AI_BATCH_SENT_WINDOW = _int_env("VSP_AI_BATCH_SENT_WINDOW", 300)   # seconds
+AI_BATCH_SENT_DAILY = _int_env("VSP_AI_BATCH_SENT_DAILY", 20000)   # sentences per day, global
+
+# Paths that receive permissive (public) CORS via the app's PublicCORSMiddleware.
+# public_endpoint() registers here; the CORS middleware reads it at request time.
+PUBLIC_CORS_PATHS: set = set()
 
 
 # ── Gas budget circuit breaker ─────────────────────────────
@@ -293,6 +320,60 @@ def ai_rate_limit(func):
 
 
 # ── Periodic cleanup (call from a background task) ─────────
+
+def public_endpoint(path: str, cost_tier: str = "cheap"):
+    """Mark an endpoint publicly consumable: register it for permissive CORS and apply
+    the anti-griefing rate/cost tier. patch_public_hardening.
+
+    cost_tier:
+      "ai_batch" — per-IP + global daily SENTENCE budget (weight = len(body['sentences']))
+      "ai"       — per-IP + global daily CALL budget (like ai_rate_limit)
+      "cheap"    — general per-IP middleware limit only
+
+    Router decorator goes ON TOP so FastAPI registers the wrapped function:
+        @router.post("/x")
+        @public_endpoint("/api/.../x", cost_tier="ai_batch")
+        def handler(...): ...
+    """
+    PUBLIC_CORS_PATHS.add(path)
+
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            request = kwargs.get("request")
+            if request is None:
+                for a in args:
+                    if isinstance(a, Request):
+                        request = a
+                        break
+            ip = _client_ip(request) if request is not None else "unknown"
+
+            if cost_tier == "ai_batch":
+                body = kwargs.get("body")
+                n = 1
+                if isinstance(body, dict) and isinstance(body.get("sentences"), list):
+                    n = max(1, len(body["sentences"]))
+                ok_ip, _ = _limiter.check_weighted(f"aibatch:{ip}", n, AI_BATCH_SENT_LIMIT, AI_BATCH_SENT_WINDOW)
+                if not ok_ip:
+                    logger.warning("ai_batch per-IP sentence budget exceeded for %s (n=%d)", ip, n)
+                    raise HTTPException(429, f"Too many sentences. Limit: {AI_BATCH_SENT_LIMIT} per {AI_BATCH_SENT_WINDOW}s.")
+                ok_g, _ = _limiter.check_weighted("aibatch:global:daily", n, AI_BATCH_SENT_DAILY, AI_DAILY_WINDOW)
+                if not ok_g:
+                    logger.warning("ai_batch global daily sentence budget exhausted")
+                    raise HTTPException(503, "Batch match temporarily unavailable — daily budget reached.")
+            elif cost_tier == "ai":
+                ok_ip, _ = _limiter.check(f"ai:{ip}", AI_RATE_LIMIT, AI_RATE_WINDOW)
+                if not ok_ip:
+                    raise HTTPException(429, f"Too many AI requests. Limit: {AI_RATE_LIMIT} per {AI_RATE_WINDOW // 60} minutes.")
+                ok_g, _ = _limiter.check("ai:global:daily", AI_DAILY_BUDGET, AI_DAILY_WINDOW)
+                if not ok_g:
+                    raise HTTPException(503, "AI temporarily unavailable — daily budget reached.")
+            # "cheap": general middleware limit already applies
+
+            return func(*args, **kwargs)
+        return wrapper
+    return decorator
+
 
 def cleanup_rate_limiter():
     """Remove stale entries. Call every ~10 minutes from a background task."""
