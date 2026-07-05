@@ -22,12 +22,12 @@ Thresholds:
 import logging
 from typing import List, Dict, Any, Optional
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request, HTTPException
 from sqlalchemy.orm import Session
 from sqlalchemy import text as sql_text
 
 from db import get_db
-from embedding import embed
+from embedding import embed, embed_batch
 from similarity import cosine_similarity
 from config import EMBEDDINGS_PROVIDER
 
@@ -174,3 +174,106 @@ def check_similar_claims(
         "total_compared": len(rows),
         "provider": provider,
     }
+
+
+# ── patch_match_batch: public batch semantic-match endpoint ──────────────────────
+import os as _mb_os
+
+
+def _mb_limits():
+    return (int(_mb_os.getenv("VSP_MATCH_MAX_SENTENCES", "100")),
+            int(_mb_os.getenv("VSP_MATCH_MAX_CHARS", "2000")))
+
+
+def _mb_authorized(request: Request) -> bool:
+    """Open by default. If VSP_MATCH_API_KEYS is set (comma-separated), require a
+    matching X-API-Key header. 'Open now, add a key later' == set that env var; no
+    code change needed."""
+    keys = [k.strip() for k in _mb_os.getenv("VSP_MATCH_API_KEYS", "").split(",") if k.strip()]
+    if not keys:
+        return True
+    return (request.headers.get("X-API-Key") or "") in keys
+
+
+def _mb_to_pgvector(emb) -> str:
+    return "[" + ",".join(repr(float(x)) for x in emb) + "]"
+
+
+@router.post("/match-batch")
+def match_batch(body: dict, request: Request, db: Session = Depends(get_db)) -> Dict[str, Any]:
+    """Batch semantic match. Given a list of sentences, return those that have a
+    matching on-chain claim (embedding cosine >= threshold), with the matching
+    post_ids and the dupe-group canonical (for rollup). Read-only — does not create
+    or cache anything.
+
+    Body: {"sentences": [str, ...], "threshold": float=0.85, "top_k": int=3}
+    Response: {"results": [{"index", "sentence", "matches": [{"post_id", "claim_text",
+      "dupe_group_id", "dupe_canonical_post_id", "similarity"}]}], "by_sentence":
+      {sentence: [post_id, ...]}, "threshold", "provider", "matched", "total_input"}
+    Only sentences with >= 1 match appear in results / by_sentence.
+    """
+    if not _mb_authorized(request):
+        raise HTTPException(401, "Invalid or missing X-API-Key")
+
+    max_sentences, max_chars = _mb_limits()
+    sentences = body.get("sentences")
+    if not isinstance(sentences, list) or not sentences:
+        raise HTTPException(400, "Body must include a non-empty 'sentences' array")
+    if len(sentences) > max_sentences:
+        raise HTTPException(413, "Too many sentences: %d > %d" % (len(sentences), max_sentences))
+
+    clean = []
+    for i, s in enumerate(sentences):
+        if not isinstance(s, str):
+            raise HTTPException(400, "sentences[%d] is not a string" % i)
+        s2 = s.strip()
+        if len(s2) > max_chars:
+            raise HTTPException(413, "sentences[%d] exceeds %d chars" % (i, max_chars))
+        clean.append(s2)
+
+    try:
+        threshold = min(max(float(body.get("threshold", 0.85)), 0.0), 1.0)
+    except (TypeError, ValueError):
+        raise HTTPException(400, "threshold must be a number")
+    try:
+        top_k = min(max(int(body.get("top_k", 3)), 1), 20)
+    except (TypeError, ValueError):
+        raise HTTPException(400, "top_k must be an integer")
+
+    provider = EMBEDDINGS_PROVIDER or "stub"
+    if provider == "stub":
+        return {"results": [], "by_sentence": {}, "threshold": threshold, "provider": "stub",
+                "matched": 0, "total_input": len(clean),
+                "note": "Semantic match disabled (stub embeddings)."}
+
+    idx_nonempty = [i for i, s in enumerate(clean) if s]
+    try:
+        embs = embed_batch([clean[i] for i in idx_nonempty])
+    except Exception as e:
+        logger.error("match_batch embed failed: %s", e)
+        raise HTTPException(503, "Embedding service unavailable")
+
+    maxdist = 1.0 - threshold
+    results = []
+    by_sentence: Dict[str, List[int]] = {}
+    for local_i, orig_i in enumerate(idx_nonempty):
+        qv = _mb_to_pgvector(embs[local_i])
+        rows = db.execute(sql_text(
+            "SELECT ct.post_id, ct.claim_text, ct.dupe_group_id, g.canonical_post_id, "
+            "       1 - (ct.embedding <=> (:q)::vector) AS sim "
+            "FROM chain_claim_text ct "
+            "LEFT JOIN claim_dupe_group g ON ct.dupe_group_id = g.group_id "
+            "WHERE ct.embedding IS NOT NULL AND (ct.embedding <=> (:q)::vector) <= :maxdist "
+            "ORDER BY ct.embedding <=> (:q)::vector LIMIT :k"
+        ), {"q": qv, "maxdist": maxdist, "k": top_k}).fetchall()
+        if not rows:
+            continue
+        matches = [{
+            "post_id": r[0], "claim_text": r[1], "dupe_group_id": r[2],
+            "dupe_canonical_post_id": r[3], "similarity": round(float(r[4]), 4),
+        } for r in rows]
+        results.append({"index": orig_i, "sentence": clean[orig_i], "matches": matches})
+        by_sentence[clean[orig_i]] = [m["post_id"] for m in matches]
+
+    return {"results": results, "by_sentence": by_sentence, "threshold": threshold,
+            "provider": provider, "matched": len(results), "total_input": len(clean)}
