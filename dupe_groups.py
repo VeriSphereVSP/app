@@ -433,6 +433,21 @@ def sweep_unassigned_groups(db: Session) -> int:
             logger.warning("sweep_unassigned_groups: assign failed for post %d: %s", pid, e)
     if n:
         logger.info("sweep_unassigned_groups: assigned %d previously-ungrouped claim(s)", n)
+
+    # patch_canonical_election: canonical + aggregates are functions of LIVE stake and
+    # must track it ("canonical can change"). Re-run the existing per-group refresher
+    # (re-election + totals + aggregate_vs + bundling ejection) over every group each
+    # cycle — this restores what the old destructive rebuild provided, without touching
+    # membership. LLM cost bounded by the claim_dupe_verdict cache.
+    refreshed = 0
+    for (gid,) in db.execute(sql_text("SELECT group_id FROM claim_dupe_group ORDER BY group_id")).fetchall():
+        try:
+            _refresh_group_stats(db, gid)
+            refreshed += 1
+        except Exception as e:
+            logger.warning("sweep: _refresh_group_stats failed for group %d: %s", gid, e)
+    if refreshed:
+        db.commit()
     return n
 
 
