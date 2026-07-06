@@ -372,6 +372,7 @@ def index_existing_claims_into_article(db: Session, article_id: int):
 
     hide_ids = set()
     kept_claim_sids = []   # (sentence_id) of sentences carrying a claim post_id
+    attached_pids = set()  # patch_canonical_authority: canonicals already attached this run
     indexed_count = 0
 
     for g in groups:
@@ -387,6 +388,23 @@ def index_existing_claims_into_article(db: Session, article_id: int):
         sent_members = [m for m in g.members if m.kind == KIND_SENTENCE and m.id in sent_by_id]
 
         if canon.kind == KIND_CLAIM:
+            # patch_canonical_authority: claim_dupe_group is the SINGLE authority for
+            # which member represents a dupe group. Resolve the article-side pick to
+            # the authoritative canonical (post_id + text); ungrouped -> fall back.
+            _row = db.execute(sql_text(
+                "SELECT g2.canonical_post_id, ct2.claim_text "
+                "FROM chain_claim_text ct "
+                "JOIN claim_dupe_group g2 ON ct.dupe_group_id = g2.group_id "
+                "JOIN chain_claim_text ct2 ON ct2.post_id = g2.canonical_post_id "
+                "WHERE ct.post_id = :p"), {"p": canon.id}).fetchone()
+            canon_pid = _row[0] if _row else canon.id
+            canon_text = _row[1] if (_row and _row[1]) else canon.text
+            if canon_pid in attached_pids:
+                # authoritative canonical already carries a sentence (the article-side
+                # pass split a dupe pair into two groups) -> hide, never double-attach
+                for m in sent_members:
+                    hide_ids.add(m.id)
+                continue
             # find a grouped sentence to overlay the claim onto; else insert
             target_sid = None
             for m in sent_members:
@@ -394,7 +412,8 @@ def index_existing_claims_into_article(db: Session, article_id: int):
                     target_sid = m.id
                     break
             if target_sid is not None:
-                update_sentence_post_id(db, target_sid, canon.id)
+                update_sentence_post_id(db, target_sid, canon_pid)
+                attached_pids.add(canon_pid)
                 kept_claim_sids.append(target_sid)
                 indexed_count += 1
                 # hide the OTHER sentence members (grouped dupes)
@@ -405,14 +424,15 @@ def index_existing_claims_into_article(db: Session, article_id: int):
                 # no grouped sentence present -> insert the claim into best section
                 try:
                     from articles.claim_indexer import find_best_section
-                    sec_id = find_best_section(db, article_id, canon.text)
+                    sec_id = find_best_section(db, article_id, canon_text)
                     if sec_id is not None:
                         last = db.execute(sql_text(
                             "SELECT sentence_id FROM article_sentence WHERE section_id = :s "
                             "ORDER BY sort_order DESC LIMIT 1"
                         ), {"s": sec_id}).fetchone()
-                        new_sid = insert_sentence(db, sec_id, last[0] if last else None, canon.text)
-                        update_sentence_post_id(db, new_sid, canon.id)
+                        new_sid = insert_sentence(db, sec_id, last[0] if last else None, canon_text)
+                        update_sentence_post_id(db, new_sid, canon_pid)
+                        attached_pids.add(canon_pid)
                         kept_claim_sids.append(new_sid)
                         indexed_count += 1
                 except Exception as e:
