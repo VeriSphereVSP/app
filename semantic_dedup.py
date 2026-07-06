@@ -41,57 +41,6 @@ HIGH_THRESHOLD = 0.98   # Warn strongly — only exact text match should block
 MEDIUM_THRESHOLD = 0.85  # Warn — similar claim, user must confirm
 
 
-def _ensure_embedding_column(db: Session) -> bool:
-    """Check if chain_claim_text has an embedding column. Returns True if it does."""
-    try:
-        db.execute(sql_text(
-            "SELECT embedding FROM chain_claim_text LIMIT 0"
-        ))
-        return True
-    except Exception:
-        db.rollback()
-        return False
-
-
-def _get_claim_embedding(db: Session, post_id: int, claim_text: str, has_col: bool) -> Optional[List[float]]:
-    """Get or compute embedding for a claim. Caches in DB if column exists."""
-    if has_col:
-        try:
-            row = db.execute(sql_text(
-                "SELECT embedding FROM chain_claim_text WHERE post_id = :pid"
-            ), {"pid": post_id}).fetchone()
-            if row and row[0] is not None:
-                emb = row[0]
-                if isinstance(emb, str):
-                    import json
-                    return json.loads(emb)
-                if isinstance(emb, list):
-                    return emb
-                return list(emb)
-        except Exception:
-            pass
-
-    # Compute and cache
-    try:
-        emb = embed(claim_text)
-    except Exception as e:
-        logger.warning("Embedding failed for post %d: %s", post_id, e)
-        return None
-
-    if has_col and emb:
-        try:
-            import json
-            db.execute(sql_text(
-                "UPDATE chain_claim_text SET embedding = :emb WHERE post_id = :pid"
-            ), {"pid": post_id, "emb": json.dumps(emb)})
-            db.commit()
-        except Exception as e:
-            db.rollback()
-            logger.debug("Failed to cache embedding for post %d: %s", post_id, e)
-
-    return emb
-
-
 @router.get("/check-similar")
 @public_endpoint("/api/claims/check-similar", cost_tier="ai")
 def check_similar_claims(
