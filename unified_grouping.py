@@ -12,7 +12,9 @@ Rules (authoritative — see DESIGN-unified-dedup.md):
       stake/VS. Sentences render neutral; they never carry stake/VS.
   R2. Sentences NEVER appear in the disputed lane.
   R3. A claim is NEVER rolled up under a sentence. If a group contains any
-      claim, the canonical is a claim (the top-staked one).
+      claim, the canonical is a claim — the top-EFFECT one, effect = (support +
+      challenge) x |VS| / 100, raw stake as tiebreak (ruling 2026-07-06; matches
+      _refresh_group_stats, which re-elects every sweep cycle).
   R4. Grouping is precision-first: exact text always groups; cosine >= HIGH
       auto-groups; [LOW, HIGH) defers to the injected LLM verifier; < LOW never
       groups. (Opposites-with-shared-vocabulary land in the LLM band and are
@@ -125,11 +127,13 @@ class _DSU:
 
 def _pick_canonical(members: List[Item]) -> Item:
     """R3: a claim is never rolled under a sentence.
-    claim-anchored -> top-staked claim (tie: higher VS, then lowest id).
+    claim-anchored -> top-EFFECT claim, effect = stake x |vs| / 100 (ruling
+    2026-07-06, matching _refresh_group_stats); raw stake breaks ties — which
+    also subsumes the all-effects-zero fallback — then lowest id.
     sentence-only  -> most complete sentence (longest text, then lowest id)."""
     claims = [m for m in members if m.is_claim]
     if claims:
-        return sorted(claims, key=lambda c: (-c.stake, -c.vs, c.id))[0]
+        return sorted(claims, key=lambda c: (-(c.stake * abs(c.vs) / 100.0), -c.stake, c.id))[0]
     return sorted(members, key=lambda s: (-len(s.text or ""), s.id))[0]
 
 

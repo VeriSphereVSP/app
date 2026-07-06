@@ -713,17 +713,25 @@ def detect_topic_endpoint(req: DetectTopicRequest, db: Session = Depends(get_db)
     """Auto-detect topic for a standalone claim, store the association,
     and trigger background article generation if needed.
     Returns immediately with the detected topic."""
-    from articles.topic_detect import detect_topic, ensure_article_for_claim
+    from articles.topic_detect import detect_topic, ensure_article_for_claim, snap_topic
 
-    topic = detect_topic(req.claim_text)
+    # patch_detect_topic_fix: cluster-then-label here too — inherit a near-identical
+    # existing claim's topic (>= snap threshold) so near-dup claims share article
+    # placement; LLM detect only when there is no strong neighbour. snap_topic returns
+    # None gracefully if this claim's embedding isn't computed yet.
+    topic = snap_topic(db, req.post_id) or detect_topic(req.claim_text)
     if not topic:
         return {"topic": None, "status": "detection_failed"}
 
     # Store topic association in the claim table
     try:
+        # keyed by claim_text (claim.post_id is NULL in practice -> the old
+        # UPDATE silently matched 0 rows); only-if-empty mirrors the worker's guard
+        # so this endpoint never overwrites an established topic.
         db.execute(sql_text(
-            "UPDATE claim SET topic = :t WHERE post_id = :pid"
-        ), {"t": topic, "pid": req.post_id})
+            "UPDATE claim SET topic = :t "
+            "WHERE claim_text = :ct AND (topic IS NULL OR btrim(topic) = '')"
+        ), {"t": topic, "ct": req.claim_text})
         db.commit()
     except Exception:
         try:
