@@ -299,18 +299,38 @@ def refresh_article(db: Session, topic: str) -> bool:
         "AND post_id IS NULL"
     ), {"a": article_id})
 
-    # Map existing (kept) sections by normalized heading so we reuse them.
-    existing_sections = {}
-    for (sec_id, heading) in db.execute(sql_text(
-        "SELECT section_id, heading FROM article_section WHERE article_id = :a"
-    ), {"a": article_id}).fetchall():
-        existing_sections[(heading or "").lower().strip()] = sec_id
+    # patch_refresh_sections: match existing sections to fresh ones by FUZZY heading so
+    # LLM heading drift ("Observable" vs "Observed") REUSES the section instead of
+    # orphaning it. Threshold via VSP_HEADING_MATCH_THRESHOLD (default 0.8).
+    import difflib
+    import os as _os
+    _HEADING_MATCH = float(_os.getenv("VSP_HEADING_MATCH_THRESHOLD", "0.8"))
+    _existing = [
+        (sec_id, (heading or "").lower().strip())
+        for (sec_id, heading) in db.execute(sql_text(
+            "SELECT section_id, heading FROM article_section WHERE article_id = :a"
+        ), {"a": article_id}).fetchall()
+    ]
+    _used_secs = set()
+
+    def _match_section(hk):
+        for sid, ek in _existing:            # exact first
+            if sid not in _used_secs and ek and ek == hk:
+                return sid
+        best, best_r = None, 0.0             # fuzzy fallback
+        for sid, ek in _existing:
+            if sid in _used_secs or not ek:
+                continue
+            r = difflib.SequenceMatcher(None, ek, hk).ratio()
+            if r > best_r:
+                best, best_r = sid, r
+        return best if best_r >= _HEADING_MATCH else None
 
     added = 0
     for fresh_sec in fresh.get("sections", []):
         heading = fresh_sec.get("heading", "")
         hk = heading.lower().strip()
-        sec_id = existing_sections.get(hk)
+        sec_id = _match_section(hk)
         if sec_id is None:
             max_order = db.execute(sql_text(
                 "SELECT COALESCE(MAX(sort_order), 0) FROM article_section WHERE article_id = :a"
@@ -320,7 +340,14 @@ def refresh_article(db: Session, topic: str) -> bool:
                 "VALUES (:a, :h, :so) RETURNING section_id"
             ), {"a": article_id, "h": heading, "so": max_order + 100}).fetchone()
             sec_id = row[0]
-            existing_sections[hk] = sec_id
+            _existing.append((sec_id, hk))
+            _used_secs.add(sec_id)
+        else:
+            _used_secs.add(sec_id)
+            # refresh the reused section's heading to the fresh wording
+            db.execute(sql_text(
+                "UPDATE article_section SET heading = :h WHERE section_id = :s"
+            ), {"h": heading, "s": sec_id})
 
         # append fresh prose after any preserved (claim-linked) sentences
         last = db.execute(sql_text(
@@ -337,6 +364,13 @@ def refresh_article(db: Session, topic: str) -> bool:
             ), {"s": sec_id, "so": sort_order, "t": t})
             sort_order += 100
             added += 1
+
+    # patch_refresh_sections: prune orphan sections left empty by heading drift
+    # (no prose, no claim-linked sentence). Claim-bearing sections are never empty.
+    db.execute(sql_text(
+        "DELETE FROM article_section sec WHERE sec.article_id = :a "
+        "AND NOT EXISTS (SELECT 1 FROM article_sentence s WHERE s.section_id = sec.section_id)"
+    ), {"a": article_id})
 
     db.execute(sql_text(
         "UPDATE topic_article SET last_refreshed_at = NOW(), updated_at = NOW() "
