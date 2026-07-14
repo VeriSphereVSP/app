@@ -178,6 +178,14 @@ _ERC20_TRANSFER_ABI = [
     {"inputs": [{"name": "to", "type": "address"}, {"name": "value", "type": "uint256"}],
      "name": "transfer", "outputs": [{"name": "", "type": "bool"}],
      "stateMutability": "nonpayable", "type": "function"},
+    # patch_sweep_transferfrom: sweep moves the MM's USDC under a bounded allowance
+    {"inputs": [{"name": "from", "type": "address"}, {"name": "to", "type": "address"},
+                {"name": "value", "type": "uint256"}],
+     "name": "transferFrom", "outputs": [{"name": "", "type": "bool"}],
+     "stateMutability": "nonpayable", "type": "function"},
+    {"inputs": [{"name": "owner", "type": "address"}, {"name": "spender", "type": "address"}],
+     "name": "allowance", "outputs": [{"name": "", "type": "uint256"}],
+     "stateMutability": "view", "type": "function"},
 ]
 
 USDC_DECIMALS = 6
@@ -236,6 +244,21 @@ class Chain:
     def transfer_usdc(self, to: str, amount_micro: int) -> str:
         tx = self.usdc.functions.transfer(
             Web3.to_checksum_address(to), int(amount_micro)
+        ).build_transaction({
+            "from": self.tw.account.address,
+            "nonce": self.w3.eth.get_transaction_count(self.tw.account.address, "pending"),
+        })
+        return self.tw.sign_and_send(tx)
+
+    # patch_sweep_transferfrom: the sweep moves USDC out of the MM hot wallet under
+    # a bounded ERC-20 allowance the MM granted this worker. Amount-source
+    # (balanceOf(MM)) and funds-source (transferFrom(MM, ...)) finally agree.
+    def mm_usdc_allowance_micro(self) -> int:
+        return int(self.usdc.functions.allowance(self.mm, self.tw.account.address).call())
+
+    def sweep_usdc_from_mm(self, to: str, amount_micro: int) -> str:
+        tx = self.usdc.functions.transferFrom(
+            self.mm, Web3.to_checksum_address(to), int(amount_micro)
         ).build_transaction({
             "from": self.tw.account.address,
             "nonce": self.w3.eth.get_transaction_count(self.tw.account.address, "pending"),
@@ -384,16 +407,33 @@ def run_once(chain: Chain, cap_cache: TtlCache, floor_cache: TtlCache,
                               amount_usdc=amount / MICRO, floor=floor_price,
                               usdc_target=usdc_bands["usdc_target_usd"])
                     else:
-                        try:
-                            tx = chain.transfer_usdc(startup_sweep_dest, amount)
-                            alert("sweep", f"swept {amount / MICRO:.2f} USDC -> COLD_RESERVE",
-                                  amount_usdc=amount / MICRO, tx=tx,
-                                  floor=floor_price,
-                                  usdc_target=usdc_bands["usdc_target_usd"])
-                        except chain.tw.TxRevertedError as e:
-                            alert("sweep_reverted", f"sweep tx reverted: {e}", tx_hash=e.tx_hash)
-                        except Exception as e:
-                            alert("sweep_failed", f"sweep failed: {e}")
+                        # patch_sweep_transferfrom: clamp to the MM->worker allowance;
+                        # a missing allowance alerts instead of reverting on-chain.
+                        allowance = chain.mm_usdc_allowance_micro()
+                        if allowance <= 0:
+                            alert("sweep_skipped_no_allowance",
+                                  "MM has not approved the worker for USDC transferFrom; "
+                                  "run the approve step (see MM-CUTOVER-RUNBOOK.md)",
+                                  needed_usdc=amount / MICRO)
+                            amount = 0
+                        elif amount > allowance:
+                            alert("sweep_clamped_by_allowance",
+                                  f"sweep clamped {amount / MICRO:.2f} -> {allowance / MICRO:.2f} USDC by allowance",
+                                  requested_usdc=amount / MICRO, allowance_usdc=allowance / MICRO)
+                            amount = allowance
+                        if amount <= 0:
+                            pass
+                        else:
+                            try:
+                                tx = chain.sweep_usdc_from_mm(startup_sweep_dest, amount)
+                                alert("sweep", f"swept {amount / MICRO:.2f} USDC -> COLD_RESERVE",
+                                      amount_usdc=amount / MICRO, tx=tx,
+                                      floor=floor_price,
+                                      usdc_target=usdc_bands["usdc_target_usd"])
+                            except chain.tw.TxRevertedError as e:
+                                alert("sweep_reverted", f"sweep tx reverted: {e}", tx_hash=e.tx_hash)
+                            except Exception as e:
+                                alert("sweep_failed", f"sweep failed: {e}")
 
     # ── MINT VSP if MM too low ──
     if mint_on and mm_vsp < bands["band_min_wei"]:

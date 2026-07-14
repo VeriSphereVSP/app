@@ -80,6 +80,12 @@ def _do_derived_state(db: Session, post_id: int, queue_kind: str) -> None:
                 # is (db, claim_text, post_id, topic) — 4 args. Previous call
                 # passed only 3 and broke every new-claim topic-detect.
                 ensure_article_for_claim(db, claim_text, post_id, topic)
+        # patch_assoc_ingest: guarantee >=1 claim_topic association at ingest (Build A)
+        try:
+            from articles.topic_reconciler import associate_one
+            associate_one(db, cid)
+        except Exception as _ae:
+            logger.warning("associate_one failed for post %d: %s", post_id, _ae)
         db.commit()
     except Exception as e:
         logger.warning("derived_state_worker: topic detection failed for post %d: %s", post_id, e)

@@ -494,6 +494,15 @@ def preview_sell(qty_vsp: float, db: Session = Depends(get_db)):
         "breakdown": fee["breakdown"],
     }
 
+# patch_killswitch_mm_halt: runtime trading-halt guard. Trip by creating the flag file
+# (default /control/mm_trading.halt); mm_buy/mm_sell return 503 while it
+# exists. Read-only endpoints (quote/floor/preview) stay up during a halt.
+def _mm_halt_guard() -> None:
+    _flag = os.getenv("MM_HALT_FLAG_PATH", "/control/mm_trading.halt")
+    if os.path.exists(_flag):
+        raise HTTPException(503, "MM trading is temporarily halted")
+
+
 @router.post("/buy", dependencies=[Depends(require_service_token)])
 def mm_buy(req: MMBuyRequest, db: Session = Depends(get_db)):
     """
@@ -501,6 +510,7 @@ def mm_buy(req: MMBuyRequest, db: Session = Depends(get_db)):
     If permit is provided, MM executes USDC.permit() first (gasless for user).
     Otherwise, falls back to checking existing allowance.
     """
+    _mm_halt_guard()  # patch_killswitch_mm_halt
     try:
         with db.begin():
             row = _load_mm_state(db, for_update=True)
@@ -630,6 +640,7 @@ def mm_sell(req: MMSellRequest, db: Session = Depends(get_db)):
     If permit is provided, MM executes VSP.permit() first (gasless for user).
     Otherwise, falls back to checking existing allowance.
     """
+    _mm_halt_guard()  # patch_killswitch_mm_halt
     try:
         with db.begin():
             row = _load_mm_state(db, for_update=True)

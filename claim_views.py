@@ -227,13 +227,39 @@ def claims_fast(limit: int = 500, include_links: bool = True, db: Session = Depe
         vs_abs = abs(p.get("verity_score", 0)) / 100.0
         controversy = total * (1 - vs_abs)
         
-        # Find topic
-        topic_row = db.execute(sql_text(
-            "SELECT ta.topic_key FROM article_sentence s "
-            "JOIN article_section sec ON s.section_id = sec.section_id "
-            "JOIN topic_article ta ON sec.article_id = ta.article_id "
-            "WHERE s.post_id = :pid LIMIT 1"
-        ), {"pid": p["post_id"]}).fetchone()
+        # Find topic — patch_2a_readflip: claim_topic (m2m) primary first,
+        # full set in topics_list; legacy paths below are the un-healed fallback.
+        _ct = db.execute(sql_text(
+            "SELECT t.label FROM claim_topic ct "
+            "JOIN topic t ON t.topic_id = ct.topic_id "
+            "JOIN claim c ON c.claim_id = ct.claim_id "
+            "JOIN chain_claim_text x ON x.claim_text = c.claim_text "
+            "WHERE x.post_id = :pid ORDER BY ct.is_primary DESC, t.label"
+        ), {"pid": p["post_id"]}).fetchall()
+        topics_list = [r[0] for r in _ct]
+        topic_row = (topics_list[0],) if topics_list else None
+        # patch_link_topic: links have no claim_topic of their own -> inherit the
+        # target (then source) claim's m2m topics. Target primary shown first.
+        if not topics_list:
+            _lt = db.execute(sql_text(
+                "SELECT t.label FROM chain_link l "
+                "JOIN chain_claim_text x ON x.post_id IN (l.to_post_id, l.from_post_id) "
+                "JOIN claim c ON c.claim_text = x.claim_text "
+                "JOIN claim_topic ct ON ct.claim_id = c.claim_id "
+                "JOIN topic t ON t.topic_id = ct.topic_id "
+                "WHERE l.link_post_id = :pid "
+                "ORDER BY (x.post_id = l.to_post_id) DESC, ct.is_primary DESC, t.label"
+            ), {"pid": p["post_id"]}).fetchall()
+            _seen = set()
+            topics_list = [r[0] for r in _lt if not (r[0] in _seen or _seen.add(r[0]))]
+            topic_row = (topics_list[0],) if topics_list else None
+        if not topic_row:
+            topic_row = db.execute(sql_text(
+                "SELECT ta.topic_key FROM article_sentence s "
+                "JOIN article_section sec ON s.section_id = sec.section_id "
+                "JOIN topic_article ta ON sec.article_id = ta.article_id "
+                "WHERE s.post_id = :pid LIMIT 1"
+            ), {"pid": p["post_id"]}).fetchone()
         if not topic_row:
             topic_row = db.execute(sql_text(
                 "SELECT topic FROM claim WHERE post_id = :pid AND topic IS NOT NULL LIMIT 1"
@@ -270,6 +296,7 @@ def claims_fast(limit: int = 500, include_links: bool = True, db: Session = Depe
             "incoming_links": len(incoming),
             "outgoing_links": len(outgoing),
             "topic": topic_row[0] if topic_row else None,
+            "topics": topics_list if topics_list else ([topic_row[0]] if topic_row else []),  # patch_2a_readflip
             "created_at": None,
             "created_epoch": p.get("created_epoch"),
         }

@@ -11,4 +11,9 @@ sqlalchemy
 numpy
 requests>=2.31.0
 uvicorn
-web3>=6.0.0pycryptodome
+web3>=6.0.0
+pycryptodome
+google-cloud-kms
+eth-account
+ecdsa
+rlp
