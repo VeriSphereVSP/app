@@ -140,6 +140,51 @@ AI_BATCH_SENT_LIMIT = _int_env("VSP_AI_BATCH_SENT_LIMIT", 500)     # sentences p
 AI_BATCH_SENT_WINDOW = _int_env("VSP_AI_BATCH_SENT_WINDOW", 300)   # seconds
 AI_BATCH_SENT_DAILY = _int_env("VSP_AI_BATCH_SENT_DAILY", 20000)   # sentences per day, global
 
+# patch_postreview_mm_trade_limit: anti-griefing limits for the MM money
+# endpoints (/api/mm/buy|sell). These endpoints cannot steal (they need the
+# user's own funds + permit) but each accepted trade costs the MM settlement
+# gas, so with no per-caller cap they are a gas-drain accelerator (F-4,
+# LAUNCH-RISK-AUDIT 2026-07-06 §3.2). Deliberately NOT public_endpoint(): the
+# money routes stay same-origin (no permissive CORS) — this is only the
+# rate/cost tier. NOTE dev topology: on the dev box all browser traffic
+# arrives from the one Vite-proxy container IP, so the per-IP bucket is
+# shared there (same caveat as GENERAL_RATE_LIMIT) — the per-address bucket
+# still distinguishes users; raise the *_IP limit via env on dev if needed.
+MM_TRADE_LIMIT_IP = _int_env("VSP_MM_TRADE_LIMIT_IP", 20)        # trades per window, per IP
+MM_TRADE_LIMIT_ADDR = _int_env("VSP_MM_TRADE_LIMIT_ADDR", 10)    # trades per window, per address
+MM_TRADE_WINDOW = _int_env("VSP_MM_TRADE_WINDOW", 60)            # seconds
+MM_TRADE_DAILY_GLOBAL = _int_env("VSP_MM_TRADE_DAILY_GLOBAL", 5000)  # trades per day, all callers
+
+
+def check_mm_trade(ip: str, user_address: str) -> None:
+    """Per-IP + per-address sliding-window limits and a global daily circuit
+    breaker for the MM money endpoints. Call at the TOP of mm_buy/mm_sell,
+    before any DB or chain work. Raises HTTPException (429/503) on breach.
+    patch_postreview_mm_trade_limit."""
+    addr = (user_address or "").strip().lower()
+    ok_ip, _ = _limiter.check(f"mmtrade:ip:{ip}", MM_TRADE_LIMIT_IP, MM_TRADE_WINDOW)
+    if not ok_ip:
+        logger.warning("MM trade rate limit (IP) exceeded for %s", ip)
+        raise HTTPException(
+            429,
+            f"Too many trades from this IP. Limit: {MM_TRADE_LIMIT_IP} per {MM_TRADE_WINDOW}s.",
+        )
+    ok_addr, _ = _limiter.check(f"mmtrade:addr:{addr}", MM_TRADE_LIMIT_ADDR, MM_TRADE_WINDOW)
+    if not ok_addr:
+        logger.warning("MM trade rate limit (address) exceeded for %s", addr)
+        raise HTTPException(
+            429,
+            f"Too many trades from this address. Limit: {MM_TRADE_LIMIT_ADDR} per {MM_TRADE_WINDOW}s.",
+        )
+    ok_g, _ = _limiter.check("mmtrade:global:daily", MM_TRADE_DAILY_GLOBAL, AI_DAILY_WINDOW)
+    if not ok_g:
+        logger.warning("MM global daily trade budget exhausted")
+        raise HTTPException(
+            503,
+            "MM trading temporarily unavailable — daily trade budget reached. Try again tomorrow.",
+        )
+
+
 # Paths that receive permissive (public) CORS via the app's PublicCORSMiddleware.
 # public_endpoint() registers here; the CORS middleware reads it at request time.
 PUBLIC_CORS_PATHS: set = set()
@@ -165,15 +210,22 @@ def check_mm_balance() -> bool:
         from config import MM_ADDRESS
         from web3 import Web3
 
-        balance = w3.eth.get_balance(Web3.to_checksum_address(MM_ADDRESS))
+        # patch_postreview_relay_gas_breaker: since the relay-key separation
+        # (#298, 2026-06-09) the RELAY wallet pays meta-tx gas, not the MM —
+        # but this breaker still watched MM_ADDRESS, so it could neither trip
+        # when the relay ran dry nor stay quiet when only the MM was low.
+        # Watch the wallet that actually pays; fall back to MM_ADDRESS only
+        # if RELAY_ADDRESS is unset (pre-separation behavior).
+        _gas_payer = os.getenv("RELAY_ADDRESS", "").strip() or MM_ADDRESS
+        balance = w3.eth.get_balance(Web3.to_checksum_address(_gas_payer))
         _mm_balance_ok = balance >= MIN_MM_AVAX_WEI
         _last_balance_check = now
 
         if not _mm_balance_ok:
             logger.warning(
-                "MM wallet AVAX balance critically low: %s wei (min: %s). "
+                "Relay gas wallet (%s) AVAX balance critically low: %s wei (min: %s). "
                 "Relay is paused.",
-                balance, MIN_MM_AVAX_WEI,
+                _gas_payer, balance, MIN_MM_AVAX_WEI,
             )
         return _mm_balance_ok
     except Exception as e:

@@ -256,6 +256,27 @@ async def main():
     asyncio.create_task(_balance_sampler())
     print("balance sampler scheduled", flush=True)
 
+    # patch_f7rg_reconcile_task: F-7 partial-trade reconciler. Finds trades where
+    # one leg landed but a later leg failed, and completes-forward or refunds-back
+    # (fund movement gated by MM_RECONCILE_ENABLED, default ON). try/except INSIDE
+    # the loop so one bad pass can't kill the task. Interval independent of the
+    # sampler so cure latency is tunable without touching metrics cadence.
+    async def _mm_reconcile_loop():
+        await asyncio.sleep(60)  # let startup settle; after the sampler's 45s
+        import os as _os
+        from mm import mm_reconcile as _mr
+        _interval = int(_os.getenv("MM_RECONCILE_INTERVAL_SEC", "120"))
+        while True:
+            try:
+                _res = _mr.reconcile_once()
+                if _res and any(_res.get(k) for k in ("reconciled", "refunded", "failed")):
+                    print(f"mm-reconcile: {_res}", flush=True)
+            except Exception as _e:
+                print(f"mm-reconcile error: {_e}", flush=True)
+            await asyncio.sleep(_interval)
+    asyncio.create_task(_mm_reconcile_loop())
+    print("mm reconciler scheduled", flush=True)
+
     # patch04b: keep-alive loop. The main indexer runs in a native
     # thread via start_indexer() and doesn't need to be awaited.
     # We just need to keep the asyncio event loop alive so the

@@ -117,7 +117,9 @@ def _claim_batch(db: Session, batch_size: int):
     #       in the past by more than STALE_INPROGRESS_MIN minutes; we
     #       reclaim them. (status is still 'in_progress' but we treat
     #       it as recoverable.)
-    rows = db.execute(sql_text(f"""
+    # patch_g31_interval_param: bound interval (G-31 re-sweep 2026-07-16) — the
+    # f-string constant was safe (int literal) but was the last f-string SQL.
+    rows = db.execute(sql_text("""
         UPDATE derived_state_queue
         SET    status        = 'in_progress',
                started_at    = now(),
@@ -129,14 +131,14 @@ def _claim_batch(db: Session, batch_size: int):
                 AND (started_at IS NULL OR started_at <= now())
             ) OR (
                 status = 'in_progress'
-                AND started_at < now() - INTERVAL '{STALE_INPROGRESS_MIN} minutes'
+                AND started_at < now() - make_interval(mins => :stale)
             )
             ORDER BY queued_at
             LIMIT :n
             FOR UPDATE SKIP LOCKED
         )
         RETURNING id, post_id, queue_kind, attempt_count
-    """), {"n": batch_size}).fetchall()
+    """), {"n": batch_size, "stale": STALE_INPROGRESS_MIN}).fetchall()
     db.commit()
     return rows
 

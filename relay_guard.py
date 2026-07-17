@@ -2,6 +2,15 @@
 """
 Relay pre-flight guards.
 
+*** WARNING — MODULE IS CURRENTLY UNWIRED (found in the 2026-07-15 launch
+review): check_relay_request() is imported by NOTHING; none of these guards
+run. Worse, ALL FOUR selector constants below were wrong (same failure class
+as the 2026-06-02 moderation CREATE_CLAIM_SELECTOR bug), so even if wired the
+per-selector branches would have silently no-op'd. Selectors corrected by
+patch_postreview_relay_guard_selectors and verified against keccak256 of the
+live core/src signatures. Wire-in-or-delete decision tracked in MVP-TASKLIST
+Bundle 6. Do NOT assume these guards are active. ***
+
 These checks run BEFORE the relay spends any AVAX on gas. They catch
 requests that would either fail on-chain or succeed without paying the
 relay fee — both of which cost the relay operator money for nothing.
@@ -33,10 +42,12 @@ logger = logging.getLogger(__name__)
 
 # ── Function selectors ────────────────────────────────────────
 
-SEL_CREATE_CLAIM = "4a3e1b89"
-SEL_CREATE_LINK  = "ce919d33"
-SEL_STAKE        = "7acb7757"
-SEL_WITHDRAW     = "441a3e70"
+# patch_postreview_relay_guard_selectors: corrected 2026-07-15 — every prior
+# value was wrong. Verified: keccak256(sig)[:4] of the live core/src signatures.
+SEL_CREATE_CLAIM = "84c08ed3"  # createClaim(string)
+SEL_CREATE_LINK  = "b6f0b787"  # createLink(uint256,uint256,bool)
+SEL_STAKE        = "f99b7d75"  # stake(uint256,uint8,uint256)
+SEL_WITHDRAW     = "34a33867"  # withdraw(uint256,uint8,uint256,bool)
 
 # ── Minimal ABIs for view calls ───────────────────────────────
 

@@ -127,6 +127,21 @@ def env_int(name: str, default: int) -> int:
 
 ALERT_LOG_PATH = os.getenv("MM_TREASURY_ALERT_LOG", "/var/log/vsp-treasury-worker.log")
 
+# patch_alertquiet_action_kinds: routine action-SUCCESS kinds are log-only by
+# default (alert log + docker log, NO Telegram/webhook fan-out). With the
+# exposure-capped USDC bands, sweeps fire on routine trading — success pings on
+# every loop violate the operator's notifications-are-errors-only requirement.
+# Failures/reverts/warnings of the same actions (sweep_failed, mint_reverted,
+# mm_usdc_low, ...) are NOT in this set and always notify. Set
+# VSP_NOTIFY_ACTION_KINDS=true to re-enable pings for these (e.g. during the
+# mainnet ceremony, when a ping per treasury action is wanted).
+ACTION_SUCCESS_KINDS = frozenset(
+    {"sweep", "mint", "burn", "dry_run_sweep", "dry_run_mint", "dry_run_burn"}
+)
+NOTIFY_ACTION_KINDS = os.getenv("VSP_NOTIFY_ACTION_KINDS", "false").strip().lower() in (
+    "1", "true", "yes", "on"
+)
+
 
 def alert(kind: str, message: str, **fields) -> None:
     """Structured alert: a JSON line to the alert log + a stdout log line.
@@ -146,6 +161,10 @@ def alert(kind: str, message: str, **fields) -> None:
         logger.error("alert: could not write alert log %s: %s", ALERT_LOG_PATH, e)
     # patch_bundle08_alert_sink: also fan out to the notifier (webhook/telegram/
     # email). No-op if no channel is configured; never blocks the alert path.
+    # patch_alertquiet_action_kinds: action-success kinds are log-only unless
+    # VSP_NOTIFY_ACTION_KINDS re-enables them; errors/warnings always fan out.
+    if kind in ACTION_SUCCESS_KINDS and not NOTIFY_ACTION_KINDS:
+        return
     try:
         import notify
         notify.send_alert(kind, message, **fields)
@@ -332,17 +351,47 @@ def compute_vsp_bands(cap_wei: int) -> dict:
     }
 
 
-def compute_usdc_bands(target_vsp: float, floor_price: float) -> dict:
+def compute_usdc_bands(target_vsp: float, floor_price: float, circ_vsp: float | None = None) -> dict:
     """USDC sweep band derived from the VSP liquidity need via floor price,
-    capped by the absolute custody ceiling. Values in micro-USDC."""
+    capped by the absolute custody ceiling. Values in micro-USDC.
+
+    patch_alerthygiene_usdc_exposure_cap: the MM's USDC exists to buy back
+    CIRCULATING VSP, so the liquidity need can never exceed circ * floor.
+    Sizing from target_vsp alone (band floor 1000) demanded a full-band hot
+    buffer at bootstrap (e.g. 566 USDC against 4 VSP circulating) and made
+    mm_usdc_low alarm hourly about exposure that could not exist. Callers pass
+    circ_vsp (total_supply - MM inventory, floored at 0); None keeps legacy
+    behavior. As circulation grows past target_vsp the cap is inert."""
     abs_max = env_float("MM_USDC_TARGET_ABS_MAX", 100000.0)
     hot_max_mult = env_float("MM_USDC_HOT_MAX_MULT", 2.0)
-    usdc_target = min(target_vsp * floor_price, abs_max)
+    eff_vsp = target_vsp if circ_vsp is None else max(0.0, min(target_vsp, circ_vsp))
+    usdc_target = min(eff_vsp * floor_price, abs_max)
     return {
         "usdc_target_usd": usdc_target,
         "usdc_target_micro": int(usdc_target * MICRO),
         "usdc_hot_max_micro": int(hot_max_mult * usdc_target * MICRO),
     }
+
+
+# patch_alerthygiene_floor_grace: floor reads race the app container on every
+# recreate (worker's first loop starts before uvicorn listens), producing a
+# guaranteed alert pair per deploy. Alert only on the SECOND consecutive failure
+# per alert kind; the first is an info-level grace. Two consecutive failures
+# span a full loop interval — a real outage, worth waking someone for.
+_floor_fail_streak: dict = {}
+
+
+def _floor_failed(kind: str, msg: str, throttled: bool = False) -> None:
+    n = _floor_fail_streak.get(kind, 0) + 1
+    _floor_fail_streak[kind] = n
+    if n >= 2:
+        (_throttled_alert if throttled else alert)(kind, msg)
+    else:
+        logger.info("floor read failed (grace, 1st consecutive; alerting on 2nd): %s", msg)
+
+
+def _floor_ok(kind: str) -> None:
+    _floor_fail_streak.pop(kind, None)
 
 
 # ─────────────────────── one iteration ───────────────────────
@@ -384,12 +433,28 @@ def run_once(chain: Chain, cap_cache: TtlCache, floor_cache: TtlCache,
     if sweep_on:
         try:
             floor_price = floor_cache.get(read_floor_price)
+            _floor_ok("floor_unavailable")  # patch_alerthygiene_floor_grace
         except Exception as e:
-            alert("floor_unavailable", f"sweep skipped: floor price read failed: {e}")
+            _floor_failed("floor_unavailable", f"sweep skipped: floor price read failed: {e}")
             floor_price = None
         if floor_price is not None:
-            usdc_bands = compute_usdc_bands(bands["target_vsp"], floor_price)
-            if mm_usdc > usdc_bands["usdc_hot_max_micro"] and startup_sweep_dest:  # patch_bundle11_cold_reserve
+            # patch_alerthygiene_usdc_exposure_cap: circulating = supply minus MM
+            # inventory (chain_reader.py:489 definition), floored at 0.
+            _circ_vsp = max(0.0, (total_supply - mm_vsp) / WEI)
+            usdc_bands = compute_usdc_bands(bands["target_vsp"], floor_price, circ_vsp=_circ_vsp)
+            # patch_postreview_sweep_bootstrap_guard: LAUNCH FINDING 2026-07-15 —
+            # at bootstrap circulation==0 => floor==0 => usdc_target==0 => hot_max==0,
+            # so ANY seeded USDC exceeded the band and was swept straight to cold
+            # (400 USDC seed, tx 0x4b781c34...). The same state recurs at the MAINNET
+            # ceremony funding step (all minted VSP sits in the MM => circulating==0).
+            # A zero/negative target is never a valid sweep basis: skip and say so.
+            # Sweeps resume automatically once the first buy starts circulation.
+            if usdc_bands["usdc_target_micro"] <= 0:
+                alert("sweep_skipped_bootstrap",
+                      "usdc_target is 0 (bootstrap: floor/circulation is 0) — "
+                      "sweep suspended until the first buy starts circulation",
+                      floor=floor_price, mm_usdc_usd=mm_usdc / MICRO)
+            elif mm_usdc > usdc_bands["usdc_hot_max_micro"] and startup_sweep_dest:  # patch_bundle11_cold_reserve
                 # destination guard (lesson: refuse if changed since startup)
                 # patch_bundle11_cold_reserve: guard the cold-custody dest
                 current_dest = os.getenv("VSP_COLD_RESERVE_ADDRESS", COLD_RESERVE_ADDRESS).strip()
@@ -529,6 +594,7 @@ def audit_reserves(chain: "Chain", cap_cache: "TtlCache", floor_cache: "TtlCache
     try:
         mm_vsp = chain.mm_vsp_wei()
         mm_usdc = chain.mm_usdc_micro()
+        total_supply = chain.vsp_total_supply_wei()  # patch_alerthygiene_usdc_exposure_cap
         cap_wei = cap_cache.get(chain.vsp_max_allowed_wei)
     except Exception as e:
         _throttled_alert("reserves_audit_rpc_error", f"reserves read failed: {e}")
@@ -548,11 +614,14 @@ def audit_reserves(chain: "Chain", cap_cache: "TtlCache", floor_cache: "TtlCache
     # USDC low check needs floor price to derive the target; skip gracefully if down.
     try:
         floor_price = floor_cache.get(read_floor_price)
+        _floor_ok("reserves_audit_floor_unavailable")  # patch_alerthygiene_floor_grace
     except Exception as e:
-        _throttled_alert("reserves_audit_floor_unavailable",
-                         f"USDC audit skipped: floor read failed: {e}")
+        _floor_failed("reserves_audit_floor_unavailable",
+                      f"USDC audit skipped: floor read failed: {e}", throttled=True)
         return
-    usdc_bands = compute_usdc_bands(bands["target_vsp"], floor_price)
+    usdc_bands = compute_usdc_bands(
+        bands["target_vsp"], floor_price,
+        circ_vsp=max(0.0, (total_supply - mm_vsp) / WEI))  # patch_alerthygiene_usdc_exposure_cap
     usdc_low_micro = int(MM_USDC_LOW_ALERT_FRAC * usdc_bands["usdc_target_micro"])
     if mm_usdc < usdc_low_micro:
         _throttled_alert(
