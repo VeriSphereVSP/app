@@ -405,14 +405,34 @@ def index_existing_claims_into_article(db: Session, article_id: int):
                 for m in sent_members:
                     hide_ids.add(m.id)
                 continue
-            # find a grouped sentence to overlay the claim onto; else insert
+            # patch_claim_verbatim_overlay: overlay a claim's post_id ONLY onto a
+            # sentence whose text EQUALS the claim (whitespace/case-normalized).
+            # INVARIANT: a claim carrier sentence must display the claim's OWN
+            # text — never overlay onto a stance-similar but differently-worded
+            # prose sentence (2026-07-19 post 12 Sicknick: the article showed a
+            # paraphrase the user never staked). The old primary loop took the
+            # first unclaimed GROUPED sentence with no text check; that is the
+            # substitution bug. We now require exact text: first among grouped
+            # sentence members, then any unclaimed article sentence. If none
+            # matches the claim text, target_sid stays None and we INSERT the
+            # claim's own text below (and hide the paraphrase as a grouped dupe).
             target_sid = None
+            _canon_norm = " ".join(canon_text.split()).lower()
             for m in sent_members:
-                if sent_by_id[m.id]["post_id"] is None:
+                _info = sent_by_id.get(m.id)
+                if (_info and _info["post_id"] is None
+                        and " ".join(_info["text"].split()).lower() == _canon_norm):
                     target_sid = m.id
                     break
+            if target_sid is None:
+                for _sid, _info in sent_by_id.items():
+                    if (_info["post_id"] is None and _sid not in hide_ids
+                            and " ".join(_info["text"].split()).lower() == _canon_norm):
+                        target_sid = _sid
+                        break
             if target_sid is not None:
                 update_sentence_post_id(db, target_sid, canon_pid)
+                sent_by_id[target_sid]["post_id"] = canon_pid  # keep in-run view fresh
                 attached_pids.add(canon_pid)
                 kept_claim_sids.append(target_sid)
                 indexed_count += 1
@@ -483,6 +503,18 @@ def index_existing_claims_into_article(db: Session, article_id: int):
     # weeding pass; kept_claim_sids is the authoritative carrier set, so drop
     # those ids from hide_ids before applying. (idempotent: guarded by marker.)
     hide_ids -= set(kept_claim_sids)
+
+    # patch_inject_never_hide_carrier: INVARIANT — a sentence carrying a claim
+    # post_id is a staked claim and must never be hidden, no matter which run
+    # attached it (the guard above only covers carriers re-linked THIS run).
+    # A hidden carrier severs the on-chain stake from the displayed article,
+    # which is the worst failure mode a truth-staking display can have.
+    if hide_ids:
+        _carriers = db.execute(sql_text(
+            "SELECT sentence_id FROM article_sentence "
+            "WHERE sentence_id = ANY(:ids) AND post_id IS NOT NULL"
+        ), {"ids": list(hide_ids)}).fetchall()
+        hide_ids -= {r[0] for r in _carriers}
 
     if hide_ids:
         try:
