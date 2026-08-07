@@ -516,6 +516,44 @@ def _index_user_stake_canonical(db: Session, se, user_address: str, post_id: int
                          user_address[:10], post_id, side, e)
 
 
+def _embed_claim_text(db: Session, post_id: int, claim_text: str) -> None:
+    """Embed a newly indexed claim, so it is findable by vector search at once.
+
+    Without this a claim carries a NULL embedding until some later pass fills it
+    in, which means the extension's article matcher can only find it by literal
+    token overlap — a paraphrase of a claim created a minute ago silently fails
+    to match. Doing it here, in the same transaction as the text insert, makes
+    "indexed" and "searchable" the same moment.
+
+    Best-effort and non-committing: the caller owns the transaction, and an
+    embedding-provider outage must never stall chain indexing.
+    """
+    try:
+        row = db.execute(sql_text(
+            "SELECT embedding IS NULL FROM chain_claim_text WHERE post_id = :pid"
+        ), {"pid": post_id}).fetchone()
+    except Exception:
+        return
+    # The upsert above nulls the vector whenever the text changes, so a non-null
+    # one is current and costs nothing to keep.
+    if row is None or not row[0]:
+        return
+
+    try:
+        from embedding import embed
+        vec = embed(claim_text)
+    except Exception as e:
+        logger.debug("Could not embed claim %d: %s", post_id, e)
+        return
+
+    try:
+        db.execute(sql_text(
+            "UPDATE chain_claim_text SET embedding = (:v)::vector WHERE post_id = :pid"
+        ), {"v": "[" + ",".join(str(float(x)) for x in vec) + "]", "pid": post_id})
+    except Exception as e:
+        logger.debug("Could not store embedding for claim %d: %s", post_id, e)
+
+
 def index_post_canonical(
     db: Session,
     post_id: int,
@@ -602,11 +640,19 @@ def index_post_canonical(
                 INSERT INTO chain_claim_text (post_id, claim_text, indexed_at)
                 VALUES (:pid, :txt, now())
                 ON CONFLICT (post_id) DO UPDATE SET
-                    claim_text = :txt, is_moderated = :mod, indexed_at = now()
+                    claim_text = :txt, is_moderated = :mod, indexed_at = now(),
+                    -- An embedding describes the text it was computed from, so
+                    -- edited text invalidates it. NULL means "needs embedding".
+                    embedding = CASE
+                        WHEN chain_claim_text.claim_text IS DISTINCT FROM EXCLUDED.claim_text
+                        THEN NULL ELSE chain_claim_text.embedding END
             """), {"pid": post_id, "txt": claim_text, "mod": is_moderated})
         except Exception as e:
             logger.debug("Could not index claim text for post %d: %s", post_id, e)
             claim_text = None
+
+    if claim_text:
+        _embed_claim_text(db, post_id, claim_text)
 
     # User positions
     if user_addresses:
