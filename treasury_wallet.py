@@ -22,25 +22,16 @@ logger = logging.getLogger(__name__)
 # configured private key does not derive this address — a guard against pasting
 # the wrong key into secrets.{network}.enc.yaml. For mainnet, this constant is
 # updated to the mainnet worker EOA during the Bundle 12 ceremony.
-EXPECTED_WORKER_ADDRESS = os.getenv(
-    "MM_TREASURY_WORKER_ADDRESS",
-    "0x3A6ECb7776070fd28F90331b7891fA645D699240",
-)
-
-MM_TREASURY_WORKER_PRIVATE_KEY = os.getenv("MM_TREASURY_WORKER_PRIVATE_KEY", "")
-
+# patch_kms_worker: the treasury-worker key lives in GCP Cloud KMS (HSM); the
+# private key never exists on this box. Fail-loud: MM_TREASURY_WORKER_KMS_KEY and
+# MM_TREASURY_WORKER_ADDRESS are required and must agree. No hardcoded address
+# default (it rots), and MM_TREASURY_WORKER_PRIVATE_KEY is deliberately ignored.
 w3 = build_w3(RPC_WRITE_URLS, conn_err_msg="treasury_wallet: Web3 RPC not connected")
 
-if not MM_TREASURY_WORKER_PRIVATE_KEY:
-    raise RuntimeError("treasury_wallet: MM_TREASURY_WORKER_PRIVATE_KEY not set")
+from signing.kms_account import kms_account_from_env  # patch_kms_worker
 
-account = Account.from_key(MM_TREASURY_WORKER_PRIVATE_KEY)
-
-if account.address.lower() != EXPECTED_WORKER_ADDRESS.lower():
-    raise RuntimeError(
-        "treasury_wallet: MM_TREASURY_WORKER_PRIVATE_KEY derives %s, expected %s"
-        % (account.address, EXPECTED_WORKER_ADDRESS)
-    )
+account = kms_account_from_env("MM_TREASURY_WORKER")
+EXPECTED_WORKER_ADDRESS = account.address
 
 logger.info("treasury_wallet: signer ready, address=%s", account.address)
 

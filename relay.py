@@ -6,6 +6,7 @@ Pattern: submit tx -> wait for receipt -> update DB -> return authoritative stat
 
 import json
 import logging
+import os  # patch_postreview_memo_dark
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Depends
@@ -21,6 +22,7 @@ from fee_calculator import compute_relay_fee, is_fee_exempt
 from config import VSP_ADDRESS  # patch_bundle10_relay_key_separation: dropped unused MM fee-wallet alias
 from moderation import check_content
 from rate_limit import relay_rate_limit
+from relay_guard import check_relay_request, GuardError, record_revert  # patch_f7rg_relay_guard_wirein
 
 logger = logging.getLogger(__name__)
 
@@ -172,6 +174,39 @@ POST_REGISTRY_ABI = _load_abi("PostRegistry") or [
 
 # Function selectors (first 4 bytes of keccak256)
 CREATE_CLAIM_SELECTOR = "84c08ed3"  # keccak256("createClaim(string)")[:4]; was "4a3e1b89" (wrong -> gate skipped)
+
+# patch_postreview_memo_dark: setMemo ships DARK (2026-07-15 ruling). The app
+# neither offers memo-writing nor displays memo content until counsel opines
+# on intermediary liability — and that must include the RELAY: without this
+# gate, a hand-crafted setMemo meta-tx would make this service the publisher-
+# of-record for arbitrary third-party content. Relaying is refused unless
+# VSP_RELAY_MEMO_ENABLED=true; the screening hook below exists NOW so that
+# enabling later is a config switch plus a screening policy — not a rebuild.
+SET_MEMO_SELECTOR = "4bc0dd65"  # keccak256("setMemo(uint256,bytes32,string)")[:4]
+
+
+def _screen_memo(calldata_hex: str) -> None:
+    """Memo-content screening hook (no-op placeholder). When memo relaying is
+    enabled (VSP_RELAY_MEMO_ENABLED=true, post counsel sign-off), implement the
+    screening policy HERE (decode uri/contentHash from the calldata; reuse
+    moderation.check_content or a memo-specific policy). Wired into the relay
+    path via _gate_memo so the plumbing is already load-bearing.
+    patch_postreview_memo_dark."""
+    return None
+
+
+def _gate_memo(calldata_hex: str) -> None:
+    """Refuse to relay setMemo while memos ship dark; route through the
+    screening hook once explicitly enabled. patch_postreview_memo_dark."""
+    if calldata_hex[:8].lower() != SET_MEMO_SELECTOR:
+        return
+    if os.getenv("VSP_RELAY_MEMO_ENABLED", "false").strip().lower() not in ("1", "true", "yes"):
+        raise HTTPException(
+            403,
+            "Memo relaying is not enabled on this service. "
+            "You may interact with the protocol contract directly.",
+        )
+    _screen_memo(calldata_hex)
 
 
 class ForwardRequestPayload(BaseModel):
@@ -519,6 +554,28 @@ def _relay_async_sync(body: RelayRequest, db: Session):
                 f"{body.fee_permit.owner} vs {req.from_})",
             )
 
+        # patch_f7rg_relay_guard_wirein: pre-flight economic guards (balance,
+        # allowance, fee viability, revert-throttle, min-stake). Run BEFORE
+        # permits execute — permits cost gas, so rejecting after executing them
+        # would defeat the purpose. has_permit/has_fee_permit tell the guard an
+        # allowance may arrive via the permit in THIS request (so it must not
+        # reject on current on-chain allowance); fee-exempt users are told the
+        # fee check is moot so a zero Forwarder allowance doesn't lock them out.
+        try:
+            _is_exempt = is_fee_exempt(db, req.from_)
+        except Exception:
+            _is_exempt = False
+        try:
+            check_relay_request(
+                user_address=req.from_,
+                target_contract=req.to,
+                calldata_hex=calldata_hex,
+                has_permit=body.permit is not None,
+                has_fee_permit=(body.fee_permit is not None) or _is_exempt,
+            )
+        except GuardError as ge:
+            raise HTTPException(ge.code, ge.message)
+
         # Permits (gasless pre-grant of allowances)
         if body.permit:
             _execute_permit(body.permit)
@@ -529,6 +586,9 @@ def _relay_async_sync(body: RelayRequest, db: Session):
                 logger.info("Fee permit executed for %s", req.from_[:10])
             except Exception as e:
                 logger.debug("Fee permit skip (non-fatal): %s", e)
+
+        # patch_postreview_memo_dark: memo dark-gate (see _gate_memo above)
+        _gate_memo(calldata_hex)
 
         # Content moderation gate
         _moderate_claim(calldata_hex)
@@ -614,6 +674,7 @@ def _relay_async_sync(body: RelayRequest, db: Session):
         except TxRevertedError as e:
             tx_hash = e.tx_hash
             tx_status = "reverted"
+            record_revert(req.from_)  # patch_f7rg_relay_guard_wirein: feed the throttle
             logger.warning(
                 "Async relay tx reverted on-chain (from=%s to=%s tx=%s); "
                 "recording tx_log row so unified pipeline can surface failure",

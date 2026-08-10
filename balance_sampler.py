@@ -81,6 +81,61 @@ def record_metric(db, metric, value, labels=None):
         "l": (None if labels is None else __import__("json").dumps(labels))})
 
 
+# patch_postreview_circ_growth_alert: F-3 instrumentation (LAUNCH-RISK-AUDIT
+# 2026-07-06 §1.2c). Mint-to-winners + the StakeEngine cap exemption means
+# circulating supply can grow without an on-chain ceiling, diluting
+# floor = reserves/circulating for every holder. Until the supply-redesign
+# ruling (deferred to counsel, 2026-07-15) lands, WATCH the growth rate and
+# alert when it exceeds a threshold over a trailing window, so dilution is a
+# graph you saw coming — not a state you discover in production.
+CIRC_GROWTH_ALERT_PCT = float(os.getenv("VSP_CIRC_GROWTH_ALERT_PCT", "20"))
+CIRC_GROWTH_WINDOW_HOURS = float(os.getenv("VSP_CIRC_GROWTH_WINDOW_HOURS", "24"))
+CIRC_GROWTH_COOLDOWN_SEC = int(os.getenv("VSP_CIRC_GROWTH_COOLDOWN_SEC", "21600"))
+_last_circ_growth_alert = 0.0
+
+
+def _check_circ_growth(db, circ_now) -> None:
+    """Alert when circulating VSP grew more than CIRC_GROWTH_ALERT_PCT within
+    the trailing window. Baseline = the newest ops_metrics sample at/before the
+    window start, so growth is measured over at least the full window. Silently
+    skips at bootstrap (no baseline, or baseline == 0). In-process cooldown
+    throttles repeats; a persisting condition re-alerts after the cooldown.
+    Never raises (instrumentation must not break sampling).
+    patch_postreview_circ_growth_alert."""
+    global _last_circ_growth_alert
+    try:
+        if time.time() - _last_circ_growth_alert < CIRC_GROWTH_COOLDOWN_SEC:
+            return
+        base = db.execute(sql_text(
+            "SELECT value_num FROM ops_metrics "
+            "WHERE metric = 'vsp_circulating' "
+            "  AND sampled_at <= now() - make_interval(secs => :s) "
+            "ORDER BY sampled_at DESC LIMIT 1"
+        ), {"s": CIRC_GROWTH_WINDOW_HOURS * 3600.0}).scalar()
+        if base is None or float(base) <= 0:
+            return
+        base = float(base)
+        growth_pct = (float(circ_now) - base) / base * 100.0
+        if growth_pct >= CIRC_GROWTH_ALERT_PCT:
+            _last_circ_growth_alert = time.time()
+            logger.warning(
+                "ALERT circ_growth: circulating VSP +%.1f%% over %gh (%.2f -> %.2f)",
+                growth_pct, CIRC_GROWTH_WINDOW_HOURS, base, float(circ_now),
+            )
+            try:
+                import notify
+                notify.send_alert(
+                    "circ_growth",
+                    f"circulating VSP grew {growth_pct:.1f}% in {CIRC_GROWTH_WINDOW_HOURS:g}h "
+                    f"({base:.2f} -> {float(circ_now):.2f}) — mint-to-winners dilution watch (F-3)",
+                    baseline=base, current=float(circ_now), pct=round(growth_pct, 2),
+                )
+            except Exception as e:
+                logger.warning("circ_growth alert delivery failed: %s", e)
+    except Exception as e:
+        logger.warning("circ_growth check failed: %s", e)
+
+
 def sample_balances_once():
     """Read each gas-payer's AVAX balance and record it. One ops_metrics row per
     component, metric='avax_balance', labels={'component': <label>, 'address': <addr>}."""
@@ -110,6 +165,7 @@ def sample_balances_once():
             res = float(read_usdc_reserves())
             record_metric(db, "vsp_circulating", circ)
             record_metric(db, "usdc_reserves", res)
+            _check_circ_growth(db, circ)  # patch_postreview_circ_growth_alert
             sampled += 2
             # floor = reserves / circulating (liquidation floor; the simple form).
             if circ > 0:

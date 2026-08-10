@@ -299,18 +299,38 @@ def refresh_article(db: Session, topic: str) -> bool:
         "AND post_id IS NULL"
     ), {"a": article_id})
 
-    # Map existing (kept) sections by normalized heading so we reuse them.
-    existing_sections = {}
-    for (sec_id, heading) in db.execute(sql_text(
-        "SELECT section_id, heading FROM article_section WHERE article_id = :a"
-    ), {"a": article_id}).fetchall():
-        existing_sections[(heading or "").lower().strip()] = sec_id
+    # patch_refresh_sections: match existing sections to fresh ones by FUZZY heading so
+    # LLM heading drift ("Observable" vs "Observed") REUSES the section instead of
+    # orphaning it. Threshold via VSP_HEADING_MATCH_THRESHOLD (default 0.8).
+    import difflib
+    import os as _os
+    _HEADING_MATCH = float(_os.getenv("VSP_HEADING_MATCH_THRESHOLD", "0.8"))
+    _existing = [
+        (sec_id, (heading or "").lower().strip())
+        for (sec_id, heading) in db.execute(sql_text(
+            "SELECT section_id, heading FROM article_section WHERE article_id = :a"
+        ), {"a": article_id}).fetchall()
+    ]
+    _used_secs = set()
+
+    def _match_section(hk):
+        for sid, ek in _existing:            # exact first
+            if sid not in _used_secs and ek and ek == hk:
+                return sid
+        best, best_r = None, 0.0             # fuzzy fallback
+        for sid, ek in _existing:
+            if sid in _used_secs or not ek:
+                continue
+            r = difflib.SequenceMatcher(None, ek, hk).ratio()
+            if r > best_r:
+                best, best_r = sid, r
+        return best if best_r >= _HEADING_MATCH else None
 
     added = 0
     for fresh_sec in fresh.get("sections", []):
         heading = fresh_sec.get("heading", "")
         hk = heading.lower().strip()
-        sec_id = existing_sections.get(hk)
+        sec_id = _match_section(hk)
         if sec_id is None:
             max_order = db.execute(sql_text(
                 "SELECT COALESCE(MAX(sort_order), 0) FROM article_section WHERE article_id = :a"
@@ -320,7 +340,14 @@ def refresh_article(db: Session, topic: str) -> bool:
                 "VALUES (:a, :h, :so) RETURNING section_id"
             ), {"a": article_id, "h": heading, "so": max_order + 100}).fetchone()
             sec_id = row[0]
-            existing_sections[hk] = sec_id
+            _existing.append((sec_id, hk))
+            _used_secs.add(sec_id)
+        else:
+            _used_secs.add(sec_id)
+            # refresh the reused section's heading to the fresh wording
+            db.execute(sql_text(
+                "UPDATE article_section SET heading = :h WHERE section_id = :s"
+            ), {"h": heading, "s": sec_id})
 
         # append fresh prose after any preserved (claim-linked) sentences
         last = db.execute(sql_text(
@@ -337,6 +364,13 @@ def refresh_article(db: Session, topic: str) -> bool:
             ), {"s": sec_id, "so": sort_order, "t": t})
             sort_order += 100
             added += 1
+
+    # patch_refresh_sections: prune orphan sections left empty by heading drift
+    # (no prose, no claim-linked sentence). Claim-bearing sections are never empty.
+    db.execute(sql_text(
+        "DELETE FROM article_section sec WHERE sec.article_id = :a "
+        "AND NOT EXISTS (SELECT 1 FROM article_sentence s WHERE s.section_id = sec.section_id)"
+    ), {"a": article_id})
 
     db.execute(sql_text(
         "UPDATE topic_article SET last_refreshed_at = NOW(), updated_at = NOW() "
@@ -843,120 +877,6 @@ def persist_dedup(db, article_id: int):
     is the sole dedup/hide authority now. Kept as a no-op so existing callers
     (worker.py, main.py) don't break."""
     return
-    import logging
-    from sqlalchemy import text as sql_text
-    logger = logging.getLogger(__name__)
-    try:
-        # Step 1: load all non-hidden sentences. Cast embedding to text so
-        # SQLAlchemy returns it as a string we can parse, since pgvector's
-        # default Python adapter isn't installed.
-        rows = db.execute(sql_text(
-            "SELECT s.sentence_id, s.text, s.post_id, s.embedding::text "
-            "FROM article_sentence s "
-            "JOIN article_section sec ON s.section_id = sec.section_id "
-            "WHERE sec.article_id = :a AND s.is_hidden = FALSE "
-            "ORDER BY s.section_id, s.sort_order"
-        ), {"a": article_id}).fetchall()
-        
-        if not rows:
-            return
-        
-        # Helper: parse pgvector text format "[0.1,0.2,...]" to list[float]
-        def _parse_vec(s):
-            if s is None:
-                return None
-            s = s.strip()
-            if not s.startswith("["):
-                return None
-            return [float(x) for x in s[1:-1].split(",")]
-        
-        # Helper: format list[float] as pgvector literal
-        def _fmt_vec(v):
-            return "[" + ",".join(repr(float(x)) for x in v) + "]"
-        
-        # Step 2: identify sentences needing embedding
-        needs_embed = [(r[0], r[1]) for r in rows if r[3] is None]
-        embeddings_by_id = {}
-        for r in rows:
-            if r[3] is not None:
-                embeddings_by_id[r[0]] = _parse_vec(r[3])
-        
-        if needs_embed:
-            from embedding import embed_batch
-            texts_to_embed = [t for (_, t) in needs_embed]
-            logger.info("persist_dedup: embedding %d new sentences in article %d",
-                        len(texts_to_embed), article_id)
-            vecs = embed_batch(texts_to_embed)
-            
-            for (sid, _), vec in zip(needs_embed, vecs):
-                embeddings_by_id[sid] = vec
-                try:
-                    db.execute(sql_text(
-                        "UPDATE article_sentence SET embedding = (:v)::vector "
-                        "WHERE sentence_id = :sid"
-                    ), {"v": _fmt_vec(vec), "sid": sid})
-                except Exception as e:
-                    logger.warning("Failed to persist embedding for sid=%d: %s", sid, e)
-                    db.rollback()
-            db.commit()
-        
-        # Step 3: dedup decision using pgvector's cosine distance operator <=>
-        # cosine_similarity = 1 - cosine_distance
-        # Threshold: similarity >= 0.70 means cosine_distance <= 0.30
-        DEDUP_DISTANCE = 0.20  # cosine distance; 0.20 = similarity 0.80
-        
-        # Identify on-chain sentences (always kept)
-        onchain_ids = [r[0] for r in rows if r[2] is not None]
-        offchain_rows = [r for r in rows if r[2] is None]
-        
-        to_hide = []
-        kept_offchain_ids = []
-        
-        for r in offchain_rows:
-            sid, text, _, _ = r
-            text_s = (text or "").strip()
-            if not text_s:
-                to_hide.append(sid)
-                continue
-            
-            # Use pgvector's <=> operator to find nearest neighbor among
-            # on-chain + already-kept off-chain sentences within this article.
-            # Only compare against other off-chain sentences.
-            # On-chain masters are handled by build_and_cache_response.
-            comparison_ids = kept_offchain_ids
-            if not comparison_ids:
-                kept_offchain_ids.append(sid)
-                continue
-            
-            row = db.execute(sql_text(
-                "SELECT MIN(s2.embedding <=> s1.embedding) AS dist "
-                "FROM article_sentence s1, article_sentence s2 "
-                "WHERE s1.sentence_id = :sid "
-                "  AND s2.sentence_id = ANY(:cids) "
-                "  AND s1.embedding IS NOT NULL "
-                "  AND s2.embedding IS NOT NULL"
-            ), {"sid": sid, "cids": comparison_ids}).fetchone()
-            
-            min_dist = row[0] if row and row[0] is not None else None
-            if min_dist is not None and min_dist <= DEDUP_DISTANCE:
-                to_hide.append(sid)
-                logger.debug("dedup: hiding sid=%d (dist=%.3f)", sid, min_dist)
-            else:
-                kept_offchain_ids.append(sid)
-        
-        if to_hide:
-            db.execute(sql_text(
-                "UPDATE article_sentence SET is_hidden = TRUE "
-                "WHERE sentence_id = ANY(:ids)"
-            ), {"ids": to_hide})
-            db.commit()
-            logger.info("persist_dedup: hid %d duplicates in article %d",
-                        len(to_hide), article_id)
-    except Exception as e:
-        logger.warning("persist_dedup failed for article_id=%d: %s", article_id, e)
-        try: db.rollback()
-        except Exception: pass
-
 
 
 def _get_article_internal(db, article_id: int) -> dict:

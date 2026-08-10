@@ -80,6 +80,12 @@ def _do_derived_state(db: Session, post_id: int, queue_kind: str) -> None:
                 # is (db, claim_text, post_id, topic) — 4 args. Previous call
                 # passed only 3 and broke every new-claim topic-detect.
                 ensure_article_for_claim(db, claim_text, post_id, topic)
+        # patch_assoc_ingest: guarantee >=1 claim_topic association at ingest (Build A)
+        try:
+            from articles.topic_reconciler import associate_one
+            associate_one(db, cid)
+        except Exception as _ae:
+            logger.warning("associate_one failed for post %d: %s", post_id, _ae)
         db.commit()
     except Exception as e:
         logger.warning("derived_state_worker: topic detection failed for post %d: %s", post_id, e)
@@ -111,7 +117,9 @@ def _claim_batch(db: Session, batch_size: int):
     #       in the past by more than STALE_INPROGRESS_MIN minutes; we
     #       reclaim them. (status is still 'in_progress' but we treat
     #       it as recoverable.)
-    rows = db.execute(sql_text(f"""
+    # patch_g31_interval_param: bound interval (G-31 re-sweep 2026-07-16) — the
+    # f-string constant was safe (int literal) but was the last f-string SQL.
+    rows = db.execute(sql_text("""
         UPDATE derived_state_queue
         SET    status        = 'in_progress',
                started_at    = now(),
@@ -123,14 +131,14 @@ def _claim_batch(db: Session, batch_size: int):
                 AND (started_at IS NULL OR started_at <= now())
             ) OR (
                 status = 'in_progress'
-                AND started_at < now() - INTERVAL '{STALE_INPROGRESS_MIN} minutes'
+                AND started_at < now() - make_interval(mins => :stale)
             )
             ORDER BY queued_at
             LIMIT :n
             FOR UPDATE SKIP LOCKED
         )
         RETURNING id, post_id, queue_kind, attempt_count
-    """), {"n": batch_size}).fetchall()
+    """), {"n": batch_size, "stale": STALE_INPROGRESS_MIN}).fetchall()
     db.commit()
     return rows
 

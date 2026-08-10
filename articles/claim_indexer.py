@@ -271,6 +271,54 @@ def is_claim_relevant_to_article(
     return False
 
 
+def _ensure_sentence_embeddings(db: Session, article_id: int) -> int:
+    """patch_crosslane_embed: ensure every VISIBLE sentence in the article has an
+    embedding BEFORE grouping/weeding read them. Without this, group_topic cannot overlay
+    a claim onto its matching prose sentence (so the claim is INSERTED as a duplicate) and
+    the Stage-B weeding pass is inert (claim_vecs empty). Replaces the retired persist_dedup
+    embed backfill. Claim sentences reuse the authoritative chain_claim_text embedding
+    (matched by text — reset-independent, no API call); prose is embed_batch'd. Idempotent:
+    fills only NULL embeddings. Returns the count that were missing."""
+    missing = db.execute(sql_text(
+        "SELECT s.sentence_id FROM article_sentence s "
+        "JOIN article_section sec ON s.section_id = sec.section_id "
+        "WHERE sec.article_id = :a AND s.is_hidden = FALSE AND s.embedding IS NULL"
+    ), {"a": article_id}).fetchall()
+    if not missing:
+        return 0
+    # (1) reuse chain_claim_text embeddings for sentences whose text is a known claim
+    db.execute(sql_text(
+        "UPDATE article_sentence AS s SET embedding = ct.embedding "
+        "FROM chain_claim_text ct, article_section sec "
+        "WHERE s.section_id = sec.section_id AND sec.article_id = :a "
+        "AND s.embedding IS NULL AND ct.claim_text = s.text AND ct.embedding IS NOT NULL"
+    ), {"a": article_id})
+    db.commit()
+    # (2) embed the remainder (prose) via the batch embedder
+    rem = db.execute(sql_text(
+        "SELECT s.sentence_id, s.text FROM article_sentence s "
+        "JOIN article_section sec ON s.section_id = sec.section_id "
+        "WHERE sec.article_id = :a AND s.is_hidden = FALSE AND s.embedding IS NULL "
+        "AND s.text IS NOT NULL AND btrim(s.text) <> ''"
+    ), {"a": article_id}).fetchall()
+    reused = len(missing) - len(rem)
+    if rem:
+        try:
+            from embedding import embed_batch
+            vecs = embed_batch([t for _, t in rem])
+            for (sid, _), vec in zip(rem, vecs):
+                db.execute(sql_text(
+                    "UPDATE article_sentence SET embedding = (:v)::vector WHERE sentence_id = :sid"
+                ), {"v": "[" + ",".join(repr(float(x)) for x in vec) + "]", "sid": sid})
+            db.commit()
+        except Exception as e:
+            logger.warning("_ensure_sentence_embeddings: prose embed failed for article %d: %s", article_id, e)
+            db.rollback()
+    logger.info("_ensure_sentence_embeddings: article %d — %d reused from chain_claim_text, %d embedded",
+                article_id, reused, len(rem))
+    return len(missing)
+
+
 def index_existing_claims_into_article(db: Session, article_id: int):
     """unified-sole-authority injection: group_topic drives injection + hiding.
 
@@ -300,6 +348,9 @@ def index_existing_claims_into_article(db: Session, article_id: int):
     ), {"a": article_id})
     db.commit()
 
+    # ── patch_crosslane_embed: embed sentences before grouping/weeding read them ──
+    _ensure_sentence_embeddings(db, article_id)
+
     # ── Stage A: unified grouping (claims + sentences) ──
     try:
         from unified_grouping_db import group_topic, make_similar
@@ -321,6 +372,7 @@ def index_existing_claims_into_article(db: Session, article_id: int):
 
     hide_ids = set()
     kept_claim_sids = []   # (sentence_id) of sentences carrying a claim post_id
+    attached_pids = set()  # patch_canonical_authority: canonicals already attached this run
     indexed_count = 0
 
     for g in groups:
@@ -336,6 +388,23 @@ def index_existing_claims_into_article(db: Session, article_id: int):
         sent_members = [m for m in g.members if m.kind == KIND_SENTENCE and m.id in sent_by_id]
 
         if canon.kind == KIND_CLAIM:
+            # patch_canonical_authority: claim_dupe_group is the SINGLE authority for
+            # which member represents a dupe group. Resolve the article-side pick to
+            # the authoritative canonical (post_id + text); ungrouped -> fall back.
+            _row = db.execute(sql_text(
+                "SELECT g2.canonical_post_id, ct2.claim_text "
+                "FROM chain_claim_text ct "
+                "JOIN claim_dupe_group g2 ON ct.dupe_group_id = g2.group_id "
+                "JOIN chain_claim_text ct2 ON ct2.post_id = g2.canonical_post_id "
+                "WHERE ct.post_id = :p"), {"p": canon.id}).fetchone()
+            canon_pid = _row[0] if _row else canon.id
+            canon_text = _row[1] if (_row and _row[1]) else canon.text
+            if canon_pid in attached_pids:
+                # authoritative canonical already carries a sentence (the article-side
+                # pass split a dupe pair into two groups) -> hide, never double-attach
+                for m in sent_members:
+                    hide_ids.add(m.id)
+                continue
             # find a grouped sentence to overlay the claim onto; else insert
             target_sid = None
             for m in sent_members:
@@ -343,7 +412,8 @@ def index_existing_claims_into_article(db: Session, article_id: int):
                     target_sid = m.id
                     break
             if target_sid is not None:
-                update_sentence_post_id(db, target_sid, canon.id)
+                update_sentence_post_id(db, target_sid, canon_pid)
+                attached_pids.add(canon_pid)
                 kept_claim_sids.append(target_sid)
                 indexed_count += 1
                 # hide the OTHER sentence members (grouped dupes)
@@ -354,14 +424,15 @@ def index_existing_claims_into_article(db: Session, article_id: int):
                 # no grouped sentence present -> insert the claim into best section
                 try:
                     from articles.claim_indexer import find_best_section
-                    sec_id = find_best_section(db, article_id, canon.text)
+                    sec_id = find_best_section(db, article_id, canon_text)
                     if sec_id is not None:
                         last = db.execute(sql_text(
                             "SELECT sentence_id FROM article_sentence WHERE section_id = :s "
                             "ORDER BY sort_order DESC LIMIT 1"
                         ), {"s": sec_id}).fetchone()
-                        new_sid = insert_sentence(db, sec_id, last[0] if last else None, canon.text)
-                        update_sentence_post_id(db, new_sid, canon.id)
+                        new_sid = insert_sentence(db, sec_id, last[0] if last else None, canon_text)
+                        update_sentence_post_id(db, new_sid, canon_pid)
+                        attached_pids.add(canon_pid)
                         kept_claim_sids.append(new_sid)
                         indexed_count += 1
                 except Exception as e:

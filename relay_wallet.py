@@ -29,31 +29,17 @@ from tx_signer import TxRevertedError, build_w3, make_sign_and_send
 
 logger = logging.getLogger(__name__)
 
-RELAY_PRIVATE_KEY = os.getenv("RELAY_PRIVATE_KEY", "")
+# patch_kms_relay: the relay key now lives in GCP Cloud KMS (HSM). The private key
+# never exists on this box; signing happens via asymmetricSign. Fail-loud policy is
+# unchanged: RELAY_KMS_KEY + RELAY_ADDRESS are required and must agree, with NO
+# fallback to a raw private key (RELAY_PRIVATE_KEY is deliberately ignored).
 RELAY_ADDRESS = os.getenv("RELAY_ADDRESS", "")
 
 w3 = build_w3(RPC_WRITE_URLS, conn_err_msg="relay_wallet: Web3 RPC not connected")
 
-if not RELAY_PRIVATE_KEY:
-    raise RuntimeError(
-        "relay_wallet: RELAY_PRIVATE_KEY not set. Relay/MM key separation (#298) is "
-        "required and fail-loud: provision RELAY_PRIVATE_KEY in "
-        "env/secrets.<network>.enc.yaml (and fund the relay EOA with gas) before start. "
-        "There is deliberately no fallback to the MM key."
-    )
-if not RELAY_ADDRESS:
-    raise RuntimeError(
-        "relay_wallet: RELAY_ADDRESS not set. It is required so startup can assert the "
-        "private key derives the expected relay EOA (guards against a mismatched paste)."
-    )
+from signing.kms_account import kms_account_from_env  # patch_kms_relay
 
-account = Account.from_key(RELAY_PRIVATE_KEY)
-
-if account.address.lower() != RELAY_ADDRESS.lower():
-    raise RuntimeError(
-        "relay_wallet: RELAY_PRIVATE_KEY derives %s, expected RELAY_ADDRESS %s"
-        % (account.address, RELAY_ADDRESS)
-    )
+account = kms_account_from_env("RELAY")  # asserts RELAY_KMS_KEY derives RELAY_ADDRESS
 
 logger.info("relay_wallet: signer ready, address=%s", account.address)
 

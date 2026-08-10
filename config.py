@@ -123,7 +123,6 @@ MM_ADDRESS = _require_for_mainnet(
     os.getenv("MM_ADDRESS", _MM_ADDRESS_FUJI_FALLBACK),
     _MM_ADDRESS_FUJI_FALLBACK,
 )
-MM_PRIVATE_KEY = os.getenv("MM_PRIVATE_KEY", "")
 
 # Treasury wallet (revenue — receives trade fees + relay fees)
 # patch_bundle10c_backend_hardening_config: explicit TREASURY_ADDRESS required on mainnet.

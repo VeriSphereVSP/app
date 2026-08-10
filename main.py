@@ -107,68 +107,9 @@ async def lifespan(app):
 
     # Dupe refresh runs in worker service
 
-    # Background article refresh — autotunes interval to spread load over 24h
-    async def _daily_refresh():
-        import asyncio, statistics, time
-        from db import get_session_factory
-        from articles.article_store import refresh_article, persist_dedup, build_and_cache_response
-        from sqlalchemy import text as sql_text
-        CYCLE_SECONDS = 86400  # 24h target
-        recent_elapsed = []
-        # Initial sleep to avoid hitting LLM during app startup
-        await asyncio.sleep(120)
-        while True:
-            try:
-                Sess = get_session_factory()
-                # Pick the article with the oldest last_refreshed_at
-                db = Sess()
-                try:
-                    row = db.execute(sql_text(
-                        "SELECT topic_key, article_id FROM topic_article "
-                        "ORDER BY last_refreshed_at NULLS FIRST LIMIT 1"
-                    )).fetchone()
-                    n_row = db.execute(sql_text("SELECT COUNT(*) FROM topic_article")).fetchone()
-                    N = n_row[0] if n_row else 1
-                finally:
-                    db.close()
-                
-                if row:
-                    topic_key, article_id = row
-                    t0 = time.time()
-                    
-                    def _do_refresh():
-                        sess = Sess()
-                        try:
-                            refresh_article(sess, topic_key)
-                        finally:
-                            sess.close()
-                        sess = Sess()
-                        try:
-                            persist_dedup(sess, article_id)
-                        finally:
-                            sess.close()
-                        build_and_cache_response(Sess, topic_key)
-                    
-                    try:
-                        await asyncio.to_thread(_do_refresh)
-                        elapsed = time.time() - t0
-                        recent_elapsed.append(elapsed)
-                        if len(recent_elapsed) > 10:
-                            recent_elapsed.pop(0)
-                        avg = statistics.mean(recent_elapsed)
-                        print(f"bg-refresh: '{topic_key}' done in {elapsed:.1f}s (avg {avg:.1f}s, N={N})")
-                    except Exception as e:
-                        print(f"bg-refresh failed for '{topic_key}': {e}")
-                
-                # Autotune: spread CYCLE_SECONDS evenly across N articles
-                avg = statistics.mean(recent_elapsed) if recent_elapsed else 30.0
-                sleep_s = max(60, (CYCLE_SECONDS - N * avg) / max(N, 1))
-                print(f"bg-refresh: sleeping {sleep_s:.0f}s before next (N={N}, avg={avg:.1f}s)")
-                await asyncio.sleep(sleep_s)
-            except Exception as e:
-                print(f"bg-refresh loop error: {e}")
-                await asyncio.sleep(120)
-    _aio.create_task(_daily_refresh())
+    # patch_remove_app_refresh: article refresh removed from the API process — it runs in
+    # worker.py (with the session-leak fix this copy lacked). The app is now
+    # free of singleton background jobs and is horizontally scalable.
 
     yield
     print("API server stopped")

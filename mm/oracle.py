@@ -38,8 +38,8 @@ HTTP_TIMEOUT = 6.0  # seconds
 # volatile, so it is set generously. patch_bundle08_oracle_cap_config: now
 # env-tunable (no code change to move them) and the default cap is raised to
 # $50k (~8× the 2026 high, ~11× spot) after gold's run toward $5–6k.
-MIN_GOLD_PRICE = float(os.getenv("MIN_GOLD_PRICE", "1000"))
-MAX_GOLD_PRICE = float(os.getenv("MAX_GOLD_PRICE", "50000"))
+MIN_GOLD_PRICE = float(os.getenv("MIN_GOLD_PRICE", "1500"))  # patch_f7rg_f10_goldband: 1000 -> 1500 (pre-mainnet; tighter fail-closed band around realistic spot)
+MAX_GOLD_PRICE = float(os.getenv("MAX_GOLD_PRICE", "10000"))  # patch_f7rg_f10_goldband: 50000 -> 10000
 
 # patch_bundle08_oracle_cap_config: warn when a *valid* gold price crosses an
 # absolute "watch level", decoupled from MAX_GOLD_PRICE so the heads-up and the

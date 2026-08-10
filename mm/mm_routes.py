@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, HTTPException, Depends, Header
+from fastapi import APIRouter, HTTPException, Depends, Header, Request  # patch_postreview_mm_trade_limit: +Request
 from pydantic import BaseModel, Field, AliasChoices, ConfigDict
 from sqlalchemy.orm import Session
 from sqlalchemy import text
@@ -18,6 +18,8 @@ from db import get_db
 from fee_calculator import compute_fee as calc_fee
 from mm.erc20 import allowance, transfer, transfer_from
 from config import USDC_ADDRESS, VSP_ADDRESS, MM_ADDRESS, TREASURY_ADDRESS, SERVICE_API_TOKEN, REQUIRE_SERVICE_TOKEN
+from rate_limit import check_mm_trade, _client_ip  # patch_postreview_mm_trade_limit
+from mm import mm_reconcile  # patch_f7rg_record_buy
 from mm.mm_pricing import (
     get_spot_quote,
     compute_buy_fill,
@@ -66,7 +68,7 @@ def require_service_token(x_service_token: str | None = Header(default=None)):
 # a sharp *favorable* price move (fill rises far above the user's fixed minimum)
 # trip the floor — harmless (the FE re-quotes and retries at the better price),
 # but the reason to keep it loose for B1.
-MM_SELL_SLIPPAGE_FLOOR_FRAC = float(os.getenv("MM_SELL_SLIPPAGE_FLOOR_FRAC", "0.80"))
+MM_SELL_SLIPPAGE_FLOOR_FRAC = float(os.getenv("MM_SELL_SLIPPAGE_FLOOR_FRAC", "0.95"))  # patch_f7rg_f8_slippage: 0.80 -> 0.95 (pre-mainnet tighten; FE sends ~0.99*net)
 
 
 # ────────────────────────────────────────────────────────────
@@ -494,13 +496,24 @@ def preview_sell(qty_vsp: float, db: Session = Depends(get_db)):
         "breakdown": fee["breakdown"],
     }
 
+# patch_killswitch_mm_halt: runtime trading-halt guard. Trip by creating the flag file
+# (default /control/mm_trading.halt); mm_buy/mm_sell return 503 while it
+# exists. Read-only endpoints (quote/floor/preview) stay up during a halt.
+def _mm_halt_guard() -> None:
+    _flag = os.getenv("MM_HALT_FLAG_PATH", "/control/mm_trading.halt")
+    if os.path.exists(_flag):
+        raise HTTPException(503, "MM trading is temporarily halted")
+
+
 @router.post("/buy", dependencies=[Depends(require_service_token)])
-def mm_buy(req: MMBuyRequest, db: Session = Depends(get_db)):
+def mm_buy(req: MMBuyRequest, request: Request, db: Session = Depends(get_db)):
     """
     Buy VSP with USDC.
     If permit is provided, MM executes USDC.permit() first (gasless for user).
     Otherwise, falls back to checking existing allowance.
     """
+    _mm_halt_guard()  # patch_killswitch_mm_halt
+    check_mm_trade(_client_ip(request), req.user_address)  # patch_postreview_mm_trade_limit
     try:
         with db.begin():
             row = _load_mm_state(db, for_update=True)
@@ -566,13 +579,29 @@ def mm_buy(req: MMBuyRequest, db: Session = Depends(get_db)):
             reserves_micro = int(fill.total_usd * 1_000_000)
             fee_micro = int(fee_usdc * 1_000_000)
 
-            # Execute on-chain transfers
-            transfer_from(USDC_ADDRESS, req.user_address, MM_ADDRESS, reserves_micro)
+            # Execute on-chain transfers.
+            # patch_f7rg_record_buy: F-7 non-atomic-trade recording. Open a durable
+            # partial-trade row BEFORE any leg moves; stamp each leg's hash as it
+            # lands; close it as 'noop' once all legs are through. If a later leg
+            # throws, the row survives (own session, eager commit) and the worker
+            # reconciler completes-or-refunds. Recording never blocks a trade: any
+            # bookkeeping error is swallowed so the trade path is unaffected.
+            _f7_idem = mm_reconcile.make_idem_key("buy", req.user_address, req.qty_vsp)
+            _f7_row = mm_reconcile.open_partial(
+                side="buy", user_address=req.user_address, qty_vsp=req.qty_vsp,
+                reserves_micro=reserves_micro, fee_micro=fee_micro,
+                vsp_wei=int(req.qty_vsp * 10**18), idem_key=_f7_idem)
+            _h = transfer_from(USDC_ADDRESS, req.user_address, MM_ADDRESS, reserves_micro)
+            mm_reconcile.mark_leg(_f7_row, "leg_principal_in_tx", _h)
             if fee_micro > 0 and TREASURY_ADDRESS.lower() != MM_ADDRESS.lower():
-                transfer_from(USDC_ADDRESS, req.user_address, TREASURY_ADDRESS, fee_micro)
+                _hf = transfer_from(USDC_ADDRESS, req.user_address, TREASURY_ADDRESS, fee_micro)
+                mm_reconcile.mark_leg(_f7_row, "leg_fee_in_tx", _hf)
             elif fee_micro > 0:
-                transfer_from(USDC_ADDRESS, req.user_address, MM_ADDRESS, fee_micro)
+                _hf = transfer_from(USDC_ADDRESS, req.user_address, MM_ADDRESS, fee_micro)
+                mm_reconcile.mark_leg(_f7_row, "leg_fee_in_tx", _hf)
             _buy_vsp_tx_hash = transfer(VSP_ADDRESS, req.user_address, int(req.qty_vsp * 10**18))  # patch_bundle04_5_p21_mm_buy_tx_hash
+            mm_reconcile.mark_leg(_f7_row, "leg_payout_out_tx", _buy_vsp_tx_hash)
+            mm_reconcile.close_partial_ok(_f7_row)
 
             # Force next chain read to skip cache, then re-read chain state
             # so the audit log records observed-on-chain values rather than
@@ -624,12 +653,14 @@ def mm_buy(req: MMBuyRequest, db: Session = Depends(get_db)):
 
 
 @router.post("/sell", dependencies=[Depends(require_service_token)])
-def mm_sell(req: MMSellRequest, db: Session = Depends(get_db)):
+def mm_sell(req: MMSellRequest, request: Request, db: Session = Depends(get_db)):
     """
     Sell VSP for USDC.
     If permit is provided, MM executes VSP.permit() first (gasless for user).
     Otherwise, falls back to checking existing allowance.
     """
+    _mm_halt_guard()  # patch_killswitch_mm_halt
+    check_mm_trade(_client_ip(request), req.user_address)  # patch_postreview_mm_trade_limit
     try:
         with db.begin():
             row = _load_mm_state(db, for_update=True)
@@ -705,14 +736,32 @@ def mm_sell(req: MMSellRequest, db: Session = Depends(get_db)):
 
             # Fee + net already computed above (patch_g34_sell_net_guard).
 
-            # Execute on-chain transfers
-            _sell_vsp_tx_hash = transfer_from(VSP_ADDRESS, req.user_address, MM_ADDRESS, vsp_wei)  # patch_bundle04_5_p21_mm_sell_tx_hash
+            # Execute on-chain transfers.
+            # patch_f7rg_record_sell + patch_sellfee_recording: F-7 recording of
+            # all THREE sell legs (user VSP in -> net USDC to user -> fee MM->sink).
+            # The fee leg previously sat OUTSIDE the envelope (intent said
+            # fee_micro=0 and closed before the fee transfer): a failed fee leg
+            # 500'd after the user was fully paid, with no durable record that the
+            # sink was short. Ordering stays USER-FIRST: the payout precedes the
+            # fee, so a fee-leg failure never delays or reduces what the user gets.
             usdc_micro = int(net_usdc * 1_000_000)
-            transfer(USDC_ADDRESS, req.user_address, usdc_micro)
-            # Send fee to treasury
             fee_micro = int(fee_usdc * 1_000_000)
-            if fee_micro > 0 and TREASURY_ADDRESS.lower() != MM_ADDRESS.lower():
-                transfer(USDC_ADDRESS, TREASURY_ADDRESS, fee_micro)
+            _fee_leg_active = fee_micro > 0 and TREASURY_ADDRESS.lower() != MM_ADDRESS.lower()
+            _f7s_idem = mm_reconcile.make_idem_key("sell", req.user_address, req.qty_vsp)
+            _f7s_row = mm_reconcile.open_partial(
+                side="sell", user_address=req.user_address, qty_vsp=req.qty_vsp,
+                reserves_micro=usdc_micro,
+                fee_micro=fee_micro if _fee_leg_active else 0,
+                vsp_wei=vsp_wei, idem_key=_f7s_idem)
+            _sell_vsp_tx_hash = transfer_from(VSP_ADDRESS, req.user_address, MM_ADDRESS, vsp_wei)  # patch_bundle04_5_p21_mm_sell_tx_hash
+            mm_reconcile.mark_leg(_f7s_row, "leg_principal_in_tx", _sell_vsp_tx_hash)
+            _payout_h = transfer(USDC_ADDRESS, req.user_address, usdc_micro)
+            mm_reconcile.mark_leg(_f7s_row, "leg_payout_out_tx", _payout_h)
+            # Send fee to treasury — now inside the F-7 envelope
+            if _fee_leg_active:
+                _fee_h = transfer(USDC_ADDRESS, TREASURY_ADDRESS, fee_micro)
+                mm_reconcile.mark_leg(_f7s_row, "leg_fee_in_tx", _fee_h)
+            mm_reconcile.close_partial_ok(_f7s_row)
 
             # Invalidate then re-read chain so audit log records observed
             # post-trade reality (not DB arithmetic, which drifts).
