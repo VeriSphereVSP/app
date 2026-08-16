@@ -92,11 +92,9 @@ def _get_w3():
 
 
 def _load_abi(name):
-    path = Path(f"/core/out/{name}.sol/{name}.json")
-    if path.exists():
-        with open(path) as f:
-            return json.load(f)["abi"]
-    return []
+    # Resolves in both Docker (/core mount) and bare local runs.
+    from chain.abi import load_abi_optional
+    return load_abi_optional(name) or []
 
 
 # patch_bundle04_5_p21_load_abi_path
@@ -168,9 +166,13 @@ def _forwarder_treasury_address():
     try:
         from config import FORWARDER_ADDRESS  # local import; avoid cycles at module load
         if FORWARDER_ADDRESS:
+            _repo = Path(__file__).resolve().parent
             abi = _load_abi_paths("VerisphereForwarder", [
                 "/core/out/VerisphereForwarder.sol/VerisphereForwarder.json",
                 "/app/contracts/out/VerisphereForwarder.sol/VerisphereForwarder.json",
+                # Bare local runs (no container mounts):
+                str(_repo.parent / "core/out/VerisphereForwarder.sol/VerisphereForwarder.json"),
+                str(_repo / "contracts/out/VerisphereForwarder.sol/VerisphereForwarder.json"),
             ])
             if abi:
                 w3 = _get_w3()

@@ -44,13 +44,16 @@ def _stake():
     )
 
 def _score():
-    import json as _json
     from config import SCORE_ENGINE_ADDRESS
+    from chain.abi import load_abi_optional
     if not SCORE_ENGINE_ADDRESS:
         raise HTTPException(503, "ScoreEngine not configured")
+    abi = load_abi_optional("ScoreEngine")
+    if not abi:
+        raise HTTPException(503, "ScoreEngine ABI unavailable (run forge build in core/)")
     return w3.eth.contract(
         address=Web3.to_checksum_address(SCORE_ENGINE_ADDRESS),
-        abi=_json.loads(open("/core/out/ScoreEngine.sol/ScoreEngine.json").read())["abi"],
+        abi=abi,
     )
 
 

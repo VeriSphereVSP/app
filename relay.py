@@ -136,11 +136,9 @@ DUPLICATE_CLAIM_SELECTOR = "c314bc02"
 
 
 def _load_abi(name):
-    path = Path(f"/core/out/{name}.sol/{name}.json")
-    if path.exists():
-        with open(path) as f:
-            return json.load(f)["abi"]
-    return None
+    # Resolves in both Docker (/core mount) and bare local runs.
+    from chain.abi import load_abi_optional
+    return load_abi_optional(name)
 
 
 FORWARDER_ABI = _load_abi("VerisphereForwarder") or [
