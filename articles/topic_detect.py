@@ -92,12 +92,34 @@ def ensure_article_for_claim(db: Session, claim_text: str, post_id: int, topic: 
 
     topic_key = _norm(topic)
 
-    # Check if article already exists (exact match or similar key)
-    existing = db.execute(sql_text(
-        "SELECT article_id, topic_key FROM topic_article "
-        "WHERE topic_key = :k OR topic_key LIKE :prefix OR :k LIKE topic_key || '%'"
-        " LIMIT 1"
-    ), {"k": topic_key, "prefix": topic_key + "%"}).fetchone()
+    # patch_topicart_centroid_resolve: resolve the article by the centroid-
+    # resolved topic_id (semantic identity), NOT by fuzzy string prefix match.
+    # The old prefix-LIKE lookup is exactly what let "January 6" / "6th" /
+    # "6th insurrection" each create a separate article for one topic (2026-07-19).
+    # Same-name/different-meaning topics have distinct centroids -> distinct
+    # topic_id -> distinct articles, so this is both correct and disambiguating.
+    # Fall back to the legacy string lookup only when no topic_id resolves yet
+    # (claim not centroided) so first-claim behavior is preserved.
+    existing = None
+    try:
+        from articles.topic_article_canonical import (
+            resolve_topic_id_for_claim, resolve_article_for_topic_id,
+        )
+        _tid = resolve_topic_id_for_claim(db, claim_text)
+        if _tid is not None:
+            _aid = db.execute(sql_text(
+                "SELECT article_id FROM topic_article WHERE topic_id = :t LIMIT 1"
+            ), {"t": _tid}).fetchone()
+            if _aid:
+                existing = (_aid[0], None)
+    except Exception as _e:
+        logger.warning("centroid article resolve failed (%s); falling back to string", _e)
+    if existing is None:
+        existing = db.execute(sql_text(
+            "SELECT article_id, topic_key FROM topic_article "
+            "WHERE topic_key = :k OR topic_key LIKE :prefix OR :k LIKE topic_key || '%'"
+            " LIMIT 1"
+        ), {"k": topic_key, "prefix": topic_key + "%"}).fetchone()
 
     if existing:
         article_id = existing[0]

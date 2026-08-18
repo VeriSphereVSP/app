@@ -111,6 +111,11 @@ APPROVE_ABI = [{
 }]
 
 MAX_UINT256 = 2**256 - 1
+# patch_verity_approve_allowlist: the only legitimate spenders in the protocol.
+# An encoder must never sign-ready an infinite approval to an arbitrary address.
+ALLOWED_SPENDERS = {
+    a.lower() for a in (STAKE_ENGINE_ADDRESS, POST_REGISTRY_ADDRESS) if a
+}
 WEI = 10**18
 MAX_CLAIM_LENGTH = 500
 # Guards the int256 encoding below and any accidental fat-finger from a client.
@@ -244,6 +249,8 @@ def relay_build(body: dict, request: Request) -> Dict[str, Any]:
         spender = body.get("spender")
         if not isinstance(spender, str) or not Web3.is_address(spender):
             raise HTTPException(400, "approve requires a valid 'spender' address")
+        if spender.lower() not in ALLOWED_SPENDERS:  # patch_verity_approve_allowlist
+            raise HTTPException(400, "spender must be a protocol contract (StakeEngine or PostRegistry)")
         token = w3.eth.contract(address=Web3.to_checksum_address(VSP_ADDRESS), abi=APPROVE_ABI)
         data = _encode_call(token, "approve", [Web3.to_checksum_address(spender), MAX_UINT256])
         return {"to": VSP_ADDRESS.lower(), "data": data, "permitValueWei": "0"}

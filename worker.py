@@ -197,6 +197,31 @@ async def main():
     asyncio.create_task(_daily_refresh())
     print("Article refresh scheduled")
 
+    # patch_topicart_reconcile_task: self-healing one-article-per-topic. Collapses
+    # any topic with >1 article to a single canonical article (claims preserved,
+    # deletions logged+alerted). Keyed on topic_id, never on name — asserts the
+    # topic count is unchanged so meanings are never fused.
+    async def _topic_article_reconcile():
+        await asyncio.sleep(90)
+        import os as _os
+        from db import get_session_factory as _sf
+        from articles.topic_article_canonical import reconcile_topic_articles as _rec
+        _interval = int(_os.getenv("VSP_TOPIC_ARTICLE_RECONCILE_SEC", "3600"))
+        while True:
+            try:
+                _db = _sf()()
+                try:
+                    _res = _rec(_db)
+                    if _res.get("collapsed") or _res.get("errors"):
+                        print(f"topic-article-reconcile: {_res}", flush=True)
+                finally:
+                    _db.close()
+            except Exception as _e:
+                print(f"topic-article-reconcile error: {_e}", flush=True)
+            await asyncio.sleep(_interval)
+    asyncio.create_task(_topic_article_reconcile())
+    print("Topic-article reconciler scheduled")
+
     # patch_bundle08_idle_tx_alert: periodic idle-in-transaction monitor.
     async def _idle_tx_monitor():
         await asyncio.sleep(45)  # initial delay; let startup transactions settle
