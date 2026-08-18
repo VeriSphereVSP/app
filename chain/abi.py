@@ -49,6 +49,21 @@ def load_abi(contract_name: str) -> List[Dict[str, Any]]:
     return abi
 
 
+def load_abi_optional(contract_name: str) -> List[Dict[str, Any]] | None:
+    """Like load_abi, but returns None when the artifact is absent.
+
+    For callers with a graceful degradation path (inline fallback ABI,
+    feature disable). Resolves relative to the repo checkout, which is the
+    same location as the container's /core mount when app/ runs at /app —
+    so one path works both in Docker and on a bare local run.
+    """
+    artifact = _CORE_OUT / f"{contract_name}.sol" / f"{contract_name}.json"
+    if not artifact.exists():
+        return None
+    with artifact.open() as f:
+        return json.load(f).get("abi")
+
+
 # Pre-load all ABIs used by the app.
 # These fail loudly at startup if forge build hasn't been run.
 try:

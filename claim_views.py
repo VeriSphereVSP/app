@@ -44,13 +44,16 @@ def _stake():
     )
 
 def _score():
-    import json as _json
     from config import SCORE_ENGINE_ADDRESS
+    from chain.abi import load_abi_optional
     if not SCORE_ENGINE_ADDRESS:
         raise HTTPException(503, "ScoreEngine not configured")
+    abi = load_abi_optional("ScoreEngine")
+    if not abi:
+        raise HTTPException(503, "ScoreEngine ABI unavailable (run forge build in core/)")
     return w3.eth.contract(
         address=Web3.to_checksum_address(SCORE_ENGINE_ADDRESS),
-        abi=_json.loads(open("/core/out/ScoreEngine.sol/ScoreEngine.json").read())["abi"],
+        abi=abi,
     )
 
 
@@ -103,6 +106,43 @@ def claim_summary(post_id: int, db: Session = Depends(get_db)):
         "verity_score": round(info["effective_vs"], 2),
         "incoming_count": len(incoming),
         "outgoing_count": len(outgoing),
+    }
+
+
+@router.get("/{post_id}/live")
+def claim_live(post_id: int):
+    """Claim state read STRAIGHT FROM THE CHAIN, bypassing the indexed DB.
+
+    /summary is derived from chain_* tables and so trails the chain by however
+    long indexing takes. That lag is invisible almost everywhere, but it is
+    glaring in the one moment a user is watching: right after they stake, the
+    claim they just funded still reads as 0 staked and inactive. The extension
+    polls this endpoint after a confirmed transaction so the UI reflects what
+    the user just did.
+
+    One ProtocolViews call, so every field is from the same block — no chance of
+    stakes and score disagreeing. is_active comes from the contract's own
+    totalStake >= postingFee test rather than being recomputed here.
+    """
+    try:
+        s = _views().functions.getClaimSummary(post_id).call()
+    except Exception as e:
+        logger.warning("claim_live(%d) failed: %s", post_id, e)
+        raise HTTPException(502, "Chain read failed")
+
+    # ProtocolViews.ClaimSummary field order (core/src/ProtocolViews.sol):
+    # text, supportStake, challengeStake, totalStake, postingFee, isActive,
+    # baseVSRay, effectiveVSRay, incomingCount, outgoingCount.
+    support, challenge, total = int(s[1]), int(s[2]), int(s[3])
+    return {
+        "post_id": post_id,
+        "support_vsp": round(_wei_to_vsp(support), 6),
+        "challenge_vsp": round(_wei_to_vsp(challenge), 6),
+        "total_vsp": round(_wei_to_vsp(total), 6),
+        "posting_fee_vsp": round(_wei_to_vsp(int(s[4])), 6),
+        "active": bool(s[5]),
+        "base_vs": _ray_to_pct(int(s[6])),
+        "effective_vs": _ray_to_pct(int(s[7])),
     }
 
 

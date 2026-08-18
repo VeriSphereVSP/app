@@ -75,15 +75,27 @@ class SlidingWindow:
         entries.append((now, weight))
         return True, max_units - used - weight
 
-    def cleanup(self, max_age: int = 3600):
-        """Remove keys with no recent hits. Call periodically."""
+    def cleanup(self, max_age: int = 3600, prefixes: tuple = ()):
+        """Remove keys with no recent hits. Call periodically.
+
+        `prefixes` restricts the sweep to keys starting with one of them, so
+        high-cardinality short-window buckets can be reaped on a much shorter
+        fuse than the daily budgets, which must survive 24h.
+        """
         now = time.time()
-        dead = [k for k, v in self._hits.items() if not v or v[-1] < now - max_age]
-        for k in dead:
-            del self._hits[k]
-        deadw = [k for k, v in self._weighted.items() if not v or v[-1][0] < now - max_age]
-        for k in deadw:
-            del self._weighted[k]
+        cutoff = now - max_age
+
+        def _sweep(d, last_ts):
+            dead = [
+                k for k, v in d.items()
+                if (not prefixes or k.startswith(prefixes))
+                and (not v or last_ts(v) < cutoff)
+            ]
+            for k in dead:
+                del d[k]
+
+        _sweep(self._hits, lambda v: v[-1])
+        _sweep(self._weighted, lambda v: v[-1][0])
 
 
 _limiter = SlidingWindow()
@@ -104,6 +116,53 @@ def _int_env(_name, _default):
         return _default
 GENERAL_RATE_LIMIT = _int_env("GENERAL_RATE_LIMIT", 120)    # requests per window
 GENERAL_RATE_WINDOW = _int_env("GENERAL_RATE_WINDOW", 60)   # seconds
+
+# Per-endpoint per-IP limits (requests per minute), loaded once at startup from
+# a JSON file so individual endpoints can be tuned — or effectively disabled
+# with a value <= 0 — without a code change. Keys are ROUTE TEMPLATES exactly as
+# declared ("/api/claims/{post_id}/live"), not concrete paths, so all ids share
+# one bucket. Endpoints not listed get default_per_minute. This caps any single
+# endpoint (e.g. an RPC-backed read) independently of the general cap above,
+# which only bounds an IP's TOTAL traffic.
+ENDPOINT_RATE_WINDOW = 60  # "per minute" by definition
+
+
+def _load_endpoint_limits() -> tuple[int, dict]:
+    """(default_per_minute, {route_template: per_minute}) from RATE_LIMITS_FILE.
+
+    Missing or malformed config degrades to the default for every endpoint —
+    a bad ops edit must never keep the API from starting.
+    """
+    import json
+    path = os.getenv("RATE_LIMITS_FILE") or os.path.join(
+        os.path.dirname(__file__), "ops", "rate_limits.json"
+    )
+    default = 100
+    per_endpoint: dict = {}
+    try:
+        with open(path) as f:
+            cfg = json.load(f)
+        default = int(cfg.get("default_per_minute", default))
+        for tpl, lim in (cfg.get("endpoints") or {}).items():
+            per_endpoint[str(tpl)] = int(lim)
+        logger.info(
+            "endpoint rate limits: default=%d/min, %d override(s) (%s)",
+            default, len(per_endpoint), path,
+        )
+    except FileNotFoundError:
+        logger.info(
+            "endpoint rate limits: no config at %s; default %d/min for all endpoints",
+            path, default,
+        )
+    except Exception as e:
+        logger.warning(
+            "endpoint rate limits: could not load %s (%s); default %d/min for all endpoints",
+            path, e, default,
+        )
+    return default, per_endpoint
+
+
+ENDPOINT_RATE_DEFAULT, ENDPOINT_RATE_LIMITS = _load_endpoint_limits()
 
 # Relay rate limits (per user address)
 RELAY_RATE_LIMIT = 60           # relay txs per window
@@ -139,6 +198,33 @@ AI_DAILY_WINDOW = 86400         # 24 hours
 AI_BATCH_SENT_LIMIT = _int_env("VSP_AI_BATCH_SENT_LIMIT", 500)     # sentences per window, per IP
 AI_BATCH_SENT_WINDOW = _int_env("VSP_AI_BATCH_SENT_WINDOW", 300)   # seconds
 AI_BATCH_SENT_DAILY = _int_env("VSP_AI_BATCH_SENT_DAILY", 20000)   # sentences per day, global
+
+# Named AI budgets: (per-IP calls, window seconds, global calls per day). An
+# endpoint that names one is metered against its OWN buckets instead of drawing
+# down the shared AI_DAILY_BUDGET. Atomicity fires on every claim-creation
+# attempt, so sharing a 500/day pool with article generation would starve one or
+# the other.
+_AI_BUDGETS = {
+    "atomicity": (
+        _int_env("VSP_ATOMICITY_RATE_LIMIT", 60),
+        _int_env("VSP_ATOMICITY_RATE_WINDOW", 300),
+        _int_env("VSP_ATOMICITY_DAILY_BUDGET", 5000),
+    ),
+}
+
+# The same idea for the per-SENTENCE (ai_batch) tier. /claims/locate needs its
+# own buckets rather than match-batch's: it fires continuously as a reader
+# scrolls an article (hundreds of sentences per page is normal, where
+# match-batch's 500/window was sized for occasional explicit calls), and it
+# embeds only the sentences that survive its token prefilter, so the submitted
+# count overstates its real cost by a wide margin.
+_AI_BATCH_BUDGETS = {
+    "locate": (
+        _int_env("VSP_LOCATE_SENT_LIMIT", 3000),     # sentences per window, per IP
+        _int_env("VSP_LOCATE_SENT_WINDOW", 300),     # seconds
+        _int_env("VSP_LOCATE_SENT_DAILY", 500_000),  # sentences per day, global
+    ),
+}
 
 # patch_postreview_mm_trade_limit: anti-griefing limits for the MM money
 # endpoints (/api/mm/buy|sell). These endpoints cannot steal (they need the
@@ -264,8 +350,28 @@ def _client_ip(request: Request) -> str:
 
 # ── FastAPI middleware ─────────────────────────────────────
 
+def _route_template(request: Request) -> Optional[str]:
+    """The matched route's path template ("/api/claims/{post_id}/live"), or None.
+
+    Middleware runs before routing, so we resolve the template ourselves by
+    matching against the app's route table — the same test the router is about
+    to run. None (no route -> 404) is deliberately unmetered: random-path scans
+    must not mint fresh buckets, and the general cap already covers them.
+    """
+    from starlette.routing import Match
+    try:
+        for route in request.app.routes:
+            match, _ = route.matches(request.scope)
+            if match == Match.FULL:
+                return route.path
+    except Exception:
+        return None
+    return None
+
+
 class RateLimitMiddleware(BaseHTTPMiddleware):
-    """General per-IP rate limiting for all endpoints."""
+    """Per-IP rate limiting: a general cap on total traffic, plus an
+    independent per-endpoint cap (config-driven, see _load_endpoint_limits)."""
 
     async def dispatch(
         self, request: Request, call_next: RequestResponseEndpoint
@@ -285,6 +391,22 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
                 content={"detail": "Too many requests. Please slow down."},
                 headers={"Retry-After": str(GENERAL_RATE_WINDOW)},
             )
+
+        template = _route_template(request)
+        if template is not None:
+            limit = ENDPOINT_RATE_LIMITS.get(template, ENDPOINT_RATE_DEFAULT)
+            if limit > 0:
+                ok, _ = _limiter.check(f"ep:{template}:{ip}", limit, ENDPOINT_RATE_WINDOW)
+                if not ok:
+                    logger.warning(
+                        "Endpoint rate limit exceeded for IP %s on %s (%d/min)",
+                        ip, template, limit,
+                    )
+                    return JSONResponse(
+                        status_code=429,
+                        content={"detail": f"Too many requests to this endpoint. Limit: {limit} per minute."},
+                        headers={"Retry-After": str(ENDPOINT_RATE_WINDOW)},
+                    )
 
         response = await call_next(request)
         response.headers["X-RateLimit-Remaining"] = str(remaining)
@@ -373,7 +495,7 @@ def ai_rate_limit(func):
 
 # ── Periodic cleanup (call from a background task) ─────────
 
-def public_endpoint(path: str, cost_tier: str = "cheap"):
+def public_endpoint(path: str, cost_tier: str = "cheap", budget: str | None = None):
     """Mark an endpoint publicly consumable: register it for permissive CORS and apply
     the anti-griefing rate/cost tier. patch_public_hardening.
 
@@ -381,6 +503,10 @@ def public_endpoint(path: str, cost_tier: str = "cheap"):
       "ai_batch" — per-IP + global daily SENTENCE budget (weight = len(body['sentences']))
       "ai"       — per-IP + global daily CALL budget (like ai_rate_limit)
       "cheap"    — general per-IP middleware limit only
+
+    budget: name of an entry in _AI_BUDGETS ("ai" tier) or _AI_BATCH_BUDGETS
+    ("ai_batch" tier). Meters this endpoint against its own buckets rather than
+    the shared ones.
 
     Router decorator goes ON TOP so FastAPI registers the wrapped function:
         @router.post("/x")
@@ -405,19 +531,27 @@ def public_endpoint(path: str, cost_tier: str = "cheap"):
                 n = 1
                 if isinstance(body, dict) and isinstance(body.get("sentences"), list):
                     n = max(1, len(body["sentences"]))
-                ok_ip, _ = _limiter.check_weighted(f"aibatch:{ip}", n, AI_BATCH_SENT_LIMIT, AI_BATCH_SENT_WINDOW)
+                bucket = budget if budget in _AI_BATCH_BUDGETS else "aibatch"
+                per_ip, window, daily = _AI_BATCH_BUDGETS.get(
+                    bucket, (AI_BATCH_SENT_LIMIT, AI_BATCH_SENT_WINDOW, AI_BATCH_SENT_DAILY),
+                )
+                ok_ip, _ = _limiter.check_weighted(f"{bucket}:{ip}", n, per_ip, window)
                 if not ok_ip:
-                    logger.warning("ai_batch per-IP sentence budget exceeded for %s (n=%d)", ip, n)
-                    raise HTTPException(429, f"Too many sentences. Limit: {AI_BATCH_SENT_LIMIT} per {AI_BATCH_SENT_WINDOW}s.")
-                ok_g, _ = _limiter.check_weighted("aibatch:global:daily", n, AI_BATCH_SENT_DAILY, AI_DAILY_WINDOW)
+                    logger.warning("ai_batch per-IP sentence budget exceeded for %s (n=%d, bucket=%s)", ip, n, bucket)
+                    raise HTTPException(429, f"Too many sentences. Limit: {per_ip} per {window}s.")
+                ok_g, _ = _limiter.check_weighted(f"{bucket}:global:daily", n, daily, AI_DAILY_WINDOW)
                 if not ok_g:
-                    logger.warning("ai_batch global daily sentence budget exhausted")
+                    logger.warning("ai_batch global daily sentence budget exhausted (bucket=%s)", bucket)
                     raise HTTPException(503, "Batch match temporarily unavailable — daily budget reached.")
             elif cost_tier == "ai":
-                ok_ip, _ = _limiter.check(f"ai:{ip}", AI_RATE_LIMIT, AI_RATE_WINDOW)
+                bucket = budget if budget in _AI_BUDGETS else "ai"
+                per_ip, window, daily = _AI_BUDGETS.get(
+                    bucket, (AI_RATE_LIMIT, AI_RATE_WINDOW, AI_DAILY_BUDGET),
+                )
+                ok_ip, _ = _limiter.check(f"{bucket}:{ip}", per_ip, window)
                 if not ok_ip:
-                    raise HTTPException(429, f"Too many AI requests. Limit: {AI_RATE_LIMIT} per {AI_RATE_WINDOW // 60} minutes.")
-                ok_g, _ = _limiter.check("ai:global:daily", AI_DAILY_BUDGET, AI_DAILY_WINDOW)
+                    raise HTTPException(429, f"Too many AI requests. Limit: {per_ip} per {window // 60} minutes.")
+                ok_g, _ = _limiter.check(f"{bucket}:global:daily", daily, AI_DAILY_WINDOW)
                 if not ok_g:
                     raise HTTPException(503, "AI temporarily unavailable — daily budget reached.")
             # "cheap": general middleware limit already applies
@@ -429,4 +563,12 @@ def public_endpoint(path: str, cost_tier: str = "cheap"):
 
 def cleanup_rate_limiter():
     """Remove stale entries. Call every ~10 minutes from a background task."""
+    # The per-IP and per-IP-per-endpoint buckets are the high-cardinality
+    # classes (one key per (ip, route) pair seen), and they are provably dead
+    # two windows after the IP goes quiet — reap them fast rather than letting
+    # them ride the 2-day retention the daily AI budgets need.
+    _limiter.cleanup(
+        max_age=max(GENERAL_RATE_WINDOW, ENDPOINT_RATE_WINDOW) * 2,
+        prefixes=("general:", "ep:"),
+    )
     _limiter.cleanup(max_age=max(GENERAL_RATE_WINDOW, RELAY_RATE_WINDOW, AI_DAILY_WINDOW) * 2)

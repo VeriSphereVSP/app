@@ -38,6 +38,9 @@ from claim_views import router as claim_views_router
 from portfolio_views import router as portfolio_router
 from articles.article_routes import router as article_router
 from semantic_dedup import router as semantic_dedup_router
+from claim_locate import router as claim_locate_router
+from claim_atomicity import router as claim_atomicity_router
+from relay_gateway import router as relay_gateway_router
 from rate_limit import RateLimitMiddleware, cleanup_rate_limiter, _client_ip as _rl_client_ip, TRUSTED_PROXY_HOPS as _TRUSTED_PROXY_HOPS
 
 
@@ -160,6 +163,12 @@ app.include_router(claim_views_router)
 app.include_router(portfolio_router)
 app.include_router(article_router)
 app.include_router(semantic_dedup_router)
+# Endpoints the Verity browser extension needs (they replace the verity-api
+# gateway): article -> claim matching, the atomicity check, and wallet signing
+# config + calldata.
+app.include_router(claim_locate_router)
+app.include_router(claim_atomicity_router)
+app.include_router(relay_gateway_router)
 
 ADDRESSES_PATH = Path(f"/app/broadcast/Deploy.s.sol/{CHAIN_ID}/addresses.json")
 

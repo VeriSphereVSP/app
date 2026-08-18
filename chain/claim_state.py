@@ -62,16 +62,20 @@ def fetch_claim_state(post_id: int) -> Dict[str, Any]:
     try:
         views = _views()
         summary = views.functions.getClaimSummary(post_id).call()
-        support = int(summary[4])
-        challenge = int(summary[5])
+        # ProtocolViews.ClaimSummary field order (core/src/ProtocolViews.sol):
+        # 0 text, 1 supportStake, 2 challengeStake, 3 totalStake, 4 postingFee,
+        # 5 isActive, 6 baseVSRay, 7 effectiveVSRay, 8 incomingCount,
+        # 9 outgoingCount. The struct carries no claim id — it is the argument.
+        support = int(summary[1])
+        challenge = int(summary[2])
         return {
-            "claim_id": int(summary[0]),
-            "text": str(summary[1]),
-            "eVS": _ray_to_pct(int(summary[3])),
-            "stake": {"support": support, "challenge": challenge, "total": support + challenge},
-            "links": {"incoming": int(summary[6]), "outgoing": int(summary[7])},
-            "is_active": bool(summary[8]),
-            "posting_fee": int(summary[9]),
+            "claim_id": post_id,
+            "text": str(summary[0]),
+            "eVS": _ray_to_pct(int(summary[7])),
+            "stake": {"support": support, "challenge": challenge, "total": int(summary[3])},
+            "links": {"incoming": int(summary[8]), "outgoing": int(summary[9])},
+            "is_active": bool(summary[5]),
+            "posting_fee": int(summary[4]),
         }
     except Exception as e:
         logger.error(f"fetch_claim_state({post_id}) failed: {e}")

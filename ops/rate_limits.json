@@ -1,0 +1,15 @@
+{
+  "_doc": [
+    "Per-endpoint, per-IP rate limits in requests per MINUTE, read once at API",
+    "startup (override the location with RATE_LIMITS_FILE). Keys under",
+    "'endpoints' are FastAPI route templates exactly as declared, e.g.",
+    "/api/claims/{post_id}/live — never concrete paths. Any endpoint not",
+    "listed gets default_per_minute. A value <= 0 disables the per-endpoint",
+    "cap for that route (the general all-endpoints cap still applies).",
+    "Changes take effect on restart; no code change or rebuild needed."
+  ],
+  "default_per_minute": 100,
+  "endpoints": {
+    "/api/claims/{post_id}/live": 60
+  }
+}
