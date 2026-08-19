@@ -125,6 +125,7 @@ GENERAL_RATE_WINDOW = _int_env("GENERAL_RATE_WINDOW", 60)   # seconds
 # endpoint (e.g. an RPC-backed read) independently of the general cap above,
 # which only bounds an IP's TOTAL traffic.
 ENDPOINT_RATE_WINDOW = 60  # "per minute" by definition
+_TEMPLATE_ERR_LOGGED = False  # patch_endpoint_limiter_routematch_isolation
 
 
 def _load_endpoint_limits() -> tuple[int, dict]:
@@ -351,23 +352,19 @@ def _client_ip(request: Request) -> str:
 # ── FastAPI middleware ─────────────────────────────────────
 
 def _route_template(request: Request) -> Optional[str]:
-    """The matched route's path template ("/api/claims/{post_id}/live"), or None.
+    """The matched route's path template, read from the ASGI scope.
 
-    Middleware runs before routing, so we resolve the template ourselves by
-    matching against the app's route table — the same test the router is about
-    to run. None (no route -> 404) is deliberately unmetered: random-path scans
-    must not mint fresh buckets, and the general cap already covers them.
+    patch_endpoint_limiter_scope_route (2026-08-19): walking app.routes is
+    unreliable here -- routers included with a prefix appear as pathless
+    _IncludedRouter entries that match FULL before the concrete APIRoute is
+    reached, and their children are not exposed on the entry. Starlette
+    writes the matched route into scope["route"] during routing, so we read
+    that instead. Available only AFTER call_next, hence metering is
+    post-dispatch (the tripping request is counted, the next is blocked).
+    None means genuinely unrouted (404) -- deliberately unmetered.
     """
-    from starlette.routing import Match
-    try:
-        for route in request.app.routes:
-            match, _ = route.matches(request.scope)
-            if match == Match.FULL:
-                return route.path
-    except Exception:
-        return None
-    return None
-
+    route = request.scope.get("route")
+    return getattr(route, "path", None) if route is not None else None
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
     """Per-IP rate limiting: a general cap on total traffic, plus an
@@ -392,6 +389,10 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
                 headers={"Retry-After": str(GENERAL_RATE_WINDOW)},
             )
 
+        response = await call_next(request)
+
+        # patch_endpoint_limiter_scope_route: scope["route"] is only populated
+        # once routing has happened, so the per-endpoint cap is metered here.
         template = _route_template(request)
         if template is not None:
             limit = ENDPOINT_RATE_LIMITS.get(template, ENDPOINT_RATE_DEFAULT)
@@ -408,7 +409,6 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
                         headers={"Retry-After": str(ENDPOINT_RATE_WINDOW)},
                     )
 
-        response = await call_next(request)
         response.headers["X-RateLimit-Remaining"] = str(remaining)
         return response
 
