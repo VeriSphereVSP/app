@@ -1,6 +1,6 @@
 # app/claim_locate.py
 """
-Underline matcher for the Verity browser extension.
+Underline matcher for the VeriSphere browser extension.
 
 The extension sends the salient phrases of the page it is on (title, wikilink
 anchors, headings) plus the sentences currently in view; it gets back the
