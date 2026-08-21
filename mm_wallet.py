@@ -6,11 +6,11 @@
 # patch_kms_mm: the MM key lives in GCP Cloud KMS (HSM); the private key never
 # exists on this box. Fail-loud: MM_KMS_KEY + MM_ADDRESS required and must agree.
 # MM_PRIVATE_KEY is deliberately ignored.
-from config import RPC_WRITE_URLS  # patch_bundle10_rpc_failover
-from tx_signer import TxRevertedError, build_w3, make_sign_and_send
+# patch_trackb_shared_w3: RPC list + build_w3 moved to chain.provider
+from tx_signer import TxRevertedError, make_sign_and_send
 from signing.kms_account import kms_account_from_env  # patch_kms_mm
 
-w3 = build_w3(RPC_WRITE_URLS)
+from chain.provider import w3  # patch_trackb_shared_w3: shared handle owned outside the MM module
 
 account = kms_account_from_env("MM")  # asserts MM_KMS_KEY derives MM_ADDRESS
 

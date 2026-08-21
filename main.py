@@ -491,7 +491,7 @@ class StakeRequest(BaseModel):
 @app.get("/api/token/allowance")
 def token_allowance(owner: str, spender: str):
     """Read VSP token allowance. Frontend calls this instead of readContract."""
-    from mm_wallet import w3
+    from chain.provider import w3  # patch_trackb_shared_w3
     from web3 import Web3
     from chain.abi import VSP_TOKEN_ABI
     from config import VSP_TOKEN_ADDRESS
@@ -513,7 +513,7 @@ def token_allowance(owner: str, spender: str):
 @app.get("/api/token/balance")
 def token_balance(address: str):
     """Read VSP token balance. Frontend calls this instead of readContract."""
-    from mm_wallet import w3
+    from chain.provider import w3  # patch_trackb_shared_w3
     from web3 import Web3
     from chain.abi import VSP_TOKEN_ABI
     from config import VSP_TOKEN_ADDRESS
