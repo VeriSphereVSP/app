@@ -114,6 +114,15 @@ if not FORWARDER_ADDRESS:
 
 # External tokens
 USDC_ADDRESS = os.getenv("USDC_ADDRESS", "0x5425890298aed601595a70ab815c96711a31bc65")
+
+# ── patch_trackb_pool_reader: public-AMM era ──
+# POOL_PAIR_ADDRESS empty = pool era DARK (endpoint answers {"configured": false},
+# FE shows the legacy MM surface). Set it to the SeedPool-deployed MockCPAMM on
+# Fuji (runbook) / the real venue pair on mainnet.
+POOL_PAIR_ADDRESS = os.getenv("POOL_PAIR_ADDRESS", "").strip()
+# Where the FE "Swap" button points (venue swap page). Served by the backend so
+# changing venue never needs an FE rebuild.
+SWAP_URL = os.getenv("SWAP_URL", "").strip()
 VSP_ADDRESS = VSP_TOKEN_ADDRESS
 
 # Market maker wallet (reserves — backs outstanding VSP)
@@ -138,6 +147,18 @@ else:
             "(implicit fallback to MM_ADDRESS would silently route fees back to MM)."
         )
     TREASURY_ADDRESS = MM_ADDRESS  # Fuji-only convenience
+
+# patch_trackb_pool_reader: post-MM circulating = totalSupply − these balances.
+# CSV env override; default = company-controlled addresses known today
+# (MM inventory while it exists + treasury). Deduped, order-stable.
+_circ_raw = os.getenv("CIRCULATING_EXCLUDE_ADDRESSES", "").strip()
+if _circ_raw:
+    CIRCULATING_EXCLUDE_ADDRESSES = [a.strip() for a in _circ_raw.split(",") if a.strip()]
+else:
+    CIRCULATING_EXCLUDE_ADDRESSES = []
+    for _a in (MM_ADDRESS, TREASURY_ADDRESS):
+        if _a and _a not in CIRCULATING_EXCLUDE_ADDRESSES:
+            CIRCULATING_EXCLUDE_ADDRESSES.append(_a)
 
 # patch_bundle11_cold_reserve: dedicated cold-custody sweep destination,
 # segregated from the fee sink (TREASURY_ADDRESS). Swept USDC stays
