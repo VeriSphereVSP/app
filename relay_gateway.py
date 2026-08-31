@@ -123,7 +123,7 @@ MAX_STAKE_VSP = 1_000_000_000
 
 
 def _w3():
-    from mm_wallet import w3
+    from chain.provider import w3  # patch_trackb_shared_w3: decoupled from the MM module
     return w3
 
 

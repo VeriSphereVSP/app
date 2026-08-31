@@ -156,10 +156,30 @@ def sample_balances_once():
                 sampled += 1
             except Exception as e:
                 logger.warning("balance_sampler: %s (%s) read failed: %s", label, addr, e)
-        # --- economic chain-reads (NOT in any DB table; read live from chain) ---
-        # floor, circulating, cap, reserves all come from chain_reader / VSPToken.
-        # Recorded into ops_metrics so Grafana can display + graph them over time.
+        # --- pool-era economic reads (Track B) --- patch_trackb_pool_reader
+        # When the public pool is configured, its price IS the market price and
+        # vsp_circulating_v2 (totalSupply - company-controlled balances) is the
+        # supply figure. Recorded alongside (not instead of) the MM-era metrics
+        # until the MM retires, so the two eras overlap on the graphs.
         try:
+            from config import POOL_PAIR_ADDRESS
+            if POOL_PAIR_ADDRESS:
+                from chain.pool_price import read_pool_state, read_vsp_circulating_v2
+                _pst = read_pool_state()
+                record_metric(db, "pool_price_usdc", float(_pst["price_usdc_per_vsp"]))
+                record_metric(db, "pool_vsp_reserve", float(_pst["vsp_reserve"]))
+                record_metric(db, "pool_usdc_reserve", float(_pst["usdc_reserve"]))
+                record_metric(db, "vsp_circulating_v2", float(read_vsp_circulating_v2()))
+                sampled += 4
+        except Exception as e:
+            logger.warning("balance_sampler: pool reads failed: %s", e)
+        # --- MM-era economic reads (retire WITH the MM) --- patch_trackb_pool_reader
+        # Gated on the same env flag as the /api/mm kill-line, read directly so the
+        # worker never imports the MM/KMS modules. Flipping MM_ROUTES_ENABLED=false
+        # retires floor/buy/sell/cap metrics AND the F-3 circ_growth alert in the
+        # same motion (the alert lives inside this block by design).
+        if os.getenv("MM_ROUTES_ENABLED", "true").strip().lower() != "false":
+          try:
             from chain.chain_reader import read_vsp_circulating, read_usdc_reserves
             circ = float(read_vsp_circulating())
             res = float(read_usdc_reserves())
@@ -194,8 +214,10 @@ def sample_balances_once():
                 sampled += 2
             except Exception as e:
                 logger.warning("balance_sampler: cap read failed: %s", e)
-        except Exception as e:
+          except Exception as e:
             logger.warning("balance_sampler: economic reads failed: %s", e)
+        else:
+            logger.info("balance_sampler: MM-era metrics retired (MM_ROUTES_ENABLED=false) — pool metrics only")
 
         # --- health/ops metrics (so the Status + Operations panels populate without
         # needing a separate ops_metrics_writer task) ---

@@ -44,7 +44,19 @@ from chain.chain_reader import (
     invalidate_mm_chain_state_cache,
 )
 
-router = APIRouter(prefix="/api/mm", tags=["market-maker"])
+# patch_trackb_mm_darkgate: Track B kill-line for the entire MM surface. Default ON
+# (unset/anything but "false") — zero behavior change until MM_ROUTES_ENABLED=false,
+# at which point every /api/mm/* route returns 410 Gone (the public AMM replaces the
+# MM). Distinct from the runtime halt flag (503 = temporary): 410 = decommissioned.
+# Flip on Fuji during the mock rehearsal, then on mainnet at MM retirement.
+MM_ROUTES_ENABLED = os.getenv("MM_ROUTES_ENABLED", "true").strip().lower() != "false"
+
+def _require_mm_routes_enabled():
+    if not MM_ROUTES_ENABLED:
+        raise HTTPException(410, "MM trading is decommissioned; use the public AMM")
+
+router = APIRouter(prefix="/api/mm", tags=["market-maker"],
+                   dependencies=[Depends(_require_mm_routes_enabled)])
 
 # patch_followup_service_token_guard: require X-Service-Token on the MM money
 # endpoints when SERVICE_API_TOKEN is configured (prod). No-op when unset (dev).

@@ -486,12 +486,43 @@ class StakeRequest(BaseModel):
 
 
 
+# ── Pool price endpoint (Track B public-AMM era) — patch_trackb_pool_reader ──
+
+@app.get("/api/pool/price")
+def pool_price():
+    """Public pool state for the trade surface. Three-state semantics:
+      not configured      -> 200 {"configured": false}  (deliberate dark state;
+                             FE renders the legacy MM surface)
+      configured, read OK -> 200 {configured, price, reserves, circulating, swap_url}
+      configured, FAILED  -> 503 (FE keeps the pool surface and shows
+                             'price unavailable' — it must NOT fall back to the
+                             MM on a transient RPC failure)
+    """
+    from config import POOL_PAIR_ADDRESS, SWAP_URL
+    if not POOL_PAIR_ADDRESS:
+        return {"configured": False}
+    from fastapi import HTTPException
+    from chain.pool_price import read_pool_state, read_vsp_circulating_v2
+    try:
+        state = read_pool_state()
+    except Exception as e:
+        print(f"pool/price read failed: {e}")
+        raise HTTPException(503, "pool read failed")
+    out = {"configured": True, "swap_url": SWAP_URL, **state}
+    try:
+        out["vsp_circulating"] = read_vsp_circulating_v2()
+    except Exception as e:
+        # price is still served; circulating is additive
+        print(f"pool/price circulating read failed: {e}")
+    return out
+
+
 # ── Token read endpoints (replaces direct chain reads from frontend) ──────────
 
 @app.get("/api/token/allowance")
 def token_allowance(owner: str, spender: str):
     """Read VSP token allowance. Frontend calls this instead of readContract."""
-    from mm_wallet import w3
+    from chain.provider import w3  # patch_trackb_shared_w3
     from web3 import Web3
     from chain.abi import VSP_TOKEN_ABI
     from config import VSP_TOKEN_ADDRESS
@@ -513,7 +544,7 @@ def token_allowance(owner: str, spender: str):
 @app.get("/api/token/balance")
 def token_balance(address: str):
     """Read VSP token balance. Frontend calls this instead of readContract."""
-    from mm_wallet import w3
+    from chain.provider import w3  # patch_trackb_shared_w3
     from web3 import Web3
     from chain.abi import VSP_TOKEN_ABI
     from config import VSP_TOKEN_ADDRESS
