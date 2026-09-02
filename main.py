@@ -33,7 +33,9 @@ from chain.stake import stake_claim
 from relay import router as relay_router
 from notifications import router as notifications_router  # patch_bundle04a_notifications_mount
 from supersedes import router as supersedes_router
-from mm.mm_routes import router as mm_router
+from config import MM_ROUTES_ENABLED  # patch_mm_410
+if MM_ROUTES_ENABLED:
+    from mm.mm_routes import router as mm_router
 from claim_views import router as claim_views_router
 from portfolio_views import router as portfolio_router
 from articles.article_routes import router as article_router
@@ -158,7 +160,22 @@ app.add_middleware(PublicCORSMiddleware)  # outermost: wraps rate-limit 429s too
 app.include_router(relay_router)
 app.include_router(notifications_router)
 app.include_router(supersedes_router)
-app.include_router(mm_router)
+if MM_ROUTES_ENABLED:
+    app.include_router(mm_router)
+else:
+    # patch_mm_410: MM retired. Every /api/mm/* answers 410 Gone with a pointer
+    # at the public pool, so stale FE bundles and API users get a truthful,
+    # machine-readable answer instead of a 404 that looks like a routing bug.
+    from fastapi.responses import JSONResponse
+    from config import SWAP_URL as _swap_url
+
+    @app.api_route("/api/mm/{_path:path}",
+                   methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
+    async def _mm_retired(_path: str):
+        return JSONResponse(status_code=410, content={
+            "detail": "MM retired — trading executes on the public pool from your own wallet",
+            "swap_url": _swap_url or None,
+        })
 app.include_router(claim_views_router)
 app.include_router(portfolio_router)
 app.include_router(article_router)

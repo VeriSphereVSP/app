@@ -187,19 +187,24 @@ def sample_balances_once():
             record_metric(db, "usdc_reserves", res)
             _check_circ_growth(db, circ)  # patch_postreview_circ_growth_alert
             sampled += 2
-            # floor = reserves / circulating (liquidation floor; the simple form).
-            if circ > 0:
-                record_metric(db, "floor_price_usd", res / circ)
-                sampled += 1
-            # current spot sale/buy price (the live MM quote, distinct from floor).
-            try:
-                from mm.mm_pricing import get_spot_quote
-                q = get_spot_quote(int(round(circ)), res, circ)
-                record_metric(db, "sell_price_usd", float(q.sell_price_usd))
-                record_metric(db, "buy_price_usd", float(q.buy_price_usd))
-                sampled += 2
-            except Exception as e:
-                logger.warning("balance_sampler: spot quote read failed: %s", e)
+            # patch_mm_410: floor + MM spot metrics are MM-model outputs; in the
+            # pool era they would be fiction (no floor exists, no MM quotes).
+            # Pool price is chain truth served by /api/pool/price.
+            from config import MM_ROUTES_ENABLED as _mm_on
+            if _mm_on:
+                # floor = reserves / circulating (liquidation floor; the simple form).
+                if circ > 0:
+                    record_metric(db, "floor_price_usd", res / circ)
+                    sampled += 1
+                # current spot sale/buy price (the live MM quote, distinct from floor).
+                try:
+                    from mm.mm_pricing import get_spot_quote
+                    q = get_spot_quote(int(round(circ)), res, circ)
+                    record_metric(db, "sell_price_usd", float(q.sell_price_usd))
+                    record_metric(db, "buy_price_usd", float(q.buy_price_usd))
+                    sampled += 2
+                except Exception as e:
+                    logger.warning("balance_sampler: spot quote read failed: %s", e)
             # circulating cap = VSPToken.maxAllowedSupply() (time-grown cap on-chain).
             try:
                 from config import VSP_TOKEN_ADDRESS
