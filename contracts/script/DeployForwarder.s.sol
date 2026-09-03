@@ -47,16 +47,13 @@ contract DeployForwarder is Script {
             address vspToken = vm.envAddress("VSP_TOKEN_ADDRESS");
             address treasury = vm.envAddress("TREASURY_ADDRESS");
             uint256 feeBps = vm.envOr("FEE_BPS", uint256(50));
-            uint256 minFeeWei = vm.envOr("MIN_FEE_WEI", uint256(1e17));  // 0.1 VSP
+            uint256 minFeeWei = vm.envOr("MIN_FEE_WEI", uint256(1e17)); // 0.1 VSP
 
             VerisphereForwarder impl = new VerisphereForwarder();
 
             ERC1967Proxy proxy = new ERC1967Proxy(
                 address(impl),
-                abi.encodeCall(
-                    VerisphereForwarder.initialize,
-                    (vspToken, treasury, deployer, feeBps, minFeeWei)
-                )
+                abi.encodeCall(VerisphereForwarder.initialize, (vspToken, treasury, deployer, feeBps, minFeeWei))
             );
 
             address proxyAddr = address(proxy);
@@ -70,22 +67,16 @@ contract DeployForwarder is Script {
             vm.stopBroadcast();
 
             string memory json = string.concat(
-                '{"Forwarder":"', vm.toString(proxyAddr),
-                '","ForwarderImpl":"', vm.toString(address(impl)),
-                '"}'
+                '{"Forwarder":"', vm.toString(proxyAddr), '","ForwarderImpl":"', vm.toString(address(impl)), '"}'
             );
             vm.writeFile("deployments/forwarder.json", json);
             console.log("Wrote deployments/forwarder.json");
-
         } else {
             // ── Upgrade: deploy new impl, upgrade proxy ──
             console.log("Upgrading existing forwarder proxy:", existingProxy);
 
             VerisphereForwarder newImpl = new VerisphereForwarder();
-            VerisphereForwarder(existingProxy).upgradeToAndCall(
-                address(newImpl),
-                bytes("")
-            );
+            VerisphereForwarder(existingProxy).upgradeToAndCall(address(newImpl), bytes(""));
 
             console.log("  New implementation:", address(newImpl));
             console.log("  Proxy address unchanged:", existingProxy);
@@ -94,9 +85,7 @@ contract DeployForwarder is Script {
 
             // Update impl address in forwarder.json (proxy stays same)
             string memory json = string.concat(
-                '{"Forwarder":"', vm.toString(existingProxy),
-                '","ForwarderImpl":"', vm.toString(address(newImpl)),
-                '"}'
+                '{"Forwarder":"', vm.toString(existingProxy), '","ForwarderImpl":"', vm.toString(address(newImpl)), '"}'
             );
             vm.writeFile("deployments/forwarder.json", json);
             console.log("Updated deployments/forwarder.json");

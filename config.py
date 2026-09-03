@@ -123,6 +123,13 @@ POOL_PAIR_ADDRESS = os.getenv("POOL_PAIR_ADDRESS", "").strip()
 # Where the FE "Swap" button points (venue swap page). Served by the backend so
 # changing venue never needs an FE rebuild.
 SWAP_URL = os.getenv("SWAP_URL", "").strip()
+# ── patch_venue: venue class for the public pool ──
+# mockcpamm (default) = the Fuji rehearsal mock (reserve0()/reserve1()).
+# univ2 = canonical UniswapV2 interface (getReserves()): Joe V1 on Fuji,
+# Uniswap v2 on Avalanche mainnet (checklist #4). VENUE_ROUTER is served to
+# the FE via /api/pool/price so in-app swaps approve + call the router.
+POOL_VENUE = os.getenv("POOL_VENUE", "mockcpamm").strip().lower()
+VENUE_ROUTER = os.getenv("VENUE_ROUTER", "").strip()
 # ── patch_mm_410: Phase 4 retirement flag ──
 # true (default) = MM era: routes live, reconcile runs, MM metrics sampled.
 # false = pool era: /api/mm/* answers 410 with a pool pointer; the reconcile
