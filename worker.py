@@ -299,8 +299,31 @@ async def main():
             except Exception as _e:
                 print(f"mm-reconcile error: {_e}", flush=True)
             await asyncio.sleep(_interval)
-    asyncio.create_task(_mm_reconcile_loop())
-    print("mm reconciler scheduled", flush=True)
+    _mm_on = os.getenv("MM_ROUTES_ENABLED", "true").strip().lower() not in ("0", "false", "no")
+    if _mm_on:
+        asyncio.create_task(_mm_reconcile_loop())
+        print("mm reconciler scheduled", flush=True)
+    else:
+        print("mm reconciler disabled (MM_ROUTES_ENABLED=false — pool era)", flush=True)
+
+    # patch_mm_410: sMax keeper wiring (S-03 layer ii operational half). The
+    # module self-gates: KEEPER_KMS_KEY/KEEPER_ADDRESS unset -> logs and idles,
+    # so this is inert until the keeper key ceremony. poll_once() is sync
+    # (web3 + KMS) — run it off the event loop.
+    import smax_keeper as _sk
+    if _sk.is_configured():
+        async def _keeper_loop():
+            await asyncio.sleep(90)  # let indexer/env settle first
+            while True:
+                try:
+                    await asyncio.to_thread(_sk.poll_once)
+                except Exception as _e:
+                    print(f"smax-keeper error: {_e}", flush=True)
+                await asyncio.sleep(_sk.KEEPER_INTERVAL_SEC)
+        asyncio.create_task(_keeper_loop())
+        print(f"smax keeper scheduled (interval {_sk.KEEPER_INTERVAL_SEC}s, addr {_sk.keeper_address()})", flush=True)
+    else:
+        print("smax keeper: unconfigured (KEEPER_KMS_KEY/KEEPER_ADDRESS unset) — idle", flush=True)
 
     # patch_smax_keeper: S-03 layer (ii) operational half. Pokes core's
     # permissionless StakeEngine.refreshSMax when a transaction would actually

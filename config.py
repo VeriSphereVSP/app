@@ -123,6 +123,12 @@ POOL_PAIR_ADDRESS = os.getenv("POOL_PAIR_ADDRESS", "").strip()
 # Where the FE "Swap" button points (venue swap page). Served by the backend so
 # changing venue never needs an FE rebuild.
 SWAP_URL = os.getenv("SWAP_URL", "").strip()
+# ── patch_mm_410: Phase 4 retirement flag ──
+# true (default) = MM era: routes live, reconcile runs, MM metrics sampled.
+# false = pool era: /api/mm/* answers 410 with a pool pointer; the reconcile
+# loop and the MM-model metrics (floor/sell/buy) stop. Flipped in
+# env/network.fuji.env at Phase 4 — this code is inert until then.
+MM_ROUTES_ENABLED = os.getenv("MM_ROUTES_ENABLED", "true").strip().lower() not in ("0", "false", "no")
 VSP_ADDRESS = VSP_TOKEN_ADDRESS
 
 # Market maker wallet (reserves — backs outstanding VSP)
