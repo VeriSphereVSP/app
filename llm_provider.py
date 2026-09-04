@@ -76,6 +76,26 @@ def _complete_openai(prompt, system, max_tokens, temperature, model):
     return resp.choices[0].message.content.strip()
 
 
+_CREATE_PARAMS: "set[str] | None" = None
+
+
+def _create_accepts(name: str) -> bool:
+    """patch_llm_sdk: anthropic-sdk 1.3+ REMOVED sampling params from
+    Messages.create (temperature is gone, not renamed — output_config only
+    carries effort/format). Detect the installed SDK's signature once so this
+    code runs under both the pre-rebuild pin and current SDKs; the unpinned
+    'anthropic' requirement let a container rebuild pull the new major."""
+    global _CREATE_PARAMS
+    if _CREATE_PARAMS is None:
+        try:
+            import inspect
+            from anthropic.resources.messages import Messages
+            _CREATE_PARAMS = set(inspect.signature(Messages.create).parameters)
+        except Exception:
+            _CREATE_PARAMS = {"temperature"}  # old-SDK assumption
+    return name in _CREATE_PARAMS
+
+
 def _complete_anthropic(prompt, system, max_tokens, temperature, model):
     import anthropic
 
@@ -88,7 +108,7 @@ def _complete_anthropic(prompt, system, max_tokens, temperature, model):
     }
     if system:
         kwargs["system"] = system
-    if temperature is not None:
+    if temperature is not None and _create_accepts("temperature"):
         kwargs["temperature"] = temperature
 
     resp = client.messages.create(**kwargs)

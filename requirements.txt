@@ -1,4 +1,4 @@
-anthropic
+anthropic>=1.3,<2  # patch_llm_sdk: pinned after unpinned rebuild pulled a breaking major
 beautifulsoup4
 fastapi
 httpx
