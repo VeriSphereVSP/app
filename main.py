@@ -180,7 +180,7 @@ app.include_router(claim_views_router)
 app.include_router(portfolio_router)
 app.include_router(article_router)
 app.include_router(semantic_dedup_router)
-# Endpoints the Verity browser extension needs (they replace the verity-api
+# Endpoints the VeriSphere browser extension needs (they replace the verity-api
 # gateway): article -> claim matching, the atomicity check, and wallet signing
 # config + calldata.
 app.include_router(claim_locate_router)

@@ -1,6 +1,6 @@
 # app/relay_gateway.py
 """
-Signing config + calldata for external wallet clients (the Verity extension).
+Signing config + calldata for external wallet clients (the VeriSphere extension).
 
 The extension holds no ABIs and no deployment artifacts. It needs two things
 from us before it can sign:
