@@ -76,9 +76,9 @@ contract VerisphereForwarder is Initializable, ERC2771Forwarder, UUPSUpgradeable
     uint256 public minFeeWei;
     bool public feeEnabled;
     bool private _initialized;
-    uint256 private _entered;    // v2: nonReentrant guard (1 = entered, 0 = not)
+    uint256 private _entered; // v2: nonReentrant guard (1 = entered, 0 = not)
     address public pendingOwner; // v2: Ownable2Step
-    uint256[50] private __gap;   // v2: storage gap
+    uint256[50] private __gap; // v2: storage gap
 
     // ── Constants ────────────────────────────────────────────
 
@@ -97,10 +97,10 @@ contract VerisphereForwarder is Initializable, ERC2771Forwarder, UUPSUpgradeable
     // upgrade. Unknown selectors revert in execute() / executeBatch().
 
     bytes4 private constant SEL_CREATE_CLAIM = bytes4(keccak256("createClaim(string)"));
-    bytes4 private constant SEL_CREATE_LINK  = bytes4(keccak256("createLink(uint256,uint256,bool)"));
-    bytes4 private constant SEL_STAKE        = bytes4(keccak256("stake(uint256,uint8,uint256)"));
-    bytes4 private constant SEL_WITHDRAW     = bytes4(keccak256("withdraw(uint256,uint8,uint256,bool)"));
-    bytes4 private constant SEL_SET_STAKE    = bytes4(keccak256("setStake(uint256,int256)"));
+    bytes4 private constant SEL_CREATE_LINK = bytes4(keccak256("createLink(uint256,uint256,bool)"));
+    bytes4 private constant SEL_STAKE = bytes4(keccak256("stake(uint256,uint8,uint256)"));
+    bytes4 private constant SEL_WITHDRAW = bytes4(keccak256("withdraw(uint256,uint8,uint256,bool)"));
+    bytes4 private constant SEL_SET_STAKE = bytes4(keccak256("setStake(uint256,int256)"));
 
     // ── Events ───────────────────────────────────────────────
 
@@ -171,13 +171,9 @@ contract VerisphereForwarder is Initializable, ERC2771Forwarder, UUPSUpgradeable
     ///         storage migration to set OZ's Initializable slot — which
     ///         is unnecessary since the bespoke _initialized flag
     ///         already gates re-entry.
-    function initialize(
-        address vspToken_,
-        address treasury_,
-        address owner_,
-        uint256 feeBps_,
-        uint256 minFeeWei_
-    ) external {
+    function initialize(address vspToken_, address treasury_, address owner_, uint256 feeBps_, uint256 minFeeWei_)
+        external
+    {
         if (_initialized) revert AlreadyInitialized();
         if (vspToken_ == address(0)) revert ZeroAddress();
         if (treasury_ == address(0)) revert ZeroAddress();
@@ -291,9 +287,7 @@ contract VerisphereForwarder is Initializable, ERC2771Forwarder, UUPSUpgradeable
 
     // ── Execute overrides ────────────────────────────────────
 
-    function execute(
-        ForwardRequestData calldata request
-    ) public payable override nonReentrant {
+    function execute(ForwardRequestData calldata request) public payable override nonReentrant {
         _collectFee(request.from, request.data);
         super.execute(request);
     }
@@ -302,10 +296,12 @@ contract VerisphereForwarder is Initializable, ERC2771Forwarder, UUPSUpgradeable
     ///         collection. Without this override, a relayer could
     ///         submit a batch and pay zero fees — a fee-evasion hole
     ///         in the v1 contract.
-    function executeBatch(
-        ForwardRequestData[] calldata requests,
-        address payable refundReceiver
-    ) public payable override nonReentrant {
+    function executeBatch(ForwardRequestData[] calldata requests, address payable refundReceiver)
+        public
+        payable
+        override
+        nonReentrant
+    {
         // Collect fee for each request BEFORE delegating. The selector
         // check inside _collectFee/_extractTxValue means an invalid
         // selector reverts the entire batch atomically — even with a
@@ -322,11 +318,7 @@ contract VerisphereForwarder is Initializable, ERC2771Forwarder, UUPSUpgradeable
 
     // ── Admin ────────────────────────────────────────────────
 
-    function setFeeConfig(
-        uint256 feeBps_,
-        uint256 minFeeWei_,
-        bool enabled_
-    ) external onlyOwner {
+    function setFeeConfig(uint256 feeBps_, uint256 minFeeWei_, bool enabled_) external onlyOwner {
         if (feeBps_ > MAX_FEE_BPS) revert FeeBpsTooHigh(feeBps_, MAX_FEE_BPS);
         if (minFeeWei_ > MAX_MIN_FEE_WEI) revert MinFeeWeiTooHigh(minFeeWei_, MAX_MIN_FEE_WEI);
         feeBps = feeBps_;
@@ -380,7 +372,7 @@ contract VerisphereForwarder is Initializable, ERC2771Forwarder, UUPSUpgradeable
     ///         (or stuck in a refund path edge case) to this contract.
     function rescueETH(address payable to, uint256 amount) external onlyOwner {
         if (to == address(0)) revert ZeroAddress();
-        (bool ok, ) = to.call{value: amount}("");
+        (bool ok,) = to.call{value: amount}("");
         require(ok, "rescueETH: send failed");
         emit ETHRescued(to, amount);
     }

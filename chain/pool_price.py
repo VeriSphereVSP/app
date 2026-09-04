@@ -25,6 +25,17 @@ VSP_DECIMALS = 18
 USDC_DECIMALS = 6
 _CACHE_TTL = 15  # seconds — the trade surface polls at 30s
 
+# patch_venue: UniV2-interface pair (Joe V1 / Uniswap v2). Token ordering is
+# BY ADDRESS SORT — orientation is detected, never assumed.
+_UNIV2_ABI = [
+    {"type": "function", "name": "token0", "inputs": [],
+     "outputs": [{"name": "", "type": "address"}], "stateMutability": "view"},
+    {"type": "function", "name": "token1", "inputs": [],
+     "outputs": [{"name": "", "type": "address"}], "stateMutability": "view"},
+    {"type": "function", "name": "getReserves", "inputs": [],
+     "outputs": [{"name": "", "type": "uint112"}, {"name": "", "type": "uint112"},
+                 {"name": "", "type": "uint32"}], "stateMutability": "view"},
+]
 _POOL_ABI = [
     {"type": "function", "name": "token0", "inputs": [],
      "outputs": [{"name": "", "type": "address"}], "stateMutability": "view"},
@@ -47,6 +58,7 @@ _w3 = None
 _pool = None
 _vsp = None
 _validated = False
+_token0_is_vsp = True  # patch_venue: set during validation; univ2 pairs sort by address
 _cache: dict = {}
 
 
@@ -73,25 +85,32 @@ def _get_pool():
     """Pool contract handle. On FIRST use, asserts the pair's tokens match the
     configured VSP/USDC — a mis-wired POOL_PAIR_ADDRESS must fail loudly, not
     quietly serve the price of some other pair."""
-    global _pool, _validated
-    from config import POOL_PAIR_ADDRESS, VSP_TOKEN_ADDRESS, USDC_ADDRESS
+    global _pool, _validated, _token0_is_vsp
+    from config import (POOL_PAIR_ADDRESS, VSP_TOKEN_ADDRESS, USDC_ADDRESS,
+                        POOL_VENUE)
     if not POOL_PAIR_ADDRESS:
         raise RuntimeError("POOL_PAIR_ADDRESS not configured")
     if _pool is None:
+        abi = _UNIV2_ABI if POOL_VENUE == "univ2" else _POOL_ABI
         _pool = _get_w3().eth.contract(
-            address=Web3.to_checksum_address(POOL_PAIR_ADDRESS), abi=_POOL_ABI
+            address=Web3.to_checksum_address(POOL_PAIR_ADDRESS), abi=abi
         )
     if not _validated:
         t0 = _pool.functions.token0().call()
         t1 = _pool.functions.token1().call()
-        if (t0.lower() != VSP_TOKEN_ADDRESS.lower()
-                or t1.lower() != USDC_ADDRESS.lower()):
+        # patch_venue: validate as a SET (univ2 orders by address sort), then
+        # record orientation. A mis-wired POOL_PAIR_ADDRESS still fails loudly.
+        want = {VSP_TOKEN_ADDRESS.lower(), USDC_ADDRESS.lower()}
+        have = {t0.lower(), t1.lower()}
+        if have != want:
             raise RuntimeError(
                 f"pool_price: pair token mismatch — pool has token0={t0} "
                 f"token1={t1}, config has VSP={VSP_TOKEN_ADDRESS} USDC={USDC_ADDRESS}"
             )
+        _token0_is_vsp = (t0.lower() == VSP_TOKEN_ADDRESS.lower())
         _validated = True
-        logger.info("pool_price: pair validated (%s)", POOL_PAIR_ADDRESS)
+        logger.info("pool_price: pair validated (%s, venue=%s, token0_is_vsp=%s)",
+                    POOL_PAIR_ADDRESS, POOL_VENUE, _token0_is_vsp)
     return _pool
 
 
@@ -104,18 +123,27 @@ def read_pool_state() -> dict:
     """Live pool state. Raises on RPC failure or empty pool — callers handle."""
     def _read():
         pool = _get_pool()
-        r0 = pool.functions.reserve0().call()
-        r1 = pool.functions.reserve1().call()
+        from config import POOL_PAIR_ADDRESS, POOL_VENUE, VENUE_ROUTER
+        if POOL_VENUE == "univ2":
+            r0, r1, _ts = pool.functions.getReserves().call()
+        else:
+            r0 = pool.functions.reserve0().call()
+            r1 = pool.functions.reserve1().call()
         if r0 <= 0 or r1 <= 0:
             raise RuntimeError("pool_price: pool has zero reserves (unseeded?)")
-        vsp_reserve = r0 / 10 ** VSP_DECIMALS
-        usdc_reserve = r1 / 10 ** USDC_DECIMALS
-        from config import POOL_PAIR_ADDRESS
+        # orient by the validated token0 (univ2 sorts by address; mock is fixed
+        # VSP=token0 and _token0_is_vsp validates True there too)
+        rv, ru = (r0, r1) if _token0_is_vsp else (r1, r0)
+        vsp_reserve = rv / 10 ** VSP_DECIMALS
+        usdc_reserve = ru / 10 ** USDC_DECIMALS
         return {
             "price_usdc_per_vsp": usdc_reserve / vsp_reserve,
             "vsp_reserve": vsp_reserve,
             "usdc_reserve": usdc_reserve,
             "pair": POOL_PAIR_ADDRESS,
+            "venue": POOL_VENUE,
+            "router": VENUE_ROUTER or None,
+            "token0_is_vsp": _token0_is_vsp,
             "updated_at": int(time.time()),
         }
     return _cached("pool_state", _read)
