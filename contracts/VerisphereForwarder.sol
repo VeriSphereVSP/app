@@ -107,6 +107,7 @@ contract VerisphereForwarder is Initializable, ERC2771Forwarder, UUPSUpgradeable
     event FeeCollected(address indexed user, uint256 fee, uint256 txValue);
     event FeeConfigUpdated(uint256 feeBps, uint256 minFeeWei, bool enabled);
     event TreasuryUpdated(address indexed oldTreasury, address indexed newTreasury);
+    event VspTokenUpdated(address indexed oldToken, address indexed newToken); // v3
     event OwnerProposed(address indexed currentOwner, address indexed pendingOwner);
     event OwnerAccepted(address indexed oldOwner, address indexed newOwner);
     event ERC20Rescued(address indexed token, address indexed to, uint256 amount);
@@ -121,6 +122,7 @@ contract VerisphereForwarder is Initializable, ERC2771Forwarder, UUPSUpgradeable
     error FeeBpsTooHigh(uint256 got, uint256 max);
     error MinFeeWeiTooHigh(uint256 got, uint256 max);
     error TreasuryIsForwarder();
+    error NotAContract(address token); // v3
     error UnknownSelector(bytes4 sel);
     error Reentrant();
 
@@ -325,6 +327,21 @@ contract VerisphereForwarder is Initializable, ERC2771Forwarder, UUPSUpgradeable
         minFeeWei = minFeeWei_;
         feeEnabled = enabled_;
         emit FeeConfigUpdated(feeBps_, minFeeWei_, enabled_);
+    }
+
+    /// @notice v3 (patch_fw_token): re-point the fee asset after a token
+    ///         genesis. The 2026-09 Fuji genesis replaced VSPToken while this
+    ///         forwarder — deployed separately, initialized once — kept
+    ///         pulling fees from the retired token, so every meta-tx reverted
+    ///         ERC20InsufficientAllowance on a token users no longer approve.
+    ///         Storage layout untouched (function + event only). Intended to
+    ///         be invoked atomically via upgradeToAndCall.
+    function setVspToken(address newToken) external onlyOwner {
+        if (newToken == address(0)) revert ZeroAddress();
+        if (newToken.code.length == 0) revert NotAContract(newToken);
+        address old = address(vspToken);
+        vspToken = IERC20(newToken);
+        emit VspTokenUpdated(old, newToken);
     }
 
     function setTreasury(address treasury_) external onlyOwner {
